@@ -1,0 +1,9 @@
+services:
+  relay:
+    image: pi-remote-relay:latest
+    container_name: pi-remote-relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:__RELAY_PORT__:8789"

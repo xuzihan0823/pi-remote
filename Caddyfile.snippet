@@ -1,0 +1,6 @@
+# pi.anyyu.cyou
+# Append this block to the existing Caddyfile; do not replace existing sites.
+pi.anyyu.cyou {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:8789
+}

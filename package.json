@@ -1,0 +1,29 @@
+{
+  "name": "pi-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remote gateway skeleton for the pi coding agent (Phase 1: RPC subprocess layer)",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "agent": "node --env-file-if-exists=.env src/agent/run.ts",
+    "start-agent": "node --env-file-if-exists=.env src/agent/run.ts",
+    "dev-agent": "node --env-file-if-exists=.env --watch src/agent/run.ts",
+    "dev": "node --env-file-if-exists=.env --watch src/index.ts",
+    "start": "node --env-file-if-exists=.env src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "test:watch": "node --test --watch tests/*.test.ts",
+    "test:live": "PI_LIVE_RPC=1 node --test tests/rpc-client.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

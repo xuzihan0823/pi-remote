@@ -1,0 +1,17 @@
+services:
+  relay:
+    image: pi-remote-relay:latest
+    container_name: pi-remote-relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    expose:
+      - "8789"
+    networks:
+      - default
+      - proxy_net
+
+networks:
+  proxy_net:
+    external: true
+    name: __PROXY_NETWORK__

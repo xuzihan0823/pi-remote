@@ -1,0 +1,35 @@
+services:
+  relay:
+    image: pi-remote-relay:latest
+    container_name: pi-remote-relay
+    restart: unless-stopped
+    env_file:
+      - .env
+    expose:
+      - "8789"
+    networks:
+      - pi_remote_net
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: pi-remote-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - pi_remote_net
+    depends_on:
+      - relay
+
+networks:
+  pi_remote_net:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
