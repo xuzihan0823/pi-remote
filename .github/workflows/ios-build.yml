@@ -1,0 +1,61 @@
+name: iOS Build
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/ios-*'
+    paths:
+      - 'ios/**'
+      - 'scripts/build-ios.sh'
+      - '.github/workflows/ios-build.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - 'scripts/build-ios.sh'
+      - '.github/workflows/ios-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simulator:
+    name: Build and launch iOS simulator app
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Build and smoke-test
+        run: bash scripts/build-ios.sh --smoke-test
+
+      - name: Upload simulator app and screenshot
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PiRemote-iOS-simulator
+          path: |
+            .build/ios/run.*/PiRemote-simulator.tar.gz
+            .build/ios/run.*/PiRemote-simulator.png
+            .build/ios/run.*/launch.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PiRemote-iOS-build-diagnostics
+          path: |
+            .build/ios/run.*/build.log
+            .build/ios/run.*/Build.xcresult
+          if-no-files-found: warn
+          retention-days: 14

@@ -3,3 +3,6 @@ dist/
 .env
 *.log
 .DS_Store
+.build/
+ios/**/xcuserdata/
+ios/**/*.xcuserstate
