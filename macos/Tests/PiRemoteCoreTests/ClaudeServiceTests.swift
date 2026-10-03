@@ -70,4 +70,82 @@ final class ClaudeServiceTests: XCTestCase {
         XCTAssertFalse(try health("pi-remote-claude", expected, false).matches(instanceId: expected))
         XCTAssertThrowsError(try JSONDecoder().decode(ClaudeServiceHealth.self, from: Data("{\"ok\":true}".utf8)))
     }
+
+    func testConfigurationDefaultsToLocalAndDecodesLegacyJSON() throws {
+        XCTAssertEqual(ClaudeServiceConfiguration().mode, .local)
+
+        let legacy = #"{"port":23456,"executablePath":"/usr/local/bin/claude","projectsDirectory":"/tmp/p","dataDirectory":"/tmp/d"}"#
+        let decoded = try JSONDecoder().decode(ClaudeServiceConfiguration.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded.mode, .local)
+        XCTAssertEqual(decoded.port, 23456)
+        XCTAssertEqual(decoded.executablePath, "/usr/local/bin/claude")
+        XCTAssertEqual(decoded.projectsDirectory, "/tmp/p")
+        XCTAssertEqual(decoded.dataDirectory, "/tmp/d")
+
+        let cloud = try JSONDecoder().decode(ClaudeServiceConfiguration.self, from: Data(#"{"mode":"cloudflare"}"#.utf8))
+        XCTAssertEqual(cloud.mode, .cloudflare)
+        XCTAssertEqual(cloud.port, 8788)
+
+        let bogus = try JSONDecoder().decode(ClaudeServiceConfiguration.self, from: Data(#"{"mode":"nonsense"}"#.utf8))
+        XCTAssertEqual(bogus.mode, .local)
+    }
+
+    func testConfigurationRoundTripsModeWithoutStoringSecrets() throws {
+        let config = ClaudeServiceConfiguration(port: 23456, projectsDirectory: "/tmp/p", dataDirectory: "/tmp/d", mode: .cloudflare)
+        let data = try JSONEncoder().encode(config)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json["mode"] as? String, "cloudflare")
+        XCTAssertNil(json["token"])
+        XCTAssertNil(json["publicURL"])
+        XCTAssertNil(json["publicBases"])
+        XCTAssertEqual(try JSONDecoder().decode(ClaudeServiceConfiguration.self, from: data), config)
+    }
+
+    func testQuickTunnelValidationRejectsLookalikesAndPaths() {
+        for good in ["https://calm-river-1234.trycloudflare.com", "https://x.trycloudflare.com/", "https://x.trycloudflare.com:443"] {
+            XCTAssertNotNil(ClaudeTunnelURL.validated(URL(string: good)!), good)
+        }
+        for bad in [
+            "http://calm-river-1234.trycloudflare.com",
+            "https://evil.example.com",
+            "https://trycloudflare.com",
+            "https://x.trycloudflare.com.evil.example",
+            "https://evil-trycloudflare.com",
+            "https://user:pass@x.trycloudflare.com",
+            "https://x.trycloudflare.com/path",
+            "https://x.trycloudflare.com?q=1",
+            "https://x.trycloudflare.com#fragment",
+            "https://x.trycloudflare.com:8443",
+        ] {
+            XCTAssertNil(ClaudeTunnelURL.validated(URL(string: bad)!), bad)
+        }
+    }
+
+    func testQuickTunnelURLIsParsedFromCloudflaredLogLine() {
+        let line = "2026-10-03T00:00:00Z INF |  https://calm-river-1234.trycloudflare.com  |"
+        XCTAssertEqual(ClaudeTunnelURL.inLogLine(line)?.absoluteString, "https://calm-river-1234.trycloudflare.com")
+        XCTAssertEqual(ClaudeTunnelURL.inLogLine("INF (https://x.trycloudflare.com).")?.absoluteString, "https://x.trycloudflare.com")
+        for badLine in [
+            "INF | https://evil.example.com |",
+            "INF | https://x.trycloudflare.com.evil.example |",
+            "INF | https://x.trycloudflare.com/evil |",
+            "INF | https://x.trycloudflare.com?token=evil |",
+            "INF | https://x.trycloudflare.com#fragment |",
+            "INF | https://user:pass@x.trycloudflare.com |",
+            "INF | https://calm.trycloudflare.com:8443 |",
+            "INF | http://x.trycloudflare.com |",
+            "INF | https://evil.example.com/?next=https://x.trycloudflare.com |",
+        ] {
+            XCTAssertNil(ClaudeTunnelURL.inLogLine(badLine), badLine)
+        }
+        XCTAssertNil(ClaudeTunnelURL.inLogLine("INF Requesting new quick Tunnel"))
+    }
+
+    func testPairInfoCanBeAssembledForPublicPayload() {
+        let token = String(repeating: "a", count: 64)
+        let info = ClaudePairInfo(bases: ["https://x.trycloudflare.com"], token: token)
+        XCTAssertEqual(info.bases, ["https://x.trycloudflare.com"])
+        XCTAssertEqual(info.token, token)
+        XCTAssertEqual(info, ClaudePairInfo(bases: ["https://x.trycloudflare.com"], token: token))
+    }
 }

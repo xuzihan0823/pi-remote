@@ -14,6 +14,18 @@ struct ClaudeRuntimePaths {
     let runtimeDirectory: URL
     let node: URL
     let supervisor: URL
+    /// The shared bundled cloudflared binary. Optional so `.local` never depends on it and older
+    /// fixtures that constructed paths without it keep working.
+    let cloudflared: URL?
+
+    init(runtimeDirectory: URL, node: URL, supervisor: URL, cloudflared: URL? = nil) {
+        self.runtimeDirectory = runtimeDirectory
+        self.node = node
+        self.supervisor = supervisor
+        self.cloudflared = cloudflared
+    }
+
+    var nodeDirectory: String { node.deletingLastPathComponent().path }
 }
 
 enum RuntimeLocator {
@@ -54,10 +66,13 @@ enum RuntimeLocator {
                 throw ValidationError("应用内 Claude 运行环境缺少 \(path)，请用 macos/build.sh 重新构建")
             }
         }
+        let cloudflared = directory.appendingPathComponent("cloudflared")
+        let bundledCloudflared = FileManager.default.isExecutableFile(atPath: cloudflared.path) ? cloudflared : nil
         return ClaudeRuntimePaths(
             runtimeDirectory: directory,
             node: directory.appendingPathComponent("node"),
-            supervisor: directory.appendingPathComponent("runtime-supervisor.mjs")
+            supervisor: directory.appendingPathComponent("runtime-supervisor.mjs"),
+            cloudflared: bundledCloudflared
         )
     }
 
