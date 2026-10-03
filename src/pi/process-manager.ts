@@ -11,6 +11,12 @@ export interface SessionProcessStatus {
   signal: string | null;
   error: string | undefined;
   startedAt: number;
+  /** True while a real agent turn is in flight; cleared on agent_settled, exit or failure. */
+  busy: boolean;
+  /** Working directory the session was started in, when known. */
+  cwd: string | undefined;
+  /** Short human-readable label (last prompt), when known. */
+  title: string | undefined;
 }
 
 export interface SessionStartOptions {
@@ -61,7 +67,6 @@ export class SessionBusyError extends Error {
 interface SessionRecord {
   client: RpcClient;
   status: SessionProcessStatus;
-  busy: boolean;
   unsubscribe: () => void;
 }
 
@@ -101,7 +106,6 @@ export class PiProcessManager {
 
     const record: SessionRecord = {
       client,
-      busy: false,
       status: {
         sessionId,
         state: "running",
@@ -110,6 +114,9 @@ export class PiProcessManager {
         signal: null,
         error: undefined,
         startedAt: Date.now(),
+        busy: false,
+        cwd: options.cwd,
+        title: undefined,
       },
       unsubscribe: () => {},
     };
@@ -147,7 +154,7 @@ export class PiProcessManager {
   }
 
   isBusy(sessionId: SessionId): boolean {
-    return this.#require(sessionId).busy;
+    return this.#require(sessionId).status.busy;
   }
 
   async send<T = unknown>(sessionId: SessionId, command: RpcCommandInput): Promise<T> {
@@ -156,14 +163,15 @@ export class PiProcessManager {
 
   async prompt(sessionId: SessionId, message: string, options: { images?: unknown[] } = {}): Promise<void> {
     const record = this.#require(sessionId);
-    if (record.busy) {
+    if (record.status.busy) {
       throw new SessionBusyError(sessionId);
     }
-    record.busy = true;
+    record.status.busy = true;
     try {
       await record.client.send({ type: "prompt", message, ...(options.images ? { images: options.images } : {}) });
+      record.status.title = sessionTitle(message) ?? record.status.title;
     } catch (error) {
-      record.busy = false;
+      record.status.busy = false;
       throw error;
     }
   }
@@ -209,9 +217,9 @@ export class PiProcessManager {
 
   #handleClientEvent(record: SessionRecord, event: GatewayEvent): void {
     if (event.type === "agent_settled") {
-      record.busy = false;
+      record.status.busy = false;
     } else if (event.type === "process_exit") {
-      record.busy = false;
+      record.status.busy = false;
       record.status.exitCode = event.code;
       record.status.signal = event.signal;
       record.status.state = event.expected || (event.code === 0 && event.signal === null) ? "exited" : "failed";
@@ -220,7 +228,7 @@ export class PiProcessManager {
       }
       this.#notifyStatus(record.status);
     } else if (event.type === "process_error") {
-      record.busy = false;
+      record.status.busy = false;
       record.status.state = "failed";
       record.status.error = event.message;
       this.#notifyStatus(record.status);
@@ -236,6 +244,14 @@ export class PiProcessManager {
       listener({ ...status });
     }
   }
+}
+
+const MAX_TITLE_LENGTH = 80;
+
+function sessionTitle(message: string): string | undefined {
+  const collapsed = message.replace(/\s+/g, " ").trim();
+  if (collapsed.length === 0) return undefined;
+  return collapsed.length > MAX_TITLE_LENGTH ? collapsed.slice(0, MAX_TITLE_LENGTH) : collapsed;
 }
 
 export type { RpcSpawnFn };

@@ -290,3 +290,65 @@ test("a real AgentClient + relay + PiProcessManager handler streams session even
     await server.stop();
   }
 });
+
+test("terminal mode delegates once to the local launcher, returns the real id/source and never spawns RPC", async () => {
+  const { fake, manager } = createHarness();
+  const calls: unknown[] = [];
+  const handler = createPiAgentHandler({
+    manager, workspaceRoot: WORKSPACE,
+    terminalLauncher: { start: async (cwd) => {
+      calls.push(cwd);
+      return { sessionId: "terminal:real-tui-id", cwd: WORKSPACE, title: "TUI", activity: "idle" };
+    } },
+  });
+  try {
+    const result = await handler(requestFrame("terminal-start", "session.start", { params: { mode: "terminal", cwd: "project" } }));
+    assert.equal(result.ok, true);
+    const data = result.data;
+    assert.ok(data && typeof data === "object" && "sessionId" in data && "source" in data);
+    assert.equal(data.sessionId, "terminal:real-tui-id");
+    assert.equal(data.source, "terminal");
+    assert.deepEqual(calls, ["project"]);
+    assert.equal(fake.spawnedArgs.length, 0);
+  } finally { await manager.closeAll(); }
+});
+
+test("terminal mode rejects remote argv, supplied IDs and invalid mode before launch", async () => {
+  const { fake, manager } = createHarness();
+  let launches = 0;
+  const handler = createPiAgentHandler({
+    manager, workspaceRoot: WORKSPACE,
+    terminalLauncher: { start: async () => {
+      launches++;
+      return { sessionId: "terminal:must-not-start", cwd: WORKSPACE, title: "", activity: "idle" };
+    } },
+  });
+  try {
+    for (const params of [
+      { mode: "terminal", args: [] }, { mode: "terminal", args: ["--resume", "old"] },
+      { mode: "terminal", sessionId: "terminal:old" }, { mode: "terminal", sessionId: "user-id" },
+      { mode: "rpc", sessionId: "terminal:old" }, { mode: "other" }, { mode: null },
+    ]) {
+      const result = await handler(requestFrame("invalid", "session.start", { params }));
+      assert.equal(result.error?.code, "invalid_frame");
+    }
+    assert.equal(launches, 0);
+    assert.equal(fake.spawnedArgs.length, 0);
+  } finally { await manager.closeAll(); }
+});
+
+test("omitted mode and explicit RPC mode preserve managed starts and source", async () => {
+  const { fake, manager, handler } = createHarness();
+  try {
+    for (const params of [{ sessionId: "legacy" }, { mode: "rpc", sessionId: "rpc" }]) {
+      const result = await handler(requestFrame("managed", "session.start", { params }));
+      assert.equal(result.ok, true);
+      const data = result.data;
+      assert.ok(data && typeof data === "object" && "source" in data);
+      assert.equal(data.source, "managed");
+    }
+    assert.equal(fake.spawnedArgs.length, 2);
+    const unavailable = await handler(requestFrame("terminal", "session.start", { params: { mode: "terminal" } }));
+    assert.equal(unavailable.error?.code, "not_implemented");
+  } finally { await manager.closeAll(); }
+});

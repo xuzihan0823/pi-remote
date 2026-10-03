@@ -139,6 +139,10 @@ if [[ -d "$INSTALL_DIR" ]]; then
     exit 1
   fi
   IS_UPGRADE=true
+  if [[ -L "$INSTALL_DIR/.env" ]]; then
+    echo "错误: $INSTALL_DIR/.env 是符号链接，拒绝读取或覆盖" >&2
+    exit 1
+  fi
   if [[ -f "$INSTALL_DIR/.env" ]]; then
     # 提取现有 RELAY_TOKEN
     EXISTING_TOKEN="$(grep -E '^RELAY_TOKEN=' "$INSTALL_DIR/.env" | cut -d'=' -f2- | tr -d '\r"' || true)"
@@ -218,12 +222,15 @@ else
   fi
 fi
 
-# 暂存准备 stage 目录，避免在原地直接破坏
-STAGE_DIR="$(mktemp -d "/tmp/pi-remote-stage.XXXXXX")"
-cleanup_stage() {
-  rm -rf "$STAGE_DIR"
-}
-trap cleanup_stage EXIT
+# 新版本在安装目录的同级目录里完整准备好，再整体���换旧目录；
+# 不向旧目录写入任何文件，因此不会跟随其中的符号链接，失败时也能整体换回。
+INSTALL_PARENT="$(dirname "$INSTALL_DIR")"
+mkdir -p "$INSTALL_PARENT"
+STAGE_DIR="$(mktemp -d "${INSTALL_PARENT}/.pi-remote-stage.XXXXXX")"
+PREVIOUS_DIR=""
+SWAPPED=false
+NEEDS_ROLLBACK=false
+OLD_IMAGE_ID=""
 
 echo "准备安装文件到暂存目录..."
 mkdir -p "$STAGE_DIR/src"
@@ -258,72 +265,128 @@ chmod 600 "$STAGE_DIR/.env"
 # 写入受管标记
 echo "pi-remote-installer-v1" > "$STAGE_DIR/.pi-remote-managed"
 
-# 回滚函数定义
-OLD_IMAGE_TAGGED=false
-if docker image inspect pi-remote-relay:latest >/dev/null 2>&1; then
-  docker tag pi-remote-relay:latest pi-remote-relay:rollback-backup
-  OLD_IMAGE_TAGGED=true
-fi
+compose() {
+  docker compose -p pi-remote -f "$INSTALL_DIR/docker-compose.yml" "$@"
+}
+
+wait_healthy() {
+  local cmd="fetch('http://127.0.0.1:8789/api/health',{signal:AbortSignal.timeout(3000)}).then(async r=>{if(!r.ok||(await r.json()).status!=='ok')process.exit(1)}).catch(()=>process.exit(1))"
+  local retries="${PI_REMOTE_HEALTH_RETRIES:-15}"
+  local interval="${PI_REMOTE_HEALTH_INTERVAL:-2}"
+  local i
+  for ((i=1; i<=retries; i++)); do
+    sleep "$interval"
+    if docker exec pi-remote-relay node -e "$cmd" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
 
 rollback() {
   echo "警告: 安装或健康检查未通过，正在触发安全回滚..." >&2
-  if [[ "$IS_UPGRADE" = true && -n "$BACKUP_TAR" && -f "$BACKUP_TAR" ]]; then
-    echo "正在还原受管目录文件..." >&2
-    # 停止可能有问题的当前服务
-    docker compose -p pi-remote -f "$INSTALL_DIR/docker-compose.yml" down || true
-    rm -rf "${INSTALL_DIR:?}"/*
-    tar -xzf "$BACKUP_TAR" -C "$INSTALL_DIR"
-    if [[ "$OLD_IMAGE_TAGGED" = true ]]; then
-      docker tag pi-remote-relay:rollback-backup pi-remote-relay:latest || true
-    fi
-    # 尝试恢复原服务
-    docker compose -p pi-remote -f "$INSTALL_DIR/docker-compose.yml" up -d --remove-orphans || { echo "错误: 旧服务恢复失败，请人工恢复" >&2; return 1; }
-    echo "受管目录已恢复为更新前状态。" >&2
-  else
+  if [[ "$IS_UPGRADE" != true ]]; then
     echo "初次安装失败，停止运行容器并保留安装目录供故障诊断。" >&2
-    if [[ -f "$INSTALL_DIR/docker-compose.yml" ]]; then
-      docker compose -p pi-remote -f "$INSTALL_DIR/docker-compose.yml" down || true
+    if [[ "$SWAPPED" = true && -f "$INSTALL_DIR/docker-compose.yml" ]]; then
+      compose down || true
+    fi
+    return 0
+  fi
+
+  if [[ "$SWAPPED" = true ]]; then
+    compose down || echo "警告: 停止新版本服务失败，继续恢复旧版本" >&2
+    local failed_dir
+    failed_dir="$(mktemp -d "${INSTALL_PARENT}/.pi-remote-failed.XXXXXX")" || failed_dir=""
+    if [[ -z "$failed_dir" ]] || ! mv "$INSTALL_DIR" "$failed_dir/install" || ! mv "$PREVIOUS_DIR" "$INSTALL_DIR"; then
+      echo "错误: 回滚失败，旧版本目录无法换回。旧版本保存在 $PREVIOUS_DIR，请人工恢复" >&2
+      return 1
+    fi
+    rm -rf "$failed_dir"
+    SWAPPED=false
+  fi
+
+  if [[ -n "$OLD_IMAGE_ID" ]] && ! docker tag "$OLD_IMAGE_ID" pi-remote-relay:latest; then
+    echo "错误: 回滚失败，旧镜像 $OLD_IMAGE_ID 无法恢复为 latest，未重新启动服务，请人工恢复" >&2
+    return 1
+  fi
+  if ! compose up -d --force-recreate --remove-orphans; then
+    echo "错误: 回滚失败，旧服务无法启动，请人工恢复" >&2
+    return 1
+  fi
+  if [[ -n "$OLD_IMAGE_ID" ]]; then
+    local running_image
+    running_image="$(docker inspect --format '{{.Image}}' pi-remote-relay 2>/dev/null || true)"
+    if [[ "$running_image" != "$OLD_IMAGE_ID" ]]; then
+      echo "错误: 回滚失败，运行中的容器镜像不是更新前的镜像，请人工核对" >&2
+      return 1
     fi
   fi
+  if ! wait_healthy; then
+    echo "错误: 回滚后旧服务健康检查未通过，请人工核对" >&2
+    return 1
+  fi
+  echo "受管目录与镜像已恢复为更新前状态，旧服务健康检查通过。" >&2
 }
 
-# 镜像构建（在 stage 目录先构建，避免直接弄脏安装目录）
+on_exit() {
+  local status=$?
+  set +e
+  if [[ $status -ne 0 && "$NEEDS_ROLLBACK" = true ]]; then
+    NEEDS_ROLLBACK=false
+    rollback || status=76
+  fi
+  [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]] && rm -rf "$STAGE_DIR"
+  exit "$status"
+}
+trap on_exit EXIT
+
+if docker image inspect pi-remote-relay:latest >/dev/null 2>&1; then
+  OLD_IMAGE_ID="$(docker image inspect --format '{{.Id}}' pi-remote-relay:latest)"
+  docker tag pi-remote-relay:latest pi-remote-relay:rollback-backup
+fi
+
+# 镜像构建（在暂存目录构建，避免弄脏安装目录）
 echo "正在构建 Docker 镜像 pi-remote-relay:latest ..."
 if ! docker build -t pi-remote-relay:latest "$STAGE_DIR"; then
   echo "错误: Docker 镜像构建失败" >&2
   exit 1
 fi
+NEEDS_ROLLBACK=true
 
-# 将暂存文件同步到目标目录
-mkdir -p "$INSTALL_DIR"
-cp -r "$STAGE_DIR/." "$INSTALL_DIR/"
+# 整体替换安装目录
+if [[ "$IS_UPGRADE" = true ]]; then
+  PREVIOUS_DIR="$(mktemp -d "${INSTALL_PARENT}/.pi-remote-previous.XXXXXX")"
+  rmdir "$PREVIOUS_DIR"
+  mv "$INSTALL_DIR" "$PREVIOUS_DIR"
+fi
+SWAPPED=true
+if ! mv "$STAGE_DIR" "$INSTALL_DIR"; then
+  echo "错误: 安装目录替换失败" >&2
+  if [[ -n "$PREVIOUS_DIR" ]] && mv "$PREVIOUS_DIR" "$INSTALL_DIR"; then
+    SWAPPED=false
+  fi
+  exit 1
+fi
+STAGE_DIR=""
+chmod 700 "$INSTALL_DIR"
 
-# 启动 Docker Compose 服务
+# 启动 Docker Compose 服务；强制重建，让容器挂载新目录中的文件
 echo "正在启动服务 (Docker Compose 项目: pi-remote)..."
-if ! docker compose -p pi-remote -f "$INSTALL_DIR/docker-compose.yml" up -d --remove-orphans; then
-  rollback
+if ! compose up -d --force-recreate --remove-orphans; then
   echo "错误: 服务启动失败" >&2
   exit 1
 fi
 
 # 健康检查验证
 echo "正在等待服务就绪并执行健康检查..."
-HEALTH_CHECK_CMD="fetch('http://127.0.0.1:8789/api/health',{signal:AbortSignal.timeout(3000)}).then(async r=>{if(!r.ok||(await r.json()).status!=='ok')process.exit(1)}).catch(()=>process.exit(1))"
-MAX_RETRIES="${PI_REMOTE_HEALTH_RETRIES:-15}"
-RETRY_INTERVAL="${PI_REMOTE_HEALTH_INTERVAL:-2}"
-HEALTH_OK=false
-for ((i=1; i<=MAX_RETRIES; i++)); do
-  sleep "$RETRY_INTERVAL"
-  if docker exec pi-remote-relay node -e "$HEALTH_CHECK_CMD" >/dev/null 2>&1; then
-    HEALTH_OK=true
-    break
-  fi
-done
-
-if [[ "$HEALTH_OK" != true ]]; then
+if ! wait_healthy; then
   echo "错误: 健康检查失败 (等待超时或 /api/health 未响应 200 OK)" >&2
-  rollback
   exit 1
+fi
+
+NEEDS_ROLLBACK=false
+if [[ -n "$PREVIOUS_DIR" ]]; then
+  rm -rf "$PREVIOUS_DIR"
 fi
 
 echo "=================================================="

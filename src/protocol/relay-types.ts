@@ -19,6 +19,7 @@ export type RelayRequestMethod =
   | "unsubscribe"
   | "session.list"
   | "session.start"
+  | "session.get"
   | "session.prompt"
   | "session.abort"
   | "ui.response";
@@ -28,6 +29,7 @@ export const RELAY_REQUEST_METHODS: readonly RelayRequestMethod[] = [
   "unsubscribe",
   "session.list",
   "session.start",
+  "session.get",
   "session.prompt",
   "session.abort",
   "ui.response",
@@ -372,9 +374,15 @@ export interface SubscribeParams {
 }
 
 export interface SessionStartParams {
+  /** Omitted mode retains the original managed RPC behavior. */
+  mode?: "terminal" | "rpc";
   sessionId?: string;
   cwd?: string;
   args?: string[];
+}
+
+export interface SessionGetParams {
+  sessionId?: string;
 }
 
 export interface SessionPromptParams {

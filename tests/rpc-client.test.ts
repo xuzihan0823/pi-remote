@@ -104,6 +104,17 @@ test("a request that never gets a response rejects with RpcTimeoutError", async 
   await client.close();
 });
 
+test("omp terminal agent_end emits settled to release managed busy state", async () => {
+  const fake = createFakeChild();
+  const client = createClient(fake);
+  const events = collectEvents(client);
+  await client.start();
+  fake.pushStdout(`${JSON.stringify({ type: "agent_end", messages: [], isTerminal: true })}\n`);
+  await flush();
+  assert.deepEqual(events.map((event) => event.type), ["agent_end", "agent_settled"]);
+  await client.close();
+});
+
 test("message_update deltas and agent lifecycle are normalized into gateway events", async () => {
   const fake = createFakeChild();
   const client = createClient(fake);

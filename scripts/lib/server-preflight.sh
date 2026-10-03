@@ -220,14 +220,16 @@ preflight_is_port_occupied() {
   return 1
 }
 
-preflight_is_own_container() {
+preflight_own_container_publishes() {
   local container_name="$1"
+  local port="$2"
   if ! command -v docker >/dev/null 2>&1; then
     return 1
   fi
   local project_label
   project_label="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$container_name" 2>/dev/null || true)"
-  [[ "$project_label" == "pi-remote" ]]
+  [[ "$project_label" == "pi-remote" ]] || return 1
+  docker port "$container_name" 2>/dev/null | grep -E -q ":${port}\$"
 }
 
 preflight_check_ports() {
@@ -246,7 +248,7 @@ preflight_check_ports() {
   if [[ "$mode" == "standalone" ]]; then
     for p in 80 443; do
       if preflight_is_port_occupied "$p"; then
-        if [[ "$is_managed_upgrade" == true ]] && (preflight_is_own_container "pi-remote-caddy" || preflight_is_own_container "pi-remote-relay"); then
+        if [[ "$is_managed_upgrade" == true ]] && preflight_own_container_publishes "pi-remote-caddy" "$p"; then
           :
         else
           echo "错误: 端口 $p 已被占用。standalone 模式需要 80 和 443 端口。" >&2
@@ -256,7 +258,7 @@ preflight_check_ports() {
     done
   elif [[ "$mode" == "external-proxy" ]]; then
     if [[ -n "$port" ]] && preflight_is_port_occupied "$port"; then
-      if [[ "$is_managed_upgrade" == true ]] && preflight_is_own_container "pi-remote-relay"; then
+      if [[ "$is_managed_upgrade" == true ]] && preflight_own_container_publishes "pi-remote-relay" "$port"; then
         :
       else
         echo "错误: 端口 $port 已被占用。external-proxy 模式指定端口已被使用。" >&2

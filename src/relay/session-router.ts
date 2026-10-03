@@ -306,6 +306,9 @@ function validateRoutedRequest(frame: RelayRequestFrame): ValidationResult {
       return { ok: true, sessionId };
     case "session.start":
       return { ok: true, sessionId };
+    case "session.get":
+      if (!sessionId) return invalid("session.get requires sessionId", sessionId);
+      return { ok: true, sessionId };
     case "session.prompt": {
       if (!sessionId) return invalid("session.prompt requires sessionId", sessionId);
       if (!stringParam(params, "message") || stringParam(params, "message")!.length === 0) {

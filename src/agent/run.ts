@@ -1,6 +1,8 @@
 import { pathToFileURL } from "node:url";
 import { describeConfig, loadConfig } from "../config.ts";
 import { PiProcessManager } from "../pi/process-manager.ts";
+import { TerminalSessionBridge } from "../terminal/bridge-client.ts";
+import { TerminalSessionLauncher } from "../terminal/launcher.ts";
 import { AgentClient } from "./agent-client.ts";
 import { createPiAgentHandler } from "./pi-agent-handler.ts";
 
@@ -108,10 +110,25 @@ export async function main(): Promise<void> {
     maxSessions: config.maxSessions,
   });
 
+  const terminalBridge = new TerminalSessionBridge({
+    workspaceRoot: config.piWorkspaceRoot,
+    logger,
+  });
+  logger(`terminal bridge directories: ${terminalBridge.bridgeDirs.join(", ")}`);
+  const terminalLauncher = new TerminalSessionLauncher({
+    piBin: config.piBin,
+    workspaceRoot: config.piWorkspaceRoot,
+    bridge: terminalBridge,
+    maxSessions: config.maxSessions,
+    managedSessionCount: () => manager.list().filter((session) => session.state === "running").length,
+  });
+
   let client: AgentClient | undefined;
   const handler = createPiAgentHandler({
     manager,
     workspaceRoot: config.piWorkspaceRoot,
+    terminalBridge,
+    terminalLauncher,
     emitSessionEvent: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
     logger,
   });
@@ -124,23 +141,30 @@ export async function main(): Promise<void> {
   });
 
   const runtime = new AgentRuntime({ client, manager, logger });
-  await runtime.start();
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger(`received ${signal}, shutting down`);
+    terminalLauncher.close();
     try {
       await runtime.stop();
     } catch (error) {
       logger(`error during shutdown: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
+    } finally {
+      // Drops bridge client sockets only; the user's terminal processes keep running.
+      terminalBridge.close();
     }
   };
 
+  // Registered before the first connect attempt so a signal arriving during a slow handshake
+  // still tears the runtime down instead of skipping cleanup.
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  await runtime.start();
 }
 
 export function isMainModule(meta: ImportMeta, argv: string[] = process.argv): boolean {

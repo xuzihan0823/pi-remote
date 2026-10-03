@@ -9,11 +9,14 @@ export interface Config {
   agentToken: string;
   agentDeviceId: string;
   piBin: string;
+  piRuntime: "pi" | "omp";
   piWorkspaceRoot: string;
   maxSessions: number;
 }
 
 export const DEFAULT_PI_BIN = "pi";
+export const DEFAULT_OMP_BIN = "omp";
+export const DEFAULT_PI_RUNTIME = "pi" as const;
 export const DEFAULT_RELAY_HOST = "127.0.0.1";
 export const DEFAULT_RELAY_PORT = 8789;
 export const MIN_RELAY_TOKEN_LENGTH = 32;
@@ -64,7 +67,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const agentToken = parseToken(env.AGENT_TOKEN, "AGENT_TOKEN") ?? relayToken;
   const agentDeviceId = parseAgentDeviceId(env.AGENT_DEVICE_ID);
 
-  const piBin = (env.PI_BIN ?? DEFAULT_PI_BIN).trim();
+  const rawRuntime = env.PI_RUNTIME ?? DEFAULT_PI_RUNTIME;
+  if (rawRuntime !== "pi" && rawRuntime !== "omp") {
+    throw new ConfigError(`PI_RUNTIME must be "pi" or "omp", got ${JSON.stringify(rawRuntime)}`);
+  }
+  const piRuntime = rawRuntime;
+  const piBin = (env.PI_BIN ?? (piRuntime === "pi" ? DEFAULT_PI_BIN : DEFAULT_OMP_BIN)).trim();
   if (piBin.length === 0) {
     throw new ConfigError("PI_BIN must not be empty");
   }
@@ -88,6 +96,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     relayUrl,
     agentToken,
     agentDeviceId,
+    piRuntime,
     piBin,
     piWorkspaceRoot: resolvedWorkspaceRoot,
     maxSessions,
@@ -102,6 +111,7 @@ export function describeConfig(config: Config): string {
   return [
     `relayUrl=${config.relayUrl}`,
     `agentDeviceId=${config.agentDeviceId}`,
+    `piRuntime=${config.piRuntime}`,
     `piBin=${config.piBin}`,
     `workspaceRoot=${config.piWorkspaceRoot}`,
     `maxSessions=${config.maxSessions}`,

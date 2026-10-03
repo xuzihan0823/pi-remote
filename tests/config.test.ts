@@ -30,6 +30,7 @@ test("loadConfig applies documented defaults", () => {
     relayUrl: `ws://${DEFAULT_RELAY_HOST}:${DEFAULT_RELAY_PORT}/ws/agent`,
     agentToken: TOKEN,
     agentDeviceId: DEFAULT_AGENT_DEVICE_ID,
+    piRuntime: "pi",
     piBin: "pi",
     piWorkspaceRoot: join(homedir(), "Desktop"),
     maxSessions: DEFAULT_MAX_SESSIONS,
@@ -52,6 +53,7 @@ test("loadConfig reads overrides and trims values", () => {
     relayUrl: "ws://0.0.0.0:9001/ws/agent",
     agentToken: TOKEN,
     agentDeviceId: DEFAULT_AGENT_DEVICE_ID,
+    piRuntime: "pi",
     piBin: "/opt/pi/bin/pi",
     piWorkspaceRoot: "/srv/workspaces",
     maxSessions: 4,
@@ -87,6 +89,15 @@ test("loadConfig validates AGENT_DEVICE_ID and defaults it when empty", () => {
   assert.equal(loadConfig({ ...BASE, AGENT_DEVICE_ID: "mac_1:agent" }).agentDeviceId, "mac_1:agent");
   for (const deviceId of ["-leading", "has space", "a/b", "x".repeat(MAX_AGENT_DEVICE_ID_LENGTH + 1)]) {
     assert.throws(() => loadConfig({ ...BASE, AGENT_DEVICE_ID: deviceId }), ConfigError, `expected ${JSON.stringify(deviceId)} to be rejected`);
+  }
+});
+
+test("loadConfig chooses the omp binary when PI_RUNTIME is omp", () => {
+  assert.equal(loadConfig({ ...BASE, PI_RUNTIME: "omp" }).piBin, "omp");
+  assert.equal(loadConfig({ ...BASE, PI_RUNTIME: "omp" }).piRuntime, "omp");
+  assert.equal(loadConfig({ ...BASE, PI_RUNTIME: "omp", PI_BIN: " /opt/bin/omp " }).piBin, "/opt/bin/omp");
+  for (const runtime of ["", "OMP", "pi ", "other"]) {
+    assert.throws(() => loadConfig({ ...BASE, PI_RUNTIME: runtime }), /PI_RUNTIME must be/);
   }
 });
 

@@ -29,11 +29,13 @@ function createDockerStub(binDir: string, options: {
   daemonOk?: boolean;
   projectLabel?: string;
   networkExists?: boolean;
+  publishedPorts?: string;
 } = {}) {
   const composeOk = options.composeOk ?? true;
   const daemonOk = options.daemonOk ?? true;
   const projectLabel = options.projectLabel ?? 'pi-remote';
   const networkExists = options.networkExists ?? true;
+  const publishedPorts = options.publishedPorts ?? '80/tcp -> 0.0.0.0:80\\n443/tcp -> 0.0.0.0:443';
 
   const script = `#!/bin/sh
 cmd="$1"
@@ -49,6 +51,11 @@ fi
 
 if [ "$cmd" = "inspect" ]; then
   echo "${projectLabel}"
+  exit 0
+fi
+
+if [ "$cmd" = "port" ]; then
+  printf "${publishedPorts}\\n"
   exit 0
 fi
 
@@ -270,6 +277,25 @@ echo "LISTEN 0 128 0.0.0.0:80 0.0.0.0:*"
     { PATH: `${binDir}:/usr/bin:/bin` }
   );
   assert.equal(resOwnOccupied.status, 0);
+
+  // Case 2b: own container exists but the port is held by an unrelated process -> fails
+  createDockerStub(binDir, { projectLabel: 'pi-remote', publishedPorts: '443/tcp -> 0.0.0.0:443' });
+  const resOwnButOther = runBashScript(
+    `source "${PREFLIGHT_LIB}" && preflight_check_ports "standalone" "8789" "${managedDir}"`,
+    { PATH: `${binDir}:/usr/bin:/bin` }
+  );
+  assert.notEqual(resOwnButOther.status, 0);
+  assert.match(resOwnButOther.stderr, /端口 80 已被占用/);
+
+  // Case 2c: external-proxy relay publishes 19189, another process holds 19190 -> fails
+  fs.writeFileSync(path.join(binDir, 'ss'), `#!/bin/sh\necho "LISTEN 0 128 127.0.0.1:19190 0.0.0.0:*"\n`, { mode: 0o755 });
+  createDockerStub(binDir, { projectLabel: 'pi-remote', publishedPorts: '8789/tcp -> 127.0.0.1:19189' });
+  const resRelayOther = runBashScript(
+    `source "${PREFLIGHT_LIB}" && preflight_check_ports "external-proxy" "19190" "${managedDir}"`,
+    { PATH: `${binDir}:/usr/bin:/bin` }
+  );
+  assert.notEqual(resRelayOther.status, 0);
+  assert.match(resRelayOther.stderr, /端口 19190 已被占用/);
 
   // Case 3: external-proxy mode checking occupied custom port
   const ssPortScript = `#!/bin/sh

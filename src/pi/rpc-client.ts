@@ -367,6 +367,9 @@ export class RpcClient {
 
     const event = toGatewayEvent(record, this.sessionId);
     if (event) this.#emit(event);
+    if (type === "agent_end" && record.isTerminal === true) {
+      this.#emit({ type: "agent_settled", sessionId: this.sessionId });
+    }
   }
 
   #handleResponse(response: RpcResponsePayload): void {

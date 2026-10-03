@@ -1,13 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { PiProcessManager } from "../pi/process-manager.ts";
+import type { PiProcessManager, SessionProcessStatus } from "../pi/process-manager.ts";
 import { relayError, type RelayErrorCode } from "../protocol/relay-types.ts";
 import type { GatewayEvent, UiDialogResponse } from "../protocol/types.ts";
+import {
+  TerminalBridgeError,
+  isTerminalSessionId,
+  type TerminalSessionBridge,
+  type TerminalSessionMeta,
+} from "../terminal/bridge-client.ts";
 import type { AgentHandlerResult, AgentRequestHandler } from "./agent-client.ts";
+import type { TerminalSessionLauncher } from "../terminal/launcher.ts";
 
 export interface PiAgentHandlerOptions {
   manager: PiProcessManager;
   workspaceRoot: string;
+  terminalBridge?: TerminalSessionBridge;
+  terminalLauncher?: Pick<TerminalSessionLauncher, "start">;
   emitSessionEvent?: (sessionId: string, event: GatewayEvent) => void;
   logger?: (message: string) => void;
 }
@@ -19,13 +28,35 @@ export interface PiAgentHandlerOptions {
  * caller can relay streaming state, while request responses only acknowledge what was queued.
  */
 export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentRequestHandler {
-  const { manager, workspaceRoot } = options;
+  const { manager, workspaceRoot, terminalBridge } = options;
   const logger = options.logger ?? (() => {});
   const emitSessionEvent = options.emitSessionEvent ?? (() => {});
 
   manager.onEvent((event) => {
     emitSessionEvent(event.sessionId, event);
   });
+
+  const listSessions = async (): Promise<Record<string, unknown>[]> => {
+    const sessions: Record<string, unknown>[] = manager.list().map(toManagedSessionEntry);
+    if (!terminalBridge) return sessions;
+
+    let terminalSessions: TerminalSessionMeta[];
+    try {
+      terminalSessions = await terminalBridge.list();
+    } catch (error) {
+      logger(`terminal session list failed: ${error instanceof Error ? error.message : String(error)}`);
+      return sessions;
+    }
+
+    const seen = new Set(sessions.map((entry) => entry.sessionId));
+    for (const session of terminalSessions) {
+      if (seen.has(session.sessionId)) continue;
+      seen.add(session.sessionId);
+      // A terminal entry exists only while its bridge socket answers, so it is by definition running.
+      sessions.push({ ...session, source: "terminal", state: "running" });
+    }
+    return sessions;
+  };
 
   return async (request) => {
     const method = request.payload.method;
@@ -36,26 +67,58 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
     try {
       switch (method) {
         case "session.list":
-          return { ok: true, data: { sessions: manager.list() } };
+          return { ok: true, data: { sessions: await listSessions() } };
+
+        case "session.get": {
+          if (!sessionId) throw new HandlerError("invalid_frame", "session.get requires sessionId");
+          if (terminalBridge && isTerminalSessionId(sessionId)) {
+            return { ok: true, data: await terminalBridge.snapshot(sessionId) };
+          }
+          return {
+            ok: false,
+            error: relayError(
+              "not_implemented",
+              "session.get is only implemented for terminal sessions; managed sessions have no history API",
+            ),
+          };
+        }
 
         case "session.start": {
+          const mode = params.mode === undefined ? "rpc" : params.mode;
+          if (mode !== "rpc" && mode !== "terminal") throw new HandlerError("invalid_frame", "params.mode must be terminal or rpc");
+          if (mode === "terminal") {
+            if (params.args !== undefined) throw new HandlerError("invalid_frame", "terminal mode does not accept remote args");
+            if (sessionId) throw new HandlerError("invalid_frame", "terminal mode creates a new session and does not accept sessionId");
+            if (!options.terminalLauncher) throw new HandlerError("not_implemented", "terminal session creation is unavailable");
+            const session = await options.terminalLauncher.start(params.cwd);
+            return { ok: true, data: { sessionId: session.sessionId, source: "terminal", status: { ...session, source: "terminal", state: "running" } } };
+          }
+          if (sessionId && isTerminalSessionId(sessionId)) throw new HandlerError("invalid_frame", "RPC mode cannot create or resume a terminal session");
           const startedId = sessionId ?? randomUUID();
           const cwd = resolveWorkspaceCwd(workspaceRoot, params.cwd);
           const args = stringArrayParam(params, "args");
           const status = await manager.start(startedId, { cwd, ...(args ? { args } : {}) });
-          return { ok: true, data: { sessionId: startedId, status } };
+          return { ok: true, data: { sessionId: startedId, source: "managed", status } };
         }
 
         case "session.prompt": {
           if (!sessionId) throw new HandlerError("invalid_frame", "session.prompt requires sessionId");
           const message = stringParam(params, "message");
           if (!message) throw new HandlerError("invalid_frame", "session.prompt requires a non-empty message");
+          if (terminalBridge && isTerminalSessionId(sessionId)) {
+            await terminalBridge.prompt(sessionId, message);
+            return { ok: true, data: { sessionId, queued: true } };
+          }
           await manager.prompt(sessionId, message, Array.isArray(params.images) ? { images: params.images } : {});
           return { ok: true, data: { sessionId, queued: true } };
         }
 
         case "session.abort": {
           if (!sessionId) throw new HandlerError("invalid_frame", "session.abort requires sessionId");
+          if (terminalBridge && isTerminalSessionId(sessionId)) {
+            await terminalBridge.abort(sessionId);
+            return { ok: true, data: { sessionId, aborted: true } };
+          }
           await manager.abort(sessionId);
           return { ok: true, data: { sessionId, aborted: true } };
         }
@@ -64,6 +127,15 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
           if (!sessionId) throw new HandlerError("invalid_frame", "ui.response requires sessionId");
           const requestId = stringParam(params, "requestId");
           if (!requestId) throw new HandlerError("invalid_frame", "ui.response requires a non-empty requestId");
+          if (terminalBridge && isTerminalSessionId(sessionId)) {
+            return {
+              ok: false,
+              error: relayError(
+                "not_implemented",
+                "extension UI prompts for terminal sessions must be answered in the Mac terminal",
+              ),
+            };
+          }
           const client = manager.get(sessionId);
           if (!client) throw new HandlerError("unknown_session", `No pi process for session "${sessionId}"`);
           client.respondToUi(requestId, asDialogResponse(params.response));
@@ -93,6 +165,9 @@ class HandlerError extends Error {
 }
 
 function toHandlerError(error: unknown): AgentHandlerResult {
+  if (error instanceof TerminalBridgeError) {
+    return { ok: false, error: relayError(error.code, error.message) };
+  }
   if (error instanceof HandlerError) {
     return { ok: false, error: relayError(error.code, error.message) };
   }
@@ -112,6 +187,17 @@ function toHandlerError(error: unknown): AgentHandlerResult {
     default:
       return { ok: false, error: relayError("internal_error", message) };
   }
+}
+
+function toManagedSessionEntry(status: SessionProcessStatus): Record<string, unknown> {
+  const entry: Record<string, unknown> = {
+    ...status,
+    source: "managed",
+    title: status.title ?? status.sessionId,
+    activity: status.state === "running" && status.busy ? "busy" : "idle",
+  };
+  if (status.cwd) entry.cwd = status.cwd;
+  return entry;
 }
 
 function resolveWorkspaceCwd(workspaceRoot: string, requested: unknown): string {

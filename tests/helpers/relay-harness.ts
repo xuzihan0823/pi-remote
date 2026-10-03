@@ -13,6 +13,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     relayUrl: "ws://127.0.0.1/ws/agent",
     agentToken: TEST_TOKEN,
     agentDeviceId: "test-agent",
+    piRuntime: "pi",
     piBin: "pi",
     piWorkspaceRoot: "/tmp",
     maxSessions: 4,

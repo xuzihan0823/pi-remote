@@ -29,18 +29,32 @@ function createTempDir(prefix: string): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
-function createDockerStub(binDir: string, options: { failHealth?: boolean; failBuild?: boolean } = {}) {
+function createDockerStub(
+  binDir: string,
+  options: { failHealth?: boolean; failBuild?: boolean; failNewHealth?: boolean; failRestoreTag?: boolean } = {},
+) {
   const dockerPath = path.join(binDir, 'docker');
+  const restored = path.join(binDir, 'restored');
+  fs.rmSync(restored, { force: true });
+  // failNewHealth: only the rebuilt image is unhealthy; health passes again once the old image id is re-tagged.
   const script = `#!/bin/sh
 cmd="$1"
 shift
 
 if [ "$cmd" = "image" ]; then
-  # docker image inspect
+  case "$*" in *--format*) echo "sha256:old" ;; esac
   exit 0
 fi
 
 if [ "$cmd" = "tag" ]; then
+  if [ "$1" = "sha256:old" ]; then
+    ${options.failRestoreTag ? 'exit 1' : `touch "${restored}"`}
+  fi
+  exit 0
+fi
+
+if [ "$cmd" = "inspect" ]; then
+  echo "sha256:old"
   exit 0
 fi
 
@@ -49,18 +63,38 @@ if [ "$cmd" = "build" ]; then
 fi
 
 if [ "$cmd" = "compose" ]; then
-  # handle compose up / down / ps / etc
   exit 0
 fi
 
 if [ "$cmd" = "exec" ]; then
-  # health check simulation
-  ${options.failHealth ? 'exit 1' : 'exit 0'}
+  ${options.failHealth ? 'exit 1' : options.failNewHealth ? `[ -f "${restored}" ] && exit 0; exit 1` : 'exit 0'}
 fi
 
 exit 0
 `;
   fs.writeFileSync(dockerPath, script, { mode: 0o755 });
+}
+
+function installEnv(binDir: string, backupDir: string) {
+  return {
+    ...process.env,
+    PATH: `${binDir}:${process.env.PATH}`,
+    EUID: '0',
+    PI_REMOTE_BACKUP_DIR: backupDir,
+    PI_REMOTE_HEALTH_RETRIES: '2',
+    PI_REMOTE_HEALTH_INTERVAL: '0.1',
+  };
+}
+
+function runInstall(targetDir: string, env: NodeJS.ProcessEnv) {
+  return spawnSync('bash', [INSTALL_SCRIPT, '--domain', 'my.test.io', '--install-dir', targetDir], {
+    encoding: 'utf-8',
+    env,
+  });
+}
+
+function listTree(dir: string): string[] {
+  return (fs.readdirSync(dir, { recursive: true }) as string[]).sort();
 }
 
 test('server-install: --help prints usage and exits cleanly', () => {
@@ -315,6 +349,85 @@ test('server-install: verifies backup sha256 creation and old backup cleanup on 
   assert.notEqual(backup2, backup1);
   assert.equal(fs.existsSync(path.join(backupDir, backup1)), false, 'old backup should be cleaned up');
   assert.equal(fs.existsSync(path.join(backupDir, `${backup1}.sha256`)), false);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('server-install: failed upgrade restores the exact previous tree, image, and health', () => {
+  const tmpDir = createTempDir('pi-restore-exact-');
+  const binDir = path.join(tmpDir, 'bin');
+  const targetDir = path.join(tmpDir, 'target');
+  const backupDir = path.join(tmpDir, 'backups');
+  fs.mkdirSync(binDir);
+  fs.mkdirSync(backupDir);
+  createDockerStub(binDir);
+  const env = installEnv(binDir, backupDir);
+
+  assert.equal(runInstall(targetDir, env).status, 0);
+  // Simulate an older managed install that predates .dockerignore; a failed upgrade must not leave it behind.
+  fs.rmSync(path.join(targetDir, '.dockerignore'));
+  const before = listTree(targetDir);
+
+  createDockerStub(binDir, { failNewHealth: true });
+  const res = runInstall(targetDir, env);
+
+  assert.notEqual(res.status, 0);
+  assert.match(res.stderr, /旧服务健康检查通过/);
+  assert.deepEqual(listTree(targetDir), before);
+  assert.deepEqual(fs.readdirSync(tmpDir).filter(n => n.startsWith('.pi-remote-')), [], 'no staging dirs left');
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('server-install: reports rollback failure when the old image cannot be restored', () => {
+  const tmpDir = createTempDir('pi-restore-tag-');
+  const binDir = path.join(tmpDir, 'bin');
+  const targetDir = path.join(tmpDir, 'target');
+  const backupDir = path.join(tmpDir, 'backups');
+  fs.mkdirSync(binDir);
+  fs.mkdirSync(backupDir);
+  createDockerStub(binDir);
+  const env = installEnv(binDir, backupDir);
+  assert.equal(runInstall(targetDir, env).status, 0);
+
+  createDockerStub(binDir, { failNewHealth: true, failRestoreTag: true });
+  const res = runInstall(targetDir, env);
+
+  assert.notEqual(res.status, 0);
+  assert.match(res.stderr, /回滚失败，旧镜像/);
+  assert.doesNotMatch(res.stderr, /已恢复为更新前状态/);
+
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('server-install: upgrade never writes through symlinks inside the install dir', () => {
+  const tmpDir = createTempDir('pi-inner-link-');
+  const binDir = path.join(tmpDir, 'bin');
+  const targetDir = path.join(tmpDir, 'target');
+  const backupDir = path.join(tmpDir, 'backups');
+  const outside = path.join(tmpDir, 'outside.txt');
+  fs.mkdirSync(binDir);
+  fs.mkdirSync(backupDir);
+  fs.writeFileSync(outside, 'outside-original');
+  createDockerStub(binDir);
+  const env = installEnv(binDir, backupDir);
+  assert.equal(runInstall(targetDir, env).status, 0);
+
+  fs.rmSync(path.join(targetDir, 'Caddyfile'));
+  fs.symlinkSync(outside, path.join(targetDir, 'Caddyfile'));
+  assert.equal(runInstall(targetDir, env).status, 0);
+  assert.equal(fs.readFileSync(outside, 'utf-8'), 'outside-original');
+  assert.equal(fs.lstatSync(path.join(targetDir, 'Caddyfile')).isSymbolicLink(), false);
+
+  const envPath = path.join(targetDir, '.env');
+  fs.copyFileSync(envPath, outside);
+  const outsideEnv = fs.readFileSync(outside, 'utf-8');
+  fs.rmSync(envPath);
+  fs.symlinkSync(outside, envPath);
+  const res = runInstall(targetDir, env);
+  assert.notEqual(res.status, 0);
+  assert.match(res.stderr, /\.env 是符号链接/);
+  assert.equal(fs.readFileSync(outside, 'utf-8'), outsideEnv);
 
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
