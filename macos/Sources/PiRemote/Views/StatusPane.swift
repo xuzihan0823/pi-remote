@@ -65,6 +65,7 @@ struct StatusPane: View {
             .padding(32)
             .frame(maxWidth: .infinity)
         }
+        .scrollIndicators(.hidden)
         .onAppear {
             guard !appeared else { return }
             withAnimation(Motion.resolved(Motion.entrance, reduceMotion: reduceMotion)) { appeared = true }
@@ -91,12 +92,6 @@ struct StatusPane: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(model.workspacePath)
-                if model.connectedIOSURL != nil {
-                    Text(model.mode == .cloudflare ? "临时隧道需扫码配对；仅有地址不能完成连接。" : "手动连接还需要连接密钥；复制的地址不含密钥。")
-                        .font(Theme.Font.caption)
-                        .foregroundColor(Theme.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
             Spacer(minLength: 0)
             Button(didCopyAddress ? "已复制" : "复制地址") {

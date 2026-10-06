@@ -60,6 +60,7 @@ struct ClaudeStatusPane: View {
             .padding(32)
             .frame(maxWidth: .infinity)
         }
+        .scrollIndicators(.hidden)
         .task(id: PairKey(state: claude.state, publicURL: claude.publicURL, mode: mode)) { await loadPairCode() }
         .onChange(of: claude.state) { state in
             ContentView.announce("Claude \(ClaudePresentation.make(state: state, mode: mode).badge)")
@@ -114,12 +115,6 @@ struct ClaudeStatusPane: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(claude.configuration.projectsDirectory)
-                if copyableAddress != nil {
-                    Text(isTunnel ? "配对需扫码；复制的地址不含访问凭据。" : "地址只能在这台 Mac 上打开。")
-                        .font(Theme.Font.caption)
-                        .foregroundColor(Theme.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
             }
             Spacer(minLength: 0)
             Button(didCopy ? "已复制" : "复制地址") {
