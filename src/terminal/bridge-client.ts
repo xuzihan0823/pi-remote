@@ -5,6 +5,7 @@ import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { RelayErrorCode } from "../protocol/relay-types.ts";
+import type { TimelineItem } from "./extension.ts";
 
 /** Every session served by the terminal bridge is addressed with this prefix. */
 export const TERMINAL_SESSION_PREFIX = "terminal:";
@@ -27,6 +28,9 @@ export interface TerminalSessionMeta {
   activity: TerminalActivity;
   /** Present only for the initial session of a gateway-created terminal. */
   launchId?: string;
+  runtime?: "omp" | "pi";
+  persistedSessionId?: string;
+  capabilities?: { timelineV2: boolean; toolDetails: boolean };
 }
 
 export interface TerminalSnapshotMessage {
@@ -39,6 +43,16 @@ export interface TerminalSessionSnapshot {
   activity: TerminalActivity;
   messages: TerminalSnapshotMessage[];
   truncated: boolean;
+  viewVersion?: number;
+  revision?: string;
+  branchId?: string;
+  availability?: string;
+  canControl?: boolean;
+  items?: TimelineItem[];
+  page?: { hasMoreBefore: boolean; before: string | null };
+  generation?: number;
+  replacements?: Record<string, string>;
+  warnings?: string[];
 }
 
 export function isTerminalSessionId(sessionId: string): boolean {
@@ -129,6 +143,16 @@ export class TerminalSessionBridge {
     return entry.meta;
   }
 
+
+  async view(sessionId: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const entry = await this.#resolve(sessionId);
+    if (!entry.meta.capabilities?.timelineV2) return { ...await this.snapshot(sessionId), canControl: true, availability: "live" };
+    const data = await this.#call(entry.socketPath, { ...params, op: "snapshot", sessionId, viewVersion: 2 }, this.#requestTimeoutMs);
+    if (!data || typeof data !== "object" || (data as Record<string, unknown>).sessionId !== sessionId) {
+      throw new TerminalBridgeError("internal_error", "terminal bridge returned an invalid timeline");
+    }
+    return data as Record<string, unknown>;
+  }
   async snapshot(sessionId: string): Promise<TerminalSessionSnapshot> {
     const entry = await this.#resolve(sessionId);
     const data = await this.#call(entry.socketPath, { op: "snapshot", sessionId }, this.#requestTimeoutMs);
@@ -266,7 +290,7 @@ export class TerminalSessionBridge {
       socket.on("error", (error) => finish(toBridgeError(error)));
       socket.on("data", (chunk) => {
         buffer += chunk;
-        if (buffer.length > MAX_RESPONSE_BYTES) {
+        if (Buffer.byteLength(buffer, "utf8") > MAX_RESPONSE_BYTES) {
           finish(new TerminalBridgeError("internal_error", "terminal bridge response exceeded the size limit"));
           return;
         }
@@ -370,7 +394,17 @@ function parseSessionMeta(value: unknown): TerminalSessionMeta | null {
   if (!sessionId || !isTerminalSessionId(sessionId) || !cwd) return null;
   const title = typeof record.title === "string" && record.title.trim().length > 0 ? record.title : sessionId;
   const launchId = typeof record.launchId === "string" && /^[0-9a-f-]{36}$/.test(record.launchId) ? record.launchId : undefined;
-  return { sessionId, title, cwd, activity: parseActivity(record.activity), ...(launchId ? { launchId } : {}) };
+  return {
+    sessionId, title, cwd, activity: parseActivity(record.activity), ...(launchId ? { launchId } : {}),
+    ...(record.runtime === "omp" || record.runtime === "pi" ? { runtime: record.runtime } : {}),
+    ...(typeof record.persistedSessionId === "string" ? { persistedSessionId: record.persistedSessionId } : {}),
+    ...(typeof record.capabilities === "object" && record.capabilities !== null ? {
+      capabilities: {
+        timelineV2: (record.capabilities as Record<string, unknown>).timelineV2 === true,
+        toolDetails: (record.capabilities as Record<string, unknown>).toolDetails === true,
+      },
+    } : {}),
+  };
 }
 
 function parseSnapshot(value: unknown): TerminalSessionSnapshot | null {

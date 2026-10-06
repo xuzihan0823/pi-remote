@@ -5,6 +5,7 @@ import { TerminalSessionBridge } from "../terminal/bridge-client.ts";
 import { TerminalSessionLauncher } from "../terminal/launcher.ts";
 import { AgentClient } from "./agent-client.ts";
 import { createPiAgentHandler } from "./pi-agent-handler.ts";
+import { defaultOmpHistoryRoots, OmpHistoryIndex } from "../history/history-index.ts";
 
 export interface AgentRuntimeOptions {
   client: AgentClient;
@@ -124,11 +125,13 @@ export async function main(): Promise<void> {
   });
 
   let client: AgentClient | undefined;
+  const history = new OmpHistoryIndex({ workspaceRoot: config.piWorkspaceRoot, roots: config.ompHistoryRoots ?? defaultOmpHistoryRoots() });
   const handler = createPiAgentHandler({
     manager,
     workspaceRoot: config.piWorkspaceRoot,
     terminalBridge,
     terminalLauncher,
+    history,
     emitSessionEvent: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
     logger,
   });
@@ -156,6 +159,7 @@ export async function main(): Promise<void> {
     } finally {
       // Drops bridge client sockets only; the user's terminal processes keep running.
       terminalBridge.close();
+      history.close();
     }
   };
 

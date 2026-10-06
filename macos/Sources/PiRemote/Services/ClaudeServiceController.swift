@@ -225,6 +225,18 @@ final class ClaudeServiceController: ObservableObject {
         await stop()
     }
 
+    #if DEBUG
+    /// Snapshot fixtures only: lets `SnapshotRenderer` show states without spawning processes.
+    var fixturePairInfo: ClaudePairInfo?
+
+    func applyFixture(state: State, configuration: ClaudeServiceConfiguration, publicURL: URL?, logs: [String]) {
+        self.state = state
+        self.configuration = configuration
+        self.publicURL = publicURL
+        self.logs = logs
+    }
+    #endif
+
     func readPairInfo() async throws -> ClaudePairInfo {
         guard state == .running, let token = activeToken, let identifier = instanceId else {
             throw ValidationError("Claude 服务尚未就绪，不能读取配对信息")

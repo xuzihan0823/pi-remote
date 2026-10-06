@@ -97,6 +97,7 @@ final class AppModel: ObservableObject {
     @Published var fieldErrors: [ConfigField: String] = [:]
     @Published var deployStage: DeployStage = .idle
     @Published var diagnosticsExpanded = false
+    @Published var activeService: ServiceKind = .pi
     @Published var statusDetail: String = "未连接"
     @Published var errorMessage: String? = nil
     @Published var infoMessage: String? = nil

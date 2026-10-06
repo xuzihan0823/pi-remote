@@ -9,7 +9,7 @@
 // The bridge only ever runs inside an interactive TUI session. It reads the live session state
 // from the current extension context and forwards prompts/aborts to the very same process, so a
 // remote client never becomes a second writer on a session.
-import { randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
@@ -34,14 +34,22 @@ interface TextBlock {
   text?: string;
 }
 
-interface PiMessage {
+export interface PiMessage {
   role?: string;
   content?: unknown;
+  toolCallId?: string;
+  toolName?: string;
+  isError?: boolean;
+  timestamp?: number;
+  stopReason?: string;
 }
 
-interface PiSessionEntry {
+export interface PiSessionEntry {
+  id?: string;
+  parentId?: string | null;
   type?: string;
   message?: PiMessage;
+  summary?: string;
 }
 
 interface PiSessionManager {
@@ -70,6 +78,12 @@ interface PiContext {
 interface PiEvent {
   type: string;
   message?: PiMessage;
+  toolCallId?: string;
+  toolName?: string;
+  args?: unknown;
+  result?: unknown;
+  partialResult?: unknown;
+  isError?: boolean;
 }
 
 type PiHandler = (event: PiEvent, ctx: PiContext) => void | Promise<void>;
@@ -85,6 +99,9 @@ interface SessionMeta {
   title: string;
   activity: "busy" | "idle";
   launchId?: string;
+  runtime?: "omp" | "pi";
+  persistedSessionId?: string;
+  capabilities?: { timelineV2: boolean; toolDetails: boolean };
 }
 
 interface SnapshotMessage {
@@ -121,6 +138,14 @@ export default function piRemoteBridge(pi: PiApi): void {
   let socketPath: string | null = null;
   let partialAssistant = "";
   let warned = false;
+  let streaming: { id: string; message: PiMessage; final: boolean; baseIds: Set<string>; persistedId?: string } | null = null;
+  let streamGeneration = 0;
+  let streamOrdinal = 0;
+  const toolStates = new Map<string, ToolStatus>();
+  const viewService = new TimelineViewService();
+  let branchIdentity = randomBytes(8).toString("hex");
+  let previousLeaf: string | undefined;
+  const stagedResults = new Map<string, PiSessionEntry>();
   const clientSockets = new Set<Socket>();
   // Binding to the exec'd PID prevents inherited launch metadata from exposing child agents.
   const launchOwner = process.env.PI_REMOTE_LAUNCH_PID;
@@ -269,7 +294,7 @@ export default function piRemoteBridge(pi: PiApi): void {
     });
     socket.on("data", (chunk: string) => {
       buffer += chunk;
-      if (buffer.length > MAX_REQUEST_BYTES) {
+      if (Buffer.byteLength(buffer, "utf8") > MAX_REQUEST_BYTES) {
         writeResponse(socket, { id: null, ok: false, error: { code: "invalid_request", message: "request exceeded the size limit" } });
         socket.destroy();
         return;
@@ -322,7 +347,7 @@ export default function piRemoteBridge(pi: PiApi): void {
         case "get":
           return success(sessionMeta(ctx, sessionId));
         case "snapshot":
-          return success(buildSnapshot(ctx, sessionId));
+          return success(request.viewVersion === 2 ? buildTimeline(ctx, sessionId, request) : buildSnapshot(ctx, sessionId));
         case "prompt": {
           const message = request.message;
           if (typeof message !== "string" || message.trim().length === 0) {
@@ -349,6 +374,8 @@ export default function piRemoteBridge(pi: PiApi): void {
     if (sessionId !== initialSessionId) launchSessionReplaced = true;
     return {
       sessionId, cwd: ctx.cwd, title: currentTitle(), activity: currentActivity(),
+      runtime: runtimeName(), persistedSessionId: ctx.sessionManager.getSessionId(),
+      capabilities: { timelineV2: true, toolDetails: true },
       ...(!launchSessionReplaced && launchId && /^[0-9a-f-]{36}$/.test(launchId) && sessionId === initialSessionId ? { launchId } : {}),
     };
   }
@@ -374,10 +401,56 @@ export default function piRemoteBridge(pi: PiApi): void {
     return { sessionId, activity: currentActivity(), messages: limited.messages, truncated: limited.truncated };
   }
 
+  function buildTimeline(ctx: PiContext, sessionId: string, request: Record<string, unknown>): Record<string, unknown> {
+    const branch = ctx.sessionManager.getBranch() ?? [];
+    if (previousLeaf && !branch.some(entry => entry.id === previousLeaf)) {
+      branchIdentity = randomBytes(8).toString("hex");
+      streamGeneration += 1;
+      streaming = null;
+      toolStates.clear();
+      stagedResults.clear();
+    }
+    previousLeaf = branch.at(-1)?.id;
+    const replacements: Record<string, string> = {};
+    if (streaming) {
+      const candidates = branch.filter(entry => entry.id && !streaming!.baseIds.has(entry.id) &&
+        entry.type === "message" && entry.message?.role === "assistant");
+      const committed = candidates.find(entry => entry.message === streaming!.message ||
+        (typeof streaming!.message.timestamp === "number" && entry.message?.timestamp === streaming!.message.timestamp)) ??
+        (streaming.final && candidates.length === 1 ? candidates[0] : undefined);
+      if (committed?.id) {
+        streaming.persistedId = committed.id;
+        replacements[streaming.id] = committed.id;
+      }
+    }
+    const entries = [...branch];
+    if (streaming && !streaming.persistedId) entries.push({ type: "message", id: streaming.id, message: streaming.message });
+    for (const [callId, result] of stagedResults) {
+      if (branch.some(entry => entry.message?.role === "toolResult" && entry.message.toolCallId === callId)) {
+        stagedResults.delete(callId);
+      } else {
+        entries.push(result);
+      }
+    }
+    const projection = projectTranscript(entries, { toolStates });
+    const branchId = branchIdentity;
+    const revision = createHash("sha256").update(`${branchIdentity}:${streamGeneration}:`).update(JSON.stringify(projection)).digest("hex");
+    return viewService.respond({
+      sessionId, branchId, revision, availability: "live", canControl: true,
+      activity: currentActivity(), generation: streamGeneration, replacements,
+    }, projection, request);
+  }
+
   pi.on("session_start", (_event, ctx) => {
     if (!isUserTerminal(ctx)) return;
     latestContext = ctx;
     partialAssistant = "";
+    streaming = null;
+    streamGeneration += 1;
+    toolStates.clear();
+    stagedResults.clear();
+    previousLeaf = undefined;
+    branchIdentity = randomBytes(8).toString("hex");
     const sessionId = currentSessionId();
     if (initialSessionId !== null && sessionId !== initialSessionId) launchSessionReplaced = true;
     initialSessionId ??= sessionId;
@@ -394,12 +467,37 @@ export default function piRemoteBridge(pi: PiApi): void {
     if (!isUserTerminal(ctx)) return;
     latestContext = ctx;
     partialAssistant = "";
+    streamGeneration += 1;
+    streaming = null;
+    toolStates.clear();
+    stagedResults.clear();
   });
 
+
+  pi.on("message_start", (event, ctx) => {
+    if (!isUserTerminal(ctx) || event.message?.role !== "assistant") return;
+    latestContext = ctx;
+    streaming = {
+      id: `stream:${streamGeneration}:${++streamOrdinal}`, message: event.message, final: false,
+      baseIds: new Set(ctx.sessionManager.getBranch().flatMap(entry => entry.id ? [entry.id] : [])),
+    };
+  });
   pi.on("message_update", (event, ctx) => {
     if (!isUserTerminal(ctx)) return;
     latestContext = ctx;
-    if (event.message?.role === "assistant") partialAssistant = extractText(event.message.content);
+    if (event.message?.role === "assistant") {
+      partialAssistant = extractText(event.message.content);
+      streaming ??= {
+        id: `stream:${streamGeneration}:${++streamOrdinal}`, message: event.message, final: false,
+        baseIds: new Set(ctx.sessionManager.getBranch().flatMap(entry => entry.id ? [entry.id] : [])),
+      };
+      streaming.message = event.message;
+      const content = event.message.content;
+      if (Array.isArray(content)) for (const raw of content) {
+        const block = asRecord(raw);
+        if (block?.type === "toolCall" && typeof block.id === "string" && !toolStates.has(block.id)) toolStates.set(block.id, "requested");
+      }
+    }
   });
 
   // The assistant message is persisted right after this handler returns, so clearing the partial
@@ -407,7 +505,13 @@ export default function piRemoteBridge(pi: PiApi): void {
   pi.on("message_end", (event, ctx) => {
     if (!isUserTerminal(ctx)) return;
     latestContext = ctx;
-    if (event.message?.role === "assistant") partialAssistant = "";
+    if (event.message?.role === "assistant") {
+      partialAssistant = "";
+      if (streaming) {
+        streaming.message = event.message;
+        streaming.final = true;
+      }
+    }
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -415,13 +519,38 @@ export default function piRemoteBridge(pi: PiApi): void {
     latestContext = ctx;
     partialAssistant = "";
   });
+
+  for (const eventName of ["tool_execution_start", "tool_execution_update", "tool_execution_end"]) {
+    pi.on(eventName, (event, ctx) => {
+      if (!isUserTerminal(ctx) || !event.toolCallId) return;
+      latestContext = ctx;
+      if (eventName === "tool_execution_end") {
+        const result = asRecord(event.result);
+        if (result && (Array.isArray(result.content) || typeof result.content === "string")) {
+          stagedResults.set(event.toolCallId, {
+            type: "message", id: `stream:tool:${streamGeneration}:${event.toolCallId}`,
+            message: { role: "toolResult", toolCallId: event.toolCallId, toolName: event.toolName,
+              content: result.content, isError: event.isError === true },
+          });
+        } else {
+          toolStates.set(event.toolCallId, "unknown");
+        }
+      } else {
+        toolStates.set(event.toolCallId, "running");
+      }
+    });
+  }
 }
 
 function bridgeDir(): string {
   const override = process.env[BRIDGE_DIR_ENV];
   if (override !== undefined && override.trim().length > 0) return override.trim();
-  const runtime = basename(process.execPath) === "omp" || process.argv.some((arg) => arg.includes("omp-darwin") || arg.includes("omp-linux")) ? ".omp" : ".pi";
-  return join(homedir(), runtime, "agent", "pi-remote-bridge");
+  return join(homedir(), runtimeName() === "omp" ? ".omp" : ".pi", "agent", "pi-remote-bridge");
+}
+
+function runtimeName(): "omp" | "pi" {
+  return basename(process.execPath) === "omp" ||
+    process.argv.some(arg => arg.includes("omp-darwin") || arg.includes("omp-linux")) ? "omp" : "pi";
 }
 
 function findLastUserText(ctx: PiContext): string | null {
@@ -482,7 +611,10 @@ function truncateTitle(text: string): string {
 
 function truncateBytes(text: string, maxBytes: number): string {
   const buffer = Buffer.from(text, "utf8");
-  return buffer.length <= maxBytes ? text : buffer.subarray(0, maxBytes).toString("utf8");
+  if (buffer.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+  return buffer.subarray(0, end).toString("utf8");
 }
 
 function byteLength(text: string): number {
@@ -512,4 +644,250 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export type ToolStatus = "requested" | "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+export interface TimelineItem {
+  id: string;
+  kind: "message" | "toolCall" | "toolResult" | "boundary" | "unsupported";
+  role?: "user" | "assistant";
+  text?: string;
+  name?: string;
+  toolCallId?: string;
+  status?: ToolStatus;
+  preview?: string;
+  detailId?: string;
+  truncated?: boolean;
+  sourceTruncated?: boolean;
+  isError?: boolean;
+}
+export interface ProjectedTranscript {
+  items: TimelineItem[];
+  details: Record<string, { arguments?: string; result?: string; error?: string; sourceTruncated?: boolean }>;
+  warnings: string[];
+  offset?: number;
+  total?: number;
+}
+
+export function safeText(text: string): string {
+  return text
+    .replace(/\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, "")
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
+    .replace(/((?:authorization|api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*["']?)[^\s"',;]+/gi, "$1[已隐藏]")
+    .replace(/([?&](?:token|key|secret|password|access_token)=)[^&#\s)]+/gi, "$1[已隐藏]")
+    .replace(/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16})\b/g, "[凭据已隐藏]")
+    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, "[私钥已隐藏]");
+}
+
+function safeArguments(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[内容已隐藏]";
+  if (typeof value === "string") return safeText(value);
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (Array.isArray(value)) return value.slice(0, 1000).map(item => safeArguments(item, depth + 1));
+  const record = asRecord(value);
+  if (!record) return "[未记录]";
+  return Object.fromEntries(Object.entries(record).slice(0, 1000).map(([key, item]) => [
+    safeText(key),
+    /token|password|secret|credential|authorization|api.?key|signature|providerPayload|thinking/i.test(key)
+      ? "[已隐藏]" : safeArguments(item, depth + 1),
+  ]));
+}
+
+export function projectTranscript(
+  entries: readonly PiSessionEntry[],
+  options: { live?: boolean; toolStates?: ReadonlyMap<string, ToolStatus> } = {},
+): ProjectedTranscript {
+  const items: TimelineItem[] = [];
+  const details: ProjectedTranscript["details"] = {};
+  const warnings: string[] = [];
+  const calls = new Map<string, TimelineItem[]>();
+  const results = new Map<string, TimelineItem[]>();
+  for (const [ordinal, entry] of entries.entries()) {
+    const entryId = entry.id ?? `legacy:${ordinal}`;
+    if (entry.type === "compaction" || entry.type === "reset_boundary" || entry.type === "branch_summary") {
+      const id = `${entryId}:boundary`;
+      const summary = typeof entry.summary === "string" ? safeText(entry.summary) : "";
+      items.push({
+        id, kind: "boundary", text: entry.type === "compaction" ? "上下文已压缩" :
+          entry.type === "reset_boundary" ? "上下文已清空" : "分支摘要",
+        ...(summary ? { preview: truncateBytes(summary, 1024), detailId: id } : {}),
+      });
+      if (summary) details[id] = { result: summary };
+      continue;
+    }
+    if (entry.type !== "message" || !entry.message) continue;
+    const message = entry.message;
+    const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] :
+      Array.isArray(message.content) ? message.content : [];
+    if (message.role === "toolResult") {
+      const id = `${entryId}:block-0`;
+      const result = safeText(extractText(message.content));
+      const item: TimelineItem = {
+        id, kind: "toolResult", toolCallId: message.toolCallId, name: safeText(message.toolName ?? "工具"),
+        isError: message.isError === true, preview: truncateBytes(result || "未记录文字结果（附件未载入）", 1024),
+        detailId: id, sourceTruncated: /(?:\[.{0,80}truncated.{0,80}\]|输出已截断)/i.test(result),
+      };
+      items.push(item);
+      details[id] = { result, ...(message.isError ? { error: result } : {}), sourceTruncated: item.sourceTruncated };
+      if (item.toolCallId) results.set(item.toolCallId, [...(results.get(item.toolCallId) ?? []), item]);
+      continue;
+    }
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    for (const [blockOrdinal, raw] of blocks.entries()) {
+      const block = asRecord(raw);
+      if (!block) continue;
+      const id = `${entryId}:block-${blockOrdinal}`;
+      if (block.type === "text" && typeof block.text === "string") {
+        const text = safeText(block.text);
+        if (!text) continue;
+        const truncated = byteLength(text) > 4096;
+        items.push({ id, kind: "message", role: message.role, text: truncateBytes(text, 4096),
+          ...(truncated ? { truncated: true, detailId: id } : {}) });
+        if (truncated) details[id] = { result: text };
+      } else if (message.role === "assistant" && block.type === "toolCall" &&
+        typeof block.id === "string" && typeof block.name === "string") {
+        const args = block.arguments === undefined ? undefined : JSON.stringify(safeArguments(block.arguments), null, 2);
+        const item: TimelineItem = {
+          id, kind: "toolCall", name: truncateBytes(safeText(block.name), 100), toolCallId: block.id, detailId: id,
+          status: options.toolStates?.get(block.id) ?? (options.live ? "requested" : "unknown"),
+          preview: args ? truncateBytes(args, 256) : "未记录参数",
+        };
+        items.push(item);
+        details[id] = { ...(args ? { arguments: args } : {}) };
+        calls.set(block.id, [...(calls.get(block.id) ?? []), item]);
+      } else if (!["thinking", "redactedThinking"].includes(String(block.type))) {
+        items.push({ id, kind: "unsupported", text: "附件或未知内容未载入" });
+      }
+    }
+  }
+  for (const [callId, callItems] of calls) {
+    const resultItems = results.get(callId) ?? [];
+    if (callItems.length > 1 || resultItems.length > 1) {
+      warnings.push("工具调用 ID 或结果冲突，未自动配对");
+      for (const item of callItems) item.status = "unknown";
+    } else if (resultItems[0]) {
+      const call = callItems[0]!;
+      const result = resultItems[0];
+      call.status = result.isError ? "failed" : "succeeded";
+      result.status = call.status;
+      details[call.id] = { ...details[call.id], ...details[result.id] };
+    }
+  }
+  for (const [callId, resultItems] of results) {
+    if (!calls.has(callId)) for (const result of resultItems) result.status = "unknown";
+  }
+  return { items, details, warnings: [...new Set(warnings)] };
+}
+
+export interface TimelineContext {
+  sessionId: string;
+  branchId: string;
+  revision: string;
+  availability: "live" | "archived";
+  canControl: boolean;
+  activity?: string;
+  generation?: number;
+  replacements?: Record<string, string>;
+}
+
+export class TimelineRequestError extends Error {}
+
+export class TimelineViewService {
+  readonly #secret = randomBytes(32);
+
+  #token(context: TimelineContext, value: Record<string, unknown>): string {
+    const body = Buffer.from(JSON.stringify({ ...value, expires: (Math.floor(Date.now() / 900_000) + 2) * 900_000,
+      session: context.sessionId, branch: context.branchId, revision: context.revision, viewVersion: 2 })).toString("base64url");
+    return `${body}.${createHmac("sha256", this.#secret).update(body).digest("base64url")}`;
+  }
+
+  #decode(context: TimelineContext, raw: unknown): Record<string, unknown> {
+    if (typeof raw !== "string" || raw.length > 4096) throw new TimelineRequestError("无效的历史引用");
+    const [body, signature] = raw.split(".");
+    if (!body || !signature || createHmac("sha256", this.#secret).update(body).digest("base64url") !== signature) {
+      throw new TimelineRequestError("无效的历史引用");
+    }
+    const value = asRecord(JSON.parse(Buffer.from(body, "base64url").toString("utf8")));
+    if (!value || value.session !== context.sessionId || value.branch !== context.branchId ||
+      value.revision !== context.revision || value.viewVersion !== 2 || Number(value.expires) < Date.now()) {
+      throw new TimelineRequestError("历史已变化或引用过期，请刷新");
+    }
+    return value;
+  }
+
+  pageRange(context: TimelineContext, total: number, params: Record<string, unknown>): { start: number; end: number } {
+    let end = total;
+    if (params.before != null) {
+      const cursor = this.#decode(context, params.before);
+      if (cursor.kind !== "timeline") throw new TimelineRequestError("无效的时间线分页");
+      end = Number(cursor.end);
+    }
+    if (!Number.isSafeInteger(end) || end < 0 || end > total) throw new TimelineRequestError("无效的时间线边界");
+    const limit = typeof params.limit === "number" && Number.isFinite(params.limit)
+      ? Math.max(1, Math.min(50, Math.floor(params.limit))) : 50;
+    return { start: Math.max(0, end - limit), end };
+  }
+
+  detailItemId(context: TimelineContext, params: Record<string, unknown>): string {
+    const reference = this.#decode(context, params.detailId);
+    if (reference.kind !== "detail" || typeof reference.id !== "string") throw new TimelineRequestError("无效的详情引用");
+    return reference.id;
+  }
+
+  respond(context: TimelineContext, projection: ProjectedTranscript, params: Record<string, unknown>): Record<string, unknown> {
+    if (params.view === "tool") {
+      if (params.revision !== context.revision) throw new TimelineRequestError("详情已变化，请刷新");
+      const reference = this.#decode(context, params.detailId);
+      if (reference.kind !== "detail" || typeof reference.id !== "string") throw new TimelineRequestError("无效的详情引用");
+      const detail = projection.details[reference.id];
+      if (!detail) throw new TimelineRequestError("详情未记录");
+      const field = params.field === "arguments" || params.field === "error" ? params.field : "result";
+      let offset = 0;
+      if (params.cursor != null) {
+        const cursor = this.#decode(context, params.cursor);
+        if (cursor.kind !== "tool" || cursor.id !== reference.id || cursor.field !== field) throw new TimelineRequestError("无效的详情分页");
+        offset = Number(cursor.offset);
+      }
+      const text = detail[field];
+      if (text === undefined) return { ...context, field, recorded: false, totalBytes: 0, returnedBytes: 0 };
+      const bytes = Buffer.from(text);
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset > bytes.length) throw new TimelineRequestError("无效的详情偏移");
+      const remaining = bytes.subarray(offset).toString("utf8");
+      let budget = 60 * 1024;
+      const makeDetail = (): Record<string, unknown> => {
+        const value = truncateBytes(remaining, budget);
+        const returnedBytes = byteLength(value);
+        const hasMore = offset + returnedBytes < bytes.length;
+        return {
+          ...context, field, recorded: true, text: value, totalBytes: bytes.length, returnedBytes,
+          truncated: hasMore, sourceTruncated: detail.sourceTruncated ?? false,
+          nextCursor: hasMore ? this.#token(context, { kind: "tool", id: reference.id, field, offset: offset + returnedBytes }) : null,
+        };
+      };
+      let response = makeDetail();
+      while (byteLength(JSON.stringify(response)) > 64 * 1024 && budget > 1) {
+        budget = Math.floor(budget * 0.75);
+        response = makeDetail();
+      }
+      if (byteLength(JSON.stringify(response)) > 64 * 1024) throw new TimelineRequestError("详情元数据超过预算");
+      return response;
+    }
+    if (params.view !== undefined && params.view !== "timeline") throw new TimelineRequestError("不支持的历史视图");
+    const range = this.pageRange(context, projection.total ?? projection.items.length, params);
+    const end = range.end;
+    let start = range.start;
+    const makePage = (): Record<string, unknown> => {
+      const items = projection.items.slice(start - (projection.offset ?? 0), end - (projection.offset ?? 0)).map(item => ({
+        ...item, ...(item.detailId ? { detailId: this.#token(context, { kind: "detail", id: item.detailId }) } : {}),
+      }));
+      const messages = items.flatMap(item => item.kind === "message" ? [{ role: item.role, text: item.text }] : []);
+      return { ...context, viewVersion: 2, items, messages, truncated: items.some(item => item.truncated),
+        warnings: projection.warnings.slice(0, 20),
+        page: { hasMoreBefore: start > 0, before: start > 0 ? this.#token(context, { kind: "timeline", end: start }) : null } };
+    };
+    let page = makePage();
+    while (byteLength(JSON.stringify(page)) > 256 * 1024 && start < end - 1) page = (start++, makePage());
+    if (byteLength(JSON.stringify(page)) > 256 * 1024) throw new TimelineRequestError("时间线元数据超过预算");
+    return page;
+  }
 }

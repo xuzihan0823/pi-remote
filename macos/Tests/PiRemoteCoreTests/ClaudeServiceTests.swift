@@ -148,4 +148,14 @@ final class ClaudeServiceTests: XCTestCase {
         XCTAssertEqual(info.token, token)
         XCTAssertEqual(info, ClaudePairInfo(bases: ["https://x.trycloudflare.com"], token: token))
     }
+
+    /// Must match `parseSetupLink` in claude-remote/app/src/lib/pairing.js: commas between bases stay
+    /// literal while `:` and `/` inside each base are percent-encoded.
+    func testSetupLinkMatchesClaudeRemoteContract() {
+        let info = ClaudePairInfo(bases: ["https://a.trycloudflare.com", "http://100.64.0.1:8788"], token: "ab+/=")
+        XCTAssertEqual(
+            info.setupLink,
+            "claude-remote://setup?v=1&token=ab%2B%2F%3D&bases=https%3A%2F%2Fa%2Etrycloudflare%2Ecom,http%3A%2F%2F100%2E64%2E0%2E1%3A8788"
+        )
+    }
 }

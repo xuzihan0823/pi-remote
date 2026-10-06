@@ -1,6 +1,6 @@
 # pi-remote 开发进度
 
-更新时间：2026-09-14
+更新时间：2026-09-16
 
 ## 1. 项目目标
 
@@ -92,6 +92,8 @@ npm test                92 pass, 1 skipped, 0 fail
 
 测试共 93 个，其中 1 个 live pi 测试按预设跳过。
 
+2026-09-16 已复跑上述检查，结果不变；另在隔离 Debian 12 / arm64 / Docker 29.8.1 环境完成 external-proxy 首装、升级和失败场景演练，并用原始 Swift 客户端接入真实 Relay 复核事件行为。确认 10 个待修问题，详见 [复核记录](REVIEW.md)。
+
 ## 3. 当前代码状态
 
 最近一次本地验证前，已针对安装器做了直接收尾修改：
@@ -139,14 +141,16 @@ npm test                92 pass, 1 skipped, 0 fail
 
 ### 高优先级
 
-- [ ] 对 `scripts/install-server.sh` 做一次最终人工 diff review，重点确认：
-  - 升级回滚时目录内容删除是否包含隐藏文件。
-  - 备份恢复失败时是否明确返回失败。
-  - 现有容器项目标签和工作目录识别是否可靠。
-  - external-proxy 非网络模式的自定义宿主机端口映射与健康检查契约一致。
-  - 生产 Linux 上 Bash 版本兼容性。
-- [ ] 在隔离 Linux + Docker 环境执行一次真实安装演练。
-- [x] 源码确认 Relay 健康状态包含 `status: "ok"`（`src/relay/server.ts`）；真实容器探测仍待验证。
+- [x] 完成 `scripts/install-server.sh` 最终人工复核（2026-09-16，详见 [复核记录](REVIEW.md)）：
+  - 回滚遗漏新增隐藏文件，待修。
+  - 备份解包失败明确返回非零；镜像恢复失败被忽略，待修。
+  - 正常升级的项目与工作目录识别通过；端口占用豁免过宽，待修。
+  - external-proxy 自定义宿主机映射与容器内固定 8789 健康检查契约一致。
+  - Debian 12 / Bash 5.2.15 运行通过，其他生产环境尚未实测。
+- [x] 在隔离 Linux + Docker 环境执行真实安装演练，覆盖 external-proxy 非网络模式的首装、升级和失败恢复；其他部署模式仍待验证。
+- [ ] 修复复核确认的安装器问题：目标内部符号链接越界写入、复制失败未回滚、旧镜像恢复错误被忽略、隐藏文件残留及无关端口占用通过预检。
+- [ ] 修复 iOS 重连后订阅丢失、流式输出期间停止按钮失效，以及列表状态、输入对话框和 Agent 在线状态错误。
+- [x] 源码及隔离 Linux 真实容器探测均确认 Relay 健康状态包含 `status: "ok"`（`src/relay/server.ts`）。
 - [ ] 增加 Agent 端安装/启动脚本，让用户可配置：
   - Relay URL
   - Agent Token
@@ -154,14 +158,17 @@ npm test                92 pass, 1 skipped, 0 fail
   - pi 二进制路径
   - 工作区路径
   - 最大会话数
-- [ ] 确定 iOS 工程技术栈和最低 iOS 版本。
+- [x] 确定 iOS 工程技术栈和最低版本：SwiftUI，工程位于 `ios/PiRemote.xcodeproj`；当前 Swift 语言模式为 5.0，最低 iOS 26.0，本次使用 Xcode 27.0 / iOS 27.0 SDK 构建。
 
 ### 中优先级
 
 - [ ] iOS MVP：服务器配置、Token/设备配对、会话列表、会话详情、prompt 输入、流式输出、停止按钮、断线重连。
+  - 已实现：服务器配置（Relay URL + Token）、会话列表（`session.list`）、会话详情（`subscribe` + `session_event` 流式渲染）、prompt 输入（`session.prompt`）、停止按钮（`session.abort`）、断线重连、`ui_request` 确认弹层（`ui.response`）。
+  - 已接入相机扫码、连接二维码解析和确认表单；帮助使用独立教程页，次级入口更名为「手动连接」。二维码导入规范见 [ios/CONNECTING.md](ios/CONNECTING.md)。
+  - 未实现：Mac 端二维码生成界面、短配对码兑换、设备撤销机制；`session.start` 的项目选择仍是手填相对路径。
 - [ ] iOS 安全存储：Keychain 保存 Relay URL/Token/Agent Token，避免明文 UserDefaults。
 - [ ] 增加配对流程和设备撤销机制。
-- [ ] 校准现有部署文档：发行版范围应与预检一致，仅列 Ubuntu、Debian、Rocky Linux、AlmaLinux、Fedora；移除未经验证的原子回滚承诺。
+- [x] 校准部署文档：发行版范围与预检一致，移除原子回滚及日志保留承诺，明确备份不包含 Docker 命名卷，并记录实际验收范围。
 - [ ] 增加日志脱敏检查，确保 Token、环境变量和命令输出不泄漏。
 - [ ] 增加版本升级/迁移策略。
 
@@ -185,6 +192,22 @@ npm test                92 pass, 1 skipped, 0 fail
 
 ## 7. 当前结论
 
-Relay MVP、服务端 Docker 部署文件、安装器和预检库已有实现，本地类型检查及自动化测试通过。安装器仍有安全边界待复核，尚不能视为已通过生产部署验收。
+Relay MVP、服务端 Docker 部署文件、安装器和预检库已有实现，本地类型检查及自动化测试通过。安装器人工复核及隔离 Linux 演练已完成，确认的失败恢复和写入边界问题仍待修复，尚未通过生产部署验收。
 
-下一步不应直接在东京服务器上强行安装；应先完成东京现有 `/opt/pi-remote` 的只读识别，或选择新的隔离安装目录，再进行备份、安装和联调。iOS 客户端仍未开始实现，后续应先固定协议与配置/配对流程，再建立 Xcode 工程。
+下一步先修复 [复核记录](REVIEW.md) 中的问题，再安排部署验收。iOS 客户端已通过 Xcode 27.0 真机签名构建，但重连、停止和会话状态行为仍有缺陷；安全存储（Keychain）、配对流程与真实模型联调继续保留为待办。
+
+## 8. Xcode 与真机安装（2026-09-16）
+
+- Xcode 已升级为 27.0，而原许可记录停留在 26.4，导致 `xcrun` 和构建被阻止。用户完成 `sudo xcodebuild -license` 与 `sudo xcodebuild -runFirstLaunch` 后已恢复。
+- 工程 Debug / Release 已配置可用开发团队，使用工程自身配置的 Debug iphoneos 构建通过。
+- App `com.piremote.app` 已安装到用户的 iPhone 17（iOS 27.0），本地代码签名及设备授权校验通过。用户已完成开发者信任；2026-09-17 USB 连接恢复后，修复版安装和启动成功，并通过真机截图确认首页正常显示。
+- 当前开发描述文件有效期至 2026-09-23 19:30（北京时间），到期后需要重新构建安装。
+- 按用户要求采用真机安装；未安装 App 到模拟器，也未启动模拟器。本轮创建的临时模拟设备已删除。
+
+## 9. 扫码与帮助入口修复（2026-09-16）
+
+- 「扫码连接 Mac」使用 VisionKit 相机扫码器，仅识别 QR 码；补齐相机用途声明、权限拒绝/受限提示、设置跳转和手动连接入口。
+- 识别有效连接二维码后预填确认表单，确认前不联网；普通二维码或非法凭据继续显示识别提示。退出、后台或识别成功时停止扫描。
+- 「帮助」打开独立教程占位页；手动配置入口更名为「手动连接」。
+- 解析回归检查覆盖有效 TLS/LAN/IPv6 地址、保留本机名称、无关/非法二维码、版本、端口、端点和凭据校验。真机签名构建通过；2026-09-17 已通过 USB 安装修复版并启动，截图确认首页显示「手动连接」。相机授权、实际扫码及帮助页交互仍待手机端验证。
+- 本次安装及启动记录：`/tmp/pi-remote-scanner-install-latest.json`、`/tmp/pi-remote-scanner-launch-foreground.json`；首页截图：`/tmp/pi-remote-scanner-foreground.png`。未安装或启动模拟器。

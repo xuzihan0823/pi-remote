@@ -8,6 +8,7 @@ struct PairingCodeView: View {
     let placeholderSymbol: String
     let placeholderTone: StatusTone
     let placeholderText: String
+    var scanHint = "打开 iPhone 上的 Pi Remote，选择扫码连接"
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.displayScale) private var displayScale
 
@@ -20,7 +21,7 @@ struct PairingCodeView: View {
                 Text(image == nil ? "手机连接码" : "用手机扫码")
                     .font(Theme.Font.section)
                     .foregroundColor(Theme.textPrimary)
-                Text(image == nil ? placeholderText : "打开 iPhone 上的 Pi Remote，选择扫码连接")
+                Text(image == nil ? placeholderText : scanHint)
                     .font(Theme.Font.body)
                     .foregroundColor(Theme.textSecondary)
                     .multilineTextAlignment(.center)

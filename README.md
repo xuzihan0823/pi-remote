@@ -144,18 +144,22 @@ This was run successfully against pi 0.85.1. It does not read or modify user ses
 | `RELAY_URL` | `ws://$RELAY_HOST:$RELAY_PORT/ws/agent` | `ws://`/`wss://` URL; must not embed a token |
 | `AGENT_TOKEN` | `RELAY_TOKEN` | Mac agent token, >= 32 chars |
 | `AGENT_DEVICE_ID` | `pi-mac-agent` | 1-128 chars from `[A-Za-z0-9._:-]`, first char alphanumeric |
-| `PI_BIN` | `pi` | non-empty after trim |
+| `PI_RUNTIME` | `pi` | exactly `pi` or `omp` (managed sessions only) |
+| `PI_BIN` | `pi` / `omp` | selected by `PI_RUNTIME` when unset; explicit non-empty override |
 | `PI_WORKSPACE_ROOT` | `~/Desktop` | absolute, non-root directory; session cwds are confined to it |
 | `MAX_SESSIONS` | `16` | integer 1-128 |
 
-Tokens are never logged. `describeConfig()` prints only the relay URL, device id, pi binary,
+Tokens are never logged. `describeConfig()` prints only the relay URL, device id, runtime, binary,
 workspace root, and session cap; `RELAY_URL` rejects embedded tokens for the same reason.
 
 ## Mac agent
 
 `npm run agent` starts the local agent. It connects to the relay as `role=agent`, forwards relay
 requests to `PiProcessManager`, and reconnects with exponential backoff (1s up to 30s) when the
-socket drops. It starts no session until a client asks for one and never invokes a model on its own.
+socket drops. Set `PI_RUNTIME=omp` to launch `omp --mode rpc` for managed sessions; terminal
+sessions from both pi and omp are discovered regardless of this setting. `PI_BIN` overrides the
+selected CLI, including an absolute executable path supplied by the Mac app. It starts no
+session until a client asks for one and never invokes a model on its own.
 
 ```bash
 RELAY_URL=wss://relay.example.com/ws/agent \

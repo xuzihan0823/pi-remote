@@ -23,6 +23,7 @@ enum SnapshotRenderer {
         let name: String
         var size = CGSize(width: 1040, height: 720)
         var dark = false
+        var settings = false
         let configure: (AppModel) -> Void
     }
 
@@ -37,6 +38,28 @@ enum SnapshotRenderer {
         }
         model.appendFixtureLog("[agent] connected to relay（演示）")
         model.appendFixtureLog("Agent 握手与健康检查通过（演示数据）")
+    }
+
+    static func claude(_ state: ClaudeServiceController.State, mode: ClaudeServiceMode = .local) -> (AppModel) -> Void {
+        { model in
+            model.activeService = .claude
+            let config = ClaudeServiceConfiguration(
+                executablePath: "/usr/local/bin/claude",
+                projectsDirectory: "/Users/demo/.claude/projects",
+                dataDirectory: "/Users/demo/Library/Application Support/Pi Remote/Claude",
+                mode: mode
+            )
+            let tunnel = URL(string: "https://demo-quiet-bridge.trycloudflare.com")!
+            let running = state == .running
+            model.claudeService.fixturePairInfo = ClaudePairInfo(bases: [tunnel.absoluteString], token: demoToken)
+            model.claudeService.applyFixture(
+                state: state,
+                configuration: config,
+                publicURL: running && mode == .cloudflare ? tunnel : nil,
+                logs: ["Claude 后端已就绪（演示数据）"]
+            )
+            if state.failureMessage != nil { model.diagnosticsExpanded = true }
+        }
     }
 
     static let fixtures: [Fixture] = [
@@ -84,6 +107,19 @@ enum SnapshotRenderer {
                 "端口 443 已被其他程序占用：需要手动以 external-proxy 模式部署",
             ])
         },
+        Fixture(name: "13-claude-idle", configure: claude(.idle)),
+        Fixture(name: "14-claude-starting-tunnel", configure: claude(.starting, mode: .cloudflare)),
+        Fixture(name: "15-claude-running-local", configure: claude(.running)),
+        Fixture(name: "16-claude-running-tunnel", configure: claude(.running, mode: .cloudflare)),
+        Fixture(name: "17-claude-running-tunnel-dark", dark: true, configure: claude(.running, mode: .cloudflare)),
+        Fixture(name: "18-claude-running-tunnel-min", size: CGSize(width: 900, height: 640), configure: claude(.running, mode: .cloudflare)),
+        Fixture(name: "19-claude-failed", configure: claude(.failed("Claude 服务端口 8788 已被占用；不会停止占用端口的进程"))),
+        Fixture(name: "20-claude-failed-dark", dark: true, configure: claude(.failed("找不到可执行的 Claude CLI，请检查路径"))),
+        Fixture(name: "21-settings-pi", size: CGSize(width: 380, height: 600), settings: true) { _ in },
+        Fixture(name: "22-settings-deploy-dark", size: CGSize(width: 380, height: 600), dark: true, settings: true) { model in
+            model.serverSource = .deploy
+        },
+        Fixture(name: "23-settings-claude-running", size: CGSize(width: 380, height: 600), settings: true, configure: claude(.running, mode: .cloudflare)),
     ]
 
     static func renderAll() {
@@ -91,7 +127,10 @@ enum SnapshotRenderer {
         try? FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
         for fixture in fixtures {
             let model = fixtureModel()
-            let hosting = NSHostingView(rootView: ContentView(model: model))
+            let root = fixture.settings
+                ? AnyView(SettingsSheet(model: model) {})
+                : AnyView(ContentView(model: model))
+            let hosting = NSHostingView(rootView: root)
             let window = NSWindow(
                 contentRect: NSRect(origin: .zero, size: fixture.size),
                 styleMask: [.titled, .closable],

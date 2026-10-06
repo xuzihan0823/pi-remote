@@ -112,6 +112,16 @@ public struct ClaudePairInfo: Decodable, Equatable {
     }
 }
 
+extension ClaudePairInfo {
+    /// `claude-remote://setup` link parsed by the Claude Remote app (`parseSetupLink` in
+    /// claude-remote/app/src/lib/pairing.js). Each base is percent-encoded on its own; the separating
+    /// commas stay literal so the app can split before decoding.
+    public var setupLink: String {
+        let encode = { (value: String) in value.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? value }
+        return "claude-remote://setup?v=1&token=\(encode(token))&bases=\(bases.map(encode).joined(separator: ","))"
+    }
+}
+
 /// Strict validation for Cloudflare Quick Tunnel public addresses. A valid address is exactly
 /// `https://<label>.<label>…trycloudflare.com` with no userinfo, port, path, query or fragment, so a
 /// look-alike host (`trycloudflare.com.evil.example`, `evil-trycloudflare.com`) can never be paired.

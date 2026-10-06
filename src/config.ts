@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { defaultOmpHistoryRoots } from "./history/history-index.ts";
 
 export interface Config {
   relayHost: string;
@@ -11,6 +12,7 @@ export interface Config {
   piBin: string;
   piRuntime: "pi" | "omp";
   piWorkspaceRoot: string;
+  ompHistoryRoots?: string[];
   maxSessions: number;
 }
 
@@ -99,6 +101,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     piRuntime,
     piBin,
     piWorkspaceRoot: resolvedWorkspaceRoot,
+    ompHistoryRoots: defaultOmpHistoryRoots(env),
     maxSessions,
   };
 }

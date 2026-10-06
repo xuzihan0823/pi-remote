@@ -33,6 +33,7 @@ test("loadConfig applies documented defaults", () => {
     piRuntime: "pi",
     piBin: "pi",
     piWorkspaceRoot: join(homedir(), "Desktop"),
+    ompHistoryRoots: [join(homedir(), ".omp", "agent", "sessions")],
     maxSessions: DEFAULT_MAX_SESSIONS,
   });
 });
@@ -56,6 +57,7 @@ test("loadConfig reads overrides and trims values", () => {
     piRuntime: "pi",
     piBin: "/opt/pi/bin/pi",
     piWorkspaceRoot: "/srv/workspaces",
+    ompHistoryRoots: [join(homedir(), ".omp", "agent", "sessions")],
     maxSessions: 4,
   });
 });

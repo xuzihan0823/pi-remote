@@ -1,0 +1,315 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AA10000000000000000010 /* Markdown in Frameworks */ = {isa = PBXBuildFile; productRef = AA10000000000000000011 /* Markdown */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AA10000000000000000001 /* PiRemote.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PiRemote.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA10000000000000000021 /* PiRemoteUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = PiRemoteUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		AA10000000000000000002 /* PiRemote */ = {isa = PBXFileSystemSynchronizedRootGroup; path = PiRemote; sourceTree = "<group>"; };
+		AA10000000000000000022 /* UITests */ = {isa = PBXFileSystemSynchronizedRootGroup; path = UITests; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		AA10000000000000000003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA10000000000000000010 /* Markdown in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA10000000000000000024 /* UI Test Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		AA10000000000000000004 = {
+			isa = PBXGroup;
+			children = (
+				AA10000000000000000002 /* PiRemote */,
+				AA10000000000000000022 /* UITests */,
+				AA10000000000000000005 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		AA10000000000000000005 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AA10000000000000000001 /* PiRemote.app */,
+				AA10000000000000000021 /* PiRemoteUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AA10000000000000000006 /* PiRemote */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA10000000000000000007 /* Build configuration list for PBXNativeTarget "PiRemote" */;
+			buildPhases = (
+				AA10000000000000000008 /* Sources */,
+				AA10000000000000000003 /* Frameworks */,
+				AA10000000000000000009 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				AA10000000000000000002 /* PiRemote */,
+			);
+			name = PiRemote;
+			packageProductDependencies = (
+				AA10000000000000000011 /* Markdown */,
+			);
+			productName = PiRemote;
+			productReference = AA10000000000000000001 /* PiRemote.app */;
+			productType = "com.apple.product-type.application";
+		};
+		AA10000000000000000020 /* PiRemoteUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA10000000000000000026;
+			buildPhases = (AA10000000000000000023, AA10000000000000000024, AA10000000000000000025);
+			buildRules = ();
+			dependencies = (AA10000000000000000029);
+			fileSystemSynchronizedGroups = (AA10000000000000000022);
+			name = PiRemoteUITests;
+			packageProductDependencies = ();
+			productName = PiRemoteUITests;
+			productReference = AA10000000000000000021;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AA1000000000000000000A /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1660;
+				LastUpgradeCheck = 1660;
+				TargetAttributes = {
+					AA10000000000000000006 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					AA10000000000000000020 = {CreatedOnToolsVersion = 16.0; TestTargetID = AA10000000000000000006; };
+				};
+			};
+			buildConfigurationList = AA1000000000000000000B /* Build configuration list for PBXProject "PiRemote" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+				"zh-Hans",
+			);
+			mainGroup = AA10000000000000000004;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				AA10000000000000000012 /* swift-markdown */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = AA10000000000000000005 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AA10000000000000000006 /* PiRemote */,
+				AA10000000000000000020 /* PiRemoteUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AA10000000000000000009 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA10000000000000000025 /* UI Test Resources */ = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXContainerItemProxy section */
+		AA1000000000000000002A = {isa = PBXContainerItemProxy; containerPortal = AA1000000000000000000A; proxyType = 1; remoteGlobalIDString = AA10000000000000000006; remoteInfo = PiRemote; };
+/* End PBXContainerItemProxy section */
+/* Begin PBXTargetDependency section */
+		AA10000000000000000029 = {isa = PBXTargetDependency; target = AA10000000000000000006; targetProxy = AA1000000000000000002A; };
+/* End PBXTargetDependency section */
+/* Begin PBXSourcesBuildPhase section */
+		AA10000000000000000008 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AA10000000000000000023 /* UI Test Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AA10000000000000000027 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = Z25WB9W2X5; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.piremote.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 1; TEST_TARGET_NAME = PiRemote; }; name = Debug; };
+		AA10000000000000000028 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_STYLE = Automatic; DEVELOPMENT_TEAM = Z25WB9W2X5; GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.piremote.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 1; TEST_TARGET_NAME = PiRemote; }; name = Release; };
+		AA1000000000000000000C /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		AA1000000000000000000D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		AA1000000000000000000E /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Z25WB9W2X5;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Pi Remote";
+				INFOPLIST_KEY_NSCameraUsageDescription = "使用相机扫描 Mac 上的连接二维码，以填写连接信息。";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.piremote.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		AA1000000000000000000F /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = Z25WB9W2X5;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Pi Remote";
+				INFOPLIST_KEY_NSCameraUsageDescription = "使用相机扫描 Mac 上的连接二维码，以填写连接信息。";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.piremote.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AA10000000000000000007 /* Build configuration list for PBXNativeTarget "PiRemote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA1000000000000000000E /* Debug */,
+				AA1000000000000000000F /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AA1000000000000000000B /* Build configuration list for PBXProject "PiRemote" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA1000000000000000000C /* Debug */,
+				AA1000000000000000000D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AA10000000000000000026 = {isa = XCConfigurationList; buildConfigurations = (AA10000000000000000027, AA10000000000000000028); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+/* Begin XCRemoteSwiftPackageReference section */
+		AA10000000000000000012 /* swift-markdown */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/swiftlang/swift-markdown.git";
+			requirement = {kind = exactVersion; version = 0.7.3; };
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AA10000000000000000011 /* Markdown */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AA10000000000000000012 /* swift-markdown */;
+			productName = Markdown;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = AA1000000000000000000A /* Project object */;
+}

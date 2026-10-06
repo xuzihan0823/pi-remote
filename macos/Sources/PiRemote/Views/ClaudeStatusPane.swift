@@ -1,0 +1,277 @@
+import AppKit
+import PiRemoteCore
+import SwiftUI
+
+struct ClaudeStatusPane: View {
+    @ObservedObject var claude: ClaudeServiceController
+    let windowVisible: Bool
+    let showDiagnostics: () -> Void
+    @State private var qrImage: NSImage?
+    @State private var pairError: String?
+    @State private var didCopy = false
+    @State private var copyTask: Task<Void, Never>?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var mode: ClaudeServiceMode { claude.configuration.mode }
+    private var isTunnel: Bool { mode == .cloudflare }
+
+    var body: some View {
+        let presentation = ClaudePresentation.make(state: claude.state, mode: mode)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(presentation.title)
+                        .font(Theme.Font.hero)
+                        .foregroundColor(Theme.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(presentation.subtitle)
+                        .font(Theme.Font.body)
+                        .foregroundColor(Theme.textSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .animation(Motion.crossfade, value: presentation)
+
+                if let message = claude.state.failureMessage {
+                    Notice(title: "原因", message: message, tone: .danger, actionTitle: "查看诊断", action: showDiagnostics)
+                } else if let pairError, claude.state == .running, isTunnel {
+                    Notice(title: "连接码暂不可用", message: pairError, tone: .warning)
+                }
+
+                VStack(spacing: 28) {
+                    ConnectionRouteView(
+                        relayTitle: isTunnel ? "临时隧道" : "Claude 后端",
+                        relaySymbol: isTunnel ? "cloud" : "terminal",
+                        state: routeState,
+                        windowVisible: windowVisible
+                    )
+                    PairingCodeView(
+                        image: claude.state == .running && isTunnel ? qrImage : nil,
+                        placeholderSymbol: placeholderSymbol,
+                        placeholderTone: presentation.tone,
+                        placeholderText: placeholderText,
+                        scanHint: "打开 iPhone 上的 Claude Remote，扫码完成配对"
+                    )
+                    summary.frame(maxWidth: 440)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .frame(maxWidth: 640, alignment: .leading)
+            .padding(32)
+            .frame(maxWidth: .infinity)
+        }
+        .task(id: PairKey(state: claude.state, publicURL: claude.publicURL, mode: mode)) { await loadPairCode() }
+        .onChange(of: claude.state) { state in
+            ContentView.announce("Claude \(ClaudePresentation.make(state: state, mode: mode).badge)")
+        }
+        .onDisappear { copyTask?.cancel() }
+    }
+
+    private struct PairKey: Equatable {
+        let state: ClaudeServiceController.State
+        let publicURL: URL?
+        let mode: ClaudeServiceMode
+    }
+
+    /// The code is cleared first on every state change, so a stale code can never stay on screen.
+    private func loadPairCode() async {
+        qrImage = nil
+        pairError = nil
+        guard claude.state == .running, isTunnel else { return }
+        do {
+            let info = try await pairInfo()
+            guard !Task.isCancelled, claude.state == .running else { return }
+            guard let image = ConnectionQRCode.image(from: info.setupLink) else {
+                pairError = "二维码生成失败"
+                return
+            }
+            qrImage = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+        } catch {
+            guard !Task.isCancelled else { return }
+            pairError = error.localizedDescription
+        }
+    }
+
+    private func pairInfo() async throws -> ClaudePairInfo {
+        #if DEBUG
+        if let fixture = claude.fixturePairInfo { return fixture }
+        #endif
+        return try await claude.readPairInfo()
+    }
+
+    private var summary: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(addressTitle)
+                    .font(Theme.Font.control)
+                    .foregroundColor(Theme.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(copyableAddress?.absoluteString ?? "")
+                Text("\(isTunnel ? "临时隧道" : "仅本机") · 端口 \(String(claude.configuration.port)) · \((claude.configuration.projectsDirectory as NSString).abbreviatingWithTildeInPath)")
+                    .font(Theme.Font.caption)
+                    .foregroundColor(Theme.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(claude.configuration.projectsDirectory)
+                if copyableAddress != nil {
+                    Text(isTunnel ? "配对需扫码；复制的地址不含访问凭据。" : "地址只能在这台 Mac 上打开。")
+                        .font(Theme.Font.caption)
+                        .foregroundColor(Theme.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 0)
+            Button(didCopy ? "已复制" : "复制地址") {
+                if let url = copyableAddress { copy(url) }
+            }
+            .buttonStyle(SecondaryButtonStyle())
+            .frame(width: 96)
+            .disabled(copyableAddress == nil)
+            .accessibilityLabel(didCopy ? "Claude 服务地址已复制" : "复制 Claude 服务地址")
+        }
+    }
+
+    // MARK: - Derived
+
+    /// Never includes the token: tunnel mode uses the verified public origin, local mode the loopback base.
+    private var copyableAddress: URL? {
+        guard claude.state == .running else { return nil }
+        return isTunnel ? claude.publicURL : claude.configuration.baseURL
+    }
+
+    private var addressTitle: String {
+        if let url = copyableAddress { return isTunnel ? (url.host ?? url.absoluteString) : url.absoluteString }
+        if claude.state == .starting && isTunnel { return "临时地址将在启动后生成" }
+        return isTunnel ? "临时隧道" : "127.0.0.1:\(String(claude.configuration.port))"
+    }
+
+    private var routeState: RouteState {
+        switch claude.state {
+        case .idle, .stopping: return .idle
+        case .starting: return .waiting
+        case .running: return .done
+        case .failed: return .broken
+        }
+    }
+
+    private var placeholderSymbol: String {
+        switch claude.state {
+        case .failed: return "exclamationmark.triangle"
+        case .starting: return "qrcode"
+        case .running: return isTunnel ? "qrcode" : "lock.laptopcomputer"
+        default: return "iphone"
+        }
+    }
+
+    private var placeholderText: String {
+        switch claude.state {
+        case .idle: return isTunnel ? "启动成功后，连接码会显示在这里。" : "仅本机模式不生成手机连接码。"
+        case .starting: return isTunnel ? "临时地址确认后即可扫码。" : "仅本机模式不生成手机连接码。"
+        case .running: return isTunnel ? "正在准备连接码。" : "仅本机模式不生成手机连接码；需要手机访问请改用临时隧道。"
+        case .stopping: return "连接码已移除。"
+        case .failed: return "处理问题后，重新启动服务。"
+        }
+    }
+
+    private func copy(_ url: URL) {
+        NSPasteboard.general.clearContents()
+        guard NSPasteboard.general.setString(url.absoluteString, forType: .string) else { return }
+        withAnimation(Motion.feedback) { didCopy = true }
+        copyTask?.cancel()
+        copyTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if !Task.isCancelled { withAnimation(Motion.feedback) { didCopy = false } }
+        }
+    }
+}
+
+struct ClaudeDiagnosticsPane: View {
+    @ObservedObject var claude: ClaudeServiceController
+    @Binding var expanded: Bool
+    @State private var copied = false
+    @State private var copyTask: Task<Void, Never>?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Button {
+                    withAnimation(Motion.resolved(Motion.disclosure, reduceMotion: reduceMotion)) { expanded.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                        Text("Claude 诊断")
+                            .font(Theme.Font.caption.weight(.semibold))
+                        if claude.state.failureMessage != nil {
+                            Circle().fill(Theme.danger).frame(width: 6, height: 6)
+                                .accessibilityLabel("有错误")
+                        }
+                    }
+                    .foregroundColor(Theme.textPrimary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(expanded ? "收起诊断" : "展开诊断")
+                if !expanded, let last = claude.logs.last {
+                    Text(last)
+                        .font(Theme.Font.mono)
+                        .foregroundColor(Theme.textSecondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                if expanded {
+                    Button(copied ? "已复制" : "复制诊断") { copyLogs() }
+                        .buttonStyle(LinkButtonStyle())
+                        .frame(minWidth: 56, alignment: .trailing)
+                        .disabled(claude.logs.isEmpty)
+                }
+            }
+            .padding(.horizontal, 16)
+            .frame(height: DiagnosticsPane.collapsedHeight)
+            if expanded {
+                Divider().overlay(Theme.border)
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            if claude.logs.isEmpty {
+                                Text("暂无运行记录").foregroundColor(Theme.textSecondary)
+                            }
+                            ForEach(Array(claude.logs.enumerated()), id: \.offset) { _, line in
+                                Text(line)
+                                    .foregroundColor(Theme.textPrimary)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            Color.clear.frame(height: 1).id("bottom")
+                        }
+                        .font(Theme.Font.mono)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                    }
+                    .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+                    .onChange(of: claude.logs.count) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                }
+                .transition(.opacity)
+            }
+        }
+        .frame(height: expanded ? DiagnosticsPane.expandedHeight : DiagnosticsPane.collapsedHeight)
+        .background(Theme.sidebar)
+        .clipped()
+        .onDisappear { copyTask?.cancel() }
+    }
+
+    /// Controller logs are already redacted of the service token when appended.
+    private func copyLogs() {
+        NSPasteboard.general.clearContents()
+        guard NSPasteboard.general.setString(claude.logs.joined(separator: "\n"), forType: .string) else { return }
+        withAnimation(Motion.feedback) { copied = true }
+        copyTask?.cancel()
+        copyTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            if !Task.isCancelled { withAnimation(Motion.feedback) { copied = false } }
+        }
+    }
+}

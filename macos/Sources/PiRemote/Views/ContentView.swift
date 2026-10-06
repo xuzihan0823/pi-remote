@@ -4,6 +4,7 @@ import SwiftUI
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var windowVisible = true
+    @State private var settingsPresented = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -11,29 +12,49 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar(presentation)
             Divider().overlay(Theme.border)
-            HStack(spacing: 0) {
-                ConfigPane(model: model)
-                    .frame(width: 340)
-                    .background(Theme.sidebar)
-                Divider().overlay(Theme.border)
-                StatusPane(model: model, windowVisible: windowVisible)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Theme.canvas)
+            Group {
+                if model.activeService == .pi {
+                    StatusPane(model: model, windowVisible: windowVisible)
+                } else {
+                    ClaudeStatusPane(claude: model.claudeService, windowVisible: windowVisible) {
+                        withAnimation(Motion.resolved(Motion.disclosure, reduceMotion: reduceMotion)) {
+                            model.diagnosticsExpanded = true
+                        }
+                    }
+                }
             }
-            .frame(maxHeight: .infinity)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Theme.canvas)
+            .sheet(isPresented: $settingsPresented) {
+                SettingsSheet(model: model) { settingsPresented = false }
+            }
             Divider().overlay(Theme.border)
-            DiagnosticsPane(model: model)
+            serviceBar
         }
         .background(Theme.canvas)
         .background(WindowVisibilityReader(isVisible: $windowVisible))
         .onAppear { model.onAppear() }
-        .onChange(of: presentation.badge) { badge in
-            NSAccessibility.post(
-                element: NSApp as Any,
-                notification: .announcementRequested,
-                userInfo: [.announcement: "Pi Remote \(badge)", .priority: NSAccessibilityPriorityLevel.medium.rawValue]
-            )
+        .sheet(isPresented: $model.diagnosticsExpanded) {
+            Group {
+                if model.activeService == .pi {
+                    DiagnosticsPane(model: model)
+                } else {
+                    ClaudeDiagnosticsPane(claude: model.claudeService, expanded: $model.diagnosticsExpanded)
+                }
+            }
+            .frame(width: 720)
         }
+        .onChange(of: presentation.badge) { badge in
+            Self.announce("Pi Remote \(badge)")
+        }
+    }
+
+    static func announce(_ text: String) {
+        NSAccessibility.post(
+            element: NSApp as Any,
+            notification: .announcementRequested,
+            userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue]
+        )
     }
 
     private func topBar(_ presentation: ConnectionPresentation) -> some View {
@@ -47,8 +68,25 @@ struct ContentView: View {
                 .font(Theme.Font.brand)
                 .foregroundColor(Theme.textPrimary)
             Spacer()
-            StatusBadge(text: presentation.badge, tone: presentation.tone)
-                .animation(Motion.crossfade, value: presentation.badge)
+            if model.activeService == .pi {
+                StatusBadge(text: presentation.badge, tone: presentation.tone)
+                    .animation(Motion.crossfade, value: presentation.badge)
+            } else {
+                ClaudeStatusBadge(claude: model.claudeService)
+            }
+            Button {
+                settingsPresented = true
+            } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(settingsPresented ? Theme.accent : Theme.textSecondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("设置（⌘,）")
+            .keyboardShortcut(",", modifiers: .command)
+            .accessibilityLabel(model.activeService == .pi ? "连接设置" : "Claude 服务设置")
             Button {
                 withAnimation(Motion.resolved(Motion.disclosure, reduceMotion: reduceMotion)) {
                     model.diagnosticsExpanded.toggle()
@@ -67,5 +105,58 @@ struct ContentView: View {
         .padding(.horizontal, 20)
         .frame(height: 56)
         .background(Theme.canvas)
+    }
+
+    private var serviceBar: some View {
+        SegmentedChoice(
+            options: [(ServiceKind.pi, ServiceKind.pi.title), (ServiceKind.claude, ServiceKind.claude.title)],
+            selection: $model.activeService,
+            compact: true,
+            accessibilityName: "服务"
+        )
+        .frame(width: 240)
+        .frame(maxWidth: .infinity)
+        .frame(height: 52)
+        .background(Theme.canvas)
+    }
+}
+
+private struct ClaudeStatusBadge: View {
+    @ObservedObject var claude: ClaudeServiceController
+
+    var body: some View {
+        let presentation = ClaudePresentation.make(state: claude.state, mode: claude.configuration.mode)
+        StatusBadge(text: presentation.badge, tone: presentation.tone)
+            .animation(Motion.crossfade, value: presentation.badge)
+    }
+}
+
+/// The configuration form for the selected service, presented from the gear button.
+struct SettingsSheet: View {
+    @ObservedObject var model: AppModel
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Group {
+                if model.activeService == .pi {
+                    ConfigPane(model: model)
+                } else {
+                    ClaudeConfigPane(claude: model.claudeService)
+                }
+            }
+            .frame(maxHeight: .infinity)
+            Divider().overlay(Theme.border)
+            HStack {
+                Spacer()
+                Button("完成", action: dismiss)
+                    .buttonStyle(SecondaryButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 12)
+        }
+        .frame(width: 380, height: 600)
+        .background(Theme.sidebar)
     }
 }

@@ -54,6 +54,7 @@ export type RelayErrorCode =
 export interface RelayErrorInfo {
   code: RelayErrorCode;
   message: string;
+  details?: { reason?: string };
 }
 
 export interface RelayHelloPayload {
@@ -383,6 +384,22 @@ export interface SessionStartParams {
 
 export interface SessionGetParams {
   sessionId?: string;
+  viewVersion?: 2;
+  view?: "timeline" | "branches" | "tool";
+  limit?: number;
+  before?: string | null;
+  branchId?: string;
+  revision?: string;
+  detailId?: string;
+  field?: "arguments" | "result" | "error";
+  cursor?: string | null;
+}
+
+export interface SessionListParams {
+  viewVersion?: 2;
+  includeArchived?: boolean;
+  limit?: number;
+  cursor?: string | null;
 }
 
 export interface SessionPromptParams {

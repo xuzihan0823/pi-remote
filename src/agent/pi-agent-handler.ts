@@ -11,12 +11,16 @@ import {
 } from "../terminal/bridge-client.ts";
 import type { AgentHandlerResult, AgentRequestHandler } from "./agent-client.ts";
 import type { TerminalSessionLauncher } from "../terminal/launcher.ts";
+import { HISTORY_PREFIX, type OmpHistoryIndex } from "../history/history-index.ts";
+import { HistoryReadError } from "../history/omp-reader.ts";
+import { TimelineRequestError } from "../terminal/extension.ts";
 
 export interface PiAgentHandlerOptions {
   manager: PiProcessManager;
   workspaceRoot: string;
   terminalBridge?: TerminalSessionBridge;
   terminalLauncher?: Pick<TerminalSessionLauncher, "start">;
+  history?: OmpHistoryIndex;
   emitSessionEvent?: (sessionId: string, event: GatewayEvent) => void;
   logger?: (message: string) => void;
 }
@@ -65,14 +69,44 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
     logger(`handling ${method}${sessionId ? ` for session "${sessionId}"` : ""}`);
 
     try {
+      if (sessionId?.startsWith(HISTORY_PREFIX) && method !== "session.get") {
+        throw new HandlerError("invalid_frame", "历史会话仅供阅读，不允许启动、发送、停止或回应确认");
+      }
+      if (sessionId && isTerminalSessionId(sessionId) && ["session.prompt", "session.abort", "ui.response"].includes(method)) {
+        if (!terminalBridge) throw new HandlerError("unknown_session", "终端连接不可用");
+        const meta = await terminalBridge.get(sessionId);
+        if (await options.history?.hasConflict(meta)) throw new HandlerError("invalid_frame", "会话存在冲突副本，已禁止控制");
+      }
       switch (method) {
-        case "session.list":
-          return { ok: true, data: { sessions: await listSessions() } };
+        case "session.list": {
+          const live = await listSessions();
+          if (params.viewVersion === 2) {
+            for (const session of live) {
+              session.availability = "live";
+              session.canControl = !(await options.history?.hasConflict(session));
+              if (!session.canControl) session.error = "会话存在冲突副本，已禁止控制";
+            }
+          }
+          const capabilities = { timelineV2: true, ompArchiveRead: Boolean(options.history), historyPagination: true, toolDetails: true };
+          if (params.viewVersion !== 2 || params.includeArchived !== true || !options.history) {
+            return { ok: true, data: { sessions: live, capabilities } };
+          }
+          const archived = await options.history.list(params, live);
+          return { ok: true, data: { ...archived, capabilities } };
+        }
 
         case "session.get": {
           if (!sessionId) throw new HandlerError("invalid_frame", "session.get requires sessionId");
+          if (sessionId.startsWith(HISTORY_PREFIX)) {
+            if (!options.history) throw new HandlerError("not_implemented", "OMP 历史阅读不可用");
+            return { ok: true, data: await options.history.get(sessionId, params) };
+          }
           if (terminalBridge && isTerminalSessionId(sessionId)) {
-            return { ok: true, data: await terminalBridge.snapshot(sessionId) };
+            const data = params.viewVersion === 2 ? await terminalBridge.view(sessionId, params) : await terminalBridge.snapshot(sessionId);
+            if (params.viewVersion === 2 && await options.history?.hasConflict(await terminalBridge.get(sessionId))) {
+              return { ok: true, data: { ...data, canControl: false } };
+            }
+            return { ok: true, data };
           }
           return {
             ok: false,
@@ -149,6 +183,9 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
           };
       }
     } catch (error) {
+      if (sessionId?.startsWith(HISTORY_PREFIX) && !(error instanceof HistoryReadError || error instanceof TimelineRequestError || error instanceof HandlerError)) {
+        return { ok: false, error: relayError("invalid_frame", "历史暂不可读取，请刷新或检查本机目录权限") };
+      }
       return toHandlerError(error);
     }
   };
@@ -165,6 +202,9 @@ class HandlerError extends Error {
 }
 
 function toHandlerError(error: unknown): AgentHandlerResult {
+  if (error instanceof TimelineRequestError || error instanceof HistoryReadError) {
+    return { ok: false, error: relayError("invalid_frame", error.message) };
+  }
   if (error instanceof TerminalBridgeError) {
     return { ok: false, error: relayError(error.code, error.message) };
   }

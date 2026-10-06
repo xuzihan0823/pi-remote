@@ -48,7 +48,37 @@ struct MenuBarView: View {
             Button("接管后台连接服务") { model.takeoverLegacyAgent() }
         }
         Divider()
+        ClaudeMenuSection(claude: model.claudeService) {
+            model.activeService = .claude
+            openWindow(id: "main")
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        Divider()
         Button("退出 Pi Remote") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+}
+
+private struct ClaudeMenuSection: View {
+    @ObservedObject var claude: ClaudeServiceController
+    let openClaude: () -> Void
+
+    var body: some View {
+        let presentation = ClaudePresentation.make(state: claude.state, mode: claude.configuration.mode)
+        Text("Claude · \(presentation.badge)")
+        Text(claude.configuration.mode == .cloudflare ? "临时隧道" : "仅本机")
+        switch claude.state {
+        case .idle, .failed:
+            Button(claude.state == .idle ? "启动 Claude 服务" : "重新启动 Claude 服务") {
+                Task { try? await claude.start() }
+            }
+        case .starting:
+            Button("取消启动 Claude 服务") { Task { await claude.stop() } }
+        case .running:
+            Button("停止 Claude 服务") { Task { await claude.stop() } }
+        case .stopping:
+            Text("Claude 服务正在停止…")
+        }
+        Button("查看 Claude 服务…", action: openClaude)
     }
 }

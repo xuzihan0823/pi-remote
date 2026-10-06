@@ -58,7 +58,9 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
 test("session.list reports the current process state", async () => {
   const { manager, handler } = createHarness();
   try {
-    assert.deepEqual(await handler(requestFrame("r1", "session.list")), { ok: true, data: { sessions: [] } });
+    assert.deepEqual(await handler(requestFrame("r1", "session.list")), {
+      ok: true, data: { sessions: [], capabilities: { timelineV2: true, ompArchiveRead: false, historyPagination: true, toolDetails: true } },
+    });
 
     await handler(requestFrame("r2", "session.start", { params: { sessionId: "s1" } }));
     const listed = await handler(requestFrame("r3", "session.list"));

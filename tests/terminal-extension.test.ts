@@ -7,7 +7,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { TerminalBridgeError, TerminalSessionBridge } from "../src/terminal/bridge-client.ts";
 
-type FakeEvent = { type: string; message?: { role?: string; content?: unknown } };
+type FakeEvent = { type: string; message?: { role?: string; content?: unknown; timestamp?: number }; toolCallId?: string; toolName?: string; result?: unknown; partialResult?: unknown; isError?: boolean };
 type FakeHandler = (event: FakeEvent, ctx: FakeContext) => void | Promise<void>;
 
 class FakePi {
@@ -207,6 +207,7 @@ test("list and snapshot expose the live terminal session with user/assistant tex
         title: "My terminal session",
         cwd: join(workspace, "proj"),
         activity: "idle",
+        runtime: "pi", persistedSessionId: "abc-123", capabilities: { timelineV2: true, toolDetails: true },
       },
     ]);
 
@@ -224,6 +225,7 @@ test("list and snapshot expose the live terminal session with user/assistant tex
       cwd: join(workspace, "proj"),
       title: "My terminal session",
       activity: "idle",
+      runtime: "pi", persistedSessionId: "abc-123", capabilities: { timelineV2: true, toolDetails: true },
     });
   } finally {
     await harness.stop();
@@ -545,4 +547,68 @@ test("globally installed copy plus explicit -e copy publish one bridge and survi
     await first.fire({ type: "session_shutdown" }, ctx);
     await second.fire({ type: "session_shutdown" }, ctx);
   }
+});
+
+test("v2 stages final assistant until entry identity persists, never deduplicating equal text", async () => {
+  const harness = await startHarness({ sessionId: "v2-stream", branch: [
+    { id: "user", type: "message", message: { role: "user", content: "start" } },
+  ] });
+  await waitForSocket(harness.dir);
+  const bridge = new TerminalSessionBridge({ workspaceRoot: harness.workspace, bridgeDir: harness.dir });
+  try {
+    const streamed = { role: "assistant", timestamp: 7, content: [{ type: "text", text: "same text" }] };
+    await harness.pi.fire({ type: "message_start", message: streamed }, harness.ctx);
+    await harness.pi.fire({ type: "message_update", message: streamed }, harness.ctx);
+    const partial = await bridge.view("terminal:v2-stream", { viewVersion: 2 });
+    const provisional = partial.items as { id: string; text?: string }[];
+    assert.equal(provisional.length, 2);
+    assert.ok(provisional[1]!.id.startsWith("stream:"));
+    await harness.pi.fire({ type: "message_end", message: streamed }, harness.ctx);
+    const staged = await bridge.view("terminal:v2-stream", { viewVersion: 2 });
+    assert.deepEqual(staged.items, partial.items, "message_end must not erase the pre-persist window");
+    harness.ctx.branch.push({ id: "persisted", type: "message", message: structuredClone(streamed) },
+      { id: "other", type: "message", message: { ...streamed, timestamp: 8 } });
+    const committed = await bridge.view("terminal:v2-stream", { viewVersion: 2 });
+    const items = committed.items as { id: string; text?: string }[];
+    assert.deepEqual(items.map(item => item.id), ["user:block-0", "persisted:block-0", "other:block-0"]);
+    assert.equal(items.filter(item => item.text === "same text").length, 2);
+    assert.equal(committed.branchId, partial.branchId);
+    const previousBranch = committed.branchId;
+    harness.ctx.branch = [{ id: "user", type: "message", message: { role: "user", content: "start" } },
+      { id: "sibling", type: "message", message: { role: "assistant", content: "sibling" } }];
+    const switched = await bridge.view("terminal:v2-stream", { viewVersion: 2 });
+    assert.notEqual(switched.branchId, previousBranch, "sibling branch switches must reset the page store");
+  } finally { bridge.close(); await harness.stop(); }
+});
+
+test("v2 tool events expose running and staged safe results through the real bridge", async () => {
+  const harness = await startHarness({ sessionId: "v2-tools", branch: [
+    { type: "message", id: "calls", message: { role: "assistant", content: [
+      { type: "toolCall", id: "c1", name: "read", arguments: { path: "fixture", token: "hidden" } },
+      { type: "toolCall", id: "c2", name: "read", arguments: { path: "second" } },
+    ] } },
+  ] });
+  await waitForSocket(harness.dir);
+  const bridge = new TerminalSessionBridge({ workspaceRoot: harness.workspace, bridgeDir: harness.dir });
+  try {
+    await harness.pi.fire({ type: "tool_execution_start", toolCallId: "c1", toolName: "read" }, harness.ctx);
+    let page = await bridge.view("terminal:v2-tools", { viewVersion: 2 });
+    let items = page.items as Record<string, unknown>[];
+    assert.equal(items[0]?.status, "running");
+    assert.equal(items[1]?.status, "unknown");
+    await harness.pi.fire({ type: "tool_execution_end", toolCallId: "c1", toolName: "read",
+      result: { content: [{ type: "text", text: "synthetic safe result" }], details: { secret: "never-send" } }, isError: false }, harness.ctx);
+    page = await bridge.view("terminal:v2-tools", { viewVersion: 2 });
+    items = page.items as Record<string, unknown>[];
+    assert.equal(items[0]?.status, "succeeded");
+    const detail = await bridge.view("terminal:v2-tools", { viewVersion: 2, view: "tool", detailId: items[0]?.detailId, revision: page.revision });
+    assert.equal(detail.text, "synthetic safe result");
+    assert.ok(!JSON.stringify(detail).includes("never-send"));
+    harness.ctx.branch.push({ type: "message", id: "result", message: { role: "toolResult", toolCallId: "c1", content: "synthetic safe result" } });
+    page = await bridge.view("terminal:v2-tools", { viewVersion: 2 });
+    items = page.items as Record<string, unknown>[];
+    assert.equal(items.filter(item => item.kind === "toolResult").length, 1);
+    const legacy = await bridge.snapshot("terminal:v2-tools");
+    assert.deepEqual(legacy.messages, [], "legacy text-only contract must still omit tool content");
+  } finally { bridge.close(); await harness.stop(); }
 });

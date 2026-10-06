@@ -1,0 +1,33 @@
+# Tokyo public relay override. Always compose it on top of the base file:
+#   docker compose -f deploy.docker-compose.yml -f deploy/docker-compose.tokyo.yml up -d relay
+# It only attaches the relay container to the external reverse-proxy network used by
+# new-api-caddy and adds local reliability settings; it adds no Caddy service and
+# publishes no extra port.
+services:
+  relay:
+    image: ${PI_REMOTE_IMAGE:-pi-remote-relay:latest}
+    init: true
+    stop_grace_period: 10s
+    healthcheck:
+      # Monitoring only: a failed check marks the container unhealthy, it does not restart it.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8789/api/health').then((res) => process.exit(res.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - default
+      - new-api_new-api-net
+
+networks:
+  new-api_new-api-net:
+    external: true
