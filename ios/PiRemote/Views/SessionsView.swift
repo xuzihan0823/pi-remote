@@ -316,7 +316,7 @@ public struct SessionsView: View {
         .padding(.horizontal, 36)
         .padding(.vertical, 16)
         .glassCapsule(isSelected: true)
-        .padding(.bottom, 24)
+        .padding(.bottom, 4)
     }
 }
 
