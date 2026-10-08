@@ -555,7 +555,7 @@ public struct ConversationView: View {
                                 if let model { client.setActiveModel(model) }
                             }
                         )
-                        .disabled(!client.activeCanControl || client.isSessionRunning || client.isSwitchingModel)
+                        .disabled(!client.activeCanControl || client.isSessionRunning || client.isSwitchingModel || client.isSendingPrompt)
                     }
 
                     if client.isSessionRunning {
@@ -619,9 +619,11 @@ public struct ConversationView: View {
     private func send() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSend else { return }
-        inputText = ""
+        let draft = inputText
         followsBottom = true
-        client.sendPrompt(text)
+        client.sendPrompt(text) { result in
+            if case .success = result, inputText == draft { inputText = "" }
+        }
     }
 
     private func followOutput(_ proxy: ScrollViewProxy) {

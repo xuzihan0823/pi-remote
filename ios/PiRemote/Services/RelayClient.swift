@@ -55,6 +55,11 @@ public final class RelayClient {
     public private(set) var activeModel: RemoteModel?
     public private(set) var activeModels: [RemoteModel] = []
     public private(set) var isSwitchingModel = false
+    public private(set) var isSendingPrompt = false
+    private var modelRequestOrdinal = 0
+    private var modelSwitchId: UUID?
+    private var modelStateUnconfirmed = false
+    private var promptOperationId: UUID?
     /// 模型切换失败时保留的草稿，会话页出现时取回
     public var pendingDraft: String?
     private var catalogRequestOrdinal = 0
@@ -96,6 +101,7 @@ public final class RelayClient {
     public var isCreatingSession: Bool { sessionCreationId != nil }
     public var canSendPrompt: Bool {
         isConnected && agentConnected && activeSessionId != nil && activeCanControl &&
+            !isSwitchingModel && !modelStateUnconfirmed && !isSendingPrompt &&
             (!isActiveTerminal || (terminal.activity == .idle && !terminal.isOffline))
     }
     public var canAbortSession: Bool { isConnected && agentConnected && activeCanControl && isSessionRunning }
@@ -210,6 +216,7 @@ public final class RelayClient {
     public func disconnect() {
         wantsConnection = false
         connectionEpoch += 1
+        invalidateActiveModelRequests()
         cancelSessionCreation()
         reconnectTask?.cancel()
         reconnectTask = nil
@@ -246,6 +253,7 @@ public final class RelayClient {
 
     private func openSocket() {
         connectionEpoch += 1
+        invalidateActiveModelRequests()
         let wasHistoryVisible = historyPageVisible
         NotificationCenter.default.post(name: Self.historyCacheReset, object: nil)
         selectedBranchId = nil
@@ -291,6 +299,7 @@ public final class RelayClient {
         guard webSocketTask != nil || isConnecting else { return }
         let wasHistoryVisible = historyPageVisible
         connectionEpoch += 1
+        invalidateActiveModelRequests()
         cancelSessionCreation()
         historyPageVisible = wasHistoryVisible
         if isActiveArchive, let id = activeSessionId, historyRecoveryOperations[id] != nil {
@@ -429,12 +438,15 @@ public final class RelayClient {
             case .success(let data):
                 let capabilities = data["capabilities"] as? [String: Any] ?? [:]
                 let hadArchive = self.supportsArchive
+                let hadModelSelection = self.supportsModelSelection
                 self.supportsTimeline = capabilities["timelineV2"] as? Bool ?? false
                 self.supportsArchive = capabilities["ompArchiveRead"] as? Bool ?? false
                 self.supportsHistoryResume = capabilities["historyResume"] as? Bool ?? false
                 self.supportsHistoryRecoveryOperations = capabilities["historyRecoveryOperations"] as? Bool ?? false
                 self.supportsModelSelection = capabilities["modelSelection"] as? Bool ?? false
                 self.supportsModelCatalog = capabilities["modelCatalog"] as? Bool ?? false
+                if !self.supportsModelSelection { self.modelStateUnconfirmed = false }
+                if !hadModelSelection || self.modelStateUnconfirmed { self.refreshActiveModels() }
                 guard let list = data["sessions"] as? [[String: Any]] else { return }
                 let incoming = list.compactMap { self.makeSession(from: $0) }
                 if params["includeArchived"] as? Bool == true {
@@ -501,6 +513,7 @@ public final class RelayClient {
     public func openSession(id: String, title: String? = nil, source: SessionSource = .managed) {
         if let title { sessionTitles[id] = title }
         if activeSessionId != id || activeSessionSource != source {
+            invalidateActiveModelRequests()
             cancelSessionCreation()
             stopTerminalPolling()
             resetSessionState()
@@ -635,29 +648,65 @@ public final class RelayClient {
         }
     }
 
+    private func invalidateActiveModelRequests() {
+        modelRequestOrdinal += 1
+        modelSwitchId = nil
+        isSwitchingModel = false
+        modelStateUnconfirmed = supportsModelSelection
+        promptOperationId = nil
+        isSendingPrompt = false
+    }
+
     public func refreshActiveModels() {
-        guard isConnected, supportsModelSelection, let sessionId = activeSessionId, !isActiveArchive else { return }
+        guard isConnected, supportsModelSelection, let sessionId = activeSessionId,
+              !isActiveArchive, !isSwitchingModel else { return }
+        modelRequestOrdinal += 1
+        let ordinal = modelRequestOrdinal
+        let epoch = connectionEpoch
         sendRequest(method: "model.list", sessionId: sessionId) { [weak self] result in
-            guard let self, self.activeSessionId == sessionId, case .success(let data) = result else { return }
-            self.activeModels = RemoteModel.list(data["models"])
-            self.activeModel = RemoteModel(remote: data["model"])
+            guard let self, self.connectionEpoch == epoch, self.activeSessionId == sessionId,
+                  self.modelRequestOrdinal == ordinal, !self.isSwitchingModel else { return }
+            switch result {
+            case .success(let data):
+                self.activeModels = RemoteModel.list(data["models"])
+                self.activeModel = RemoteModel(remote: data["model"])
+                self.modelStateUnconfirmed = false
+            case .failure(let error):
+                self.lastError = error.localizedDescription
+            }
         }
     }
 
     public func setActiveModel(_ model: RemoteModel) {
         guard isConnected, supportsModelSelection, let sessionId = activeSessionId,
-              activeCanControl, !isSwitchingModel, model != activeModel else { return }
+              activeCanControl, !isSwitchingModel, !isSendingPrompt,
+              modelStateUnconfirmed || model.id != activeModel?.id else { return }
+        modelRequestOrdinal += 1
+        let ordinal = modelRequestOrdinal
+        let epoch = connectionEpoch
+        let operationId = UUID()
+        modelSwitchId = operationId
         isSwitchingModel = true
+        modelStateUnconfirmed = true
         sendRequest(method: "session.set_model", sessionId: sessionId, params: ["model": model.selection]) { [weak self] result in
-            guard let self, self.activeSessionId == sessionId else { return }
+            guard let self, self.connectionEpoch == epoch, self.activeSessionId == sessionId,
+                  self.modelRequestOrdinal == ordinal, self.modelSwitchId == operationId else { return }
+            self.modelSwitchId = nil
             self.isSwitchingModel = false
             switch result {
             case .success(let data):
-                self.activeModel = RemoteModel(remote: data["model"]) ?? model
-                self.lastError = nil
+                if let confirmed = RemoteModel(remote: data["model"]), confirmed.id == model.id {
+                    self.activeModel = confirmed
+                    self.modelStateUnconfirmed = false
+                    self.lastError = nil
+                } else {
+                    self.activeModel = nil
+                    self.lastError = "模型切换结果尚未确认，正在重新读取 Mac 上的实际模型。"
+                    self.refreshActiveModels()
+                }
             case .failure(let error):
+                self.activeModel = nil
                 self.lastError = error.localizedDescription
-                // 失败不代表一定没切换，以 Mac 上的实际状态为准
                 self.refreshActiveModels()
             }
         }
@@ -696,6 +745,10 @@ public final class RelayClient {
                 self.sessions.removeAll { $0.id == historyId || $0.id == id }
                 self.sessions.insert(resumed, at: 0)
                 self.openSession(resumed)
+                if let selection = data["modelSelection"] as? [String: Any], selection["applied"] as? Bool != true {
+                    let message = (selection["error"] as? [String: Any])?["message"] as? String
+                    self.lastError = "会话已恢复，但模型尚未确认：\(message ?? "请读取当前模型后重新选择")"
+                }
                 self.refreshSessions()
             case .failure(let error):
                 self.lastError = error.localizedDescription
@@ -759,6 +812,10 @@ public final class RelayClient {
                     self.sessions.removeAll { $0.id == historyId || $0.id == id }
                     self.sessions.insert(resumed, at: 0)
                     self.openSession(resumed)
+                    if let selection = data["modelSelection"] as? [String: Any], selection["applied"] as? Bool != true {
+                        let message = (selection["error"] as? [String: Any])?["message"] as? String
+                        self.lastError = "会话已恢复，但模型尚未确认：\(message ?? "请读取当前模型后重新选择")"
+                    }
                     self.refreshSessions()
                 case "pending":
                     self.historyRecoveryPollTask?.cancel()
@@ -795,38 +852,52 @@ public final class RelayClient {
         }
     }
 
-    public func sendPrompt(_ message: String) {
+    public func sendPrompt(_ message: String, completion: RequestCompletion? = nil) {
         guard let sessionId = activeSessionId else {
             lastError = "尚未选择会话"
+            completion?(.failure(Self.error("尚未选择会话")))
             return
         }
-        guard canSendPrompt else { return }
-        sendPrompt(message, to: sessionId, source: activeSessionSource)
+        guard canSendPrompt else {
+            completion?(.failure(Self.error("请等待会话及模型确认后再发送")))
+            return
+        }
+        sendPrompt(message, to: sessionId, source: activeSessionSource, completion: completion)
     }
 
-    private func sendPrompt(_ message: String, to sessionId: String, source: SessionSource) {
-        if source == .terminal {
-            let generation = terminalGeneration
-            sendRequest(method: "session.prompt", sessionId: sessionId, params: ["message": message]) { [weak self] result in
-                guard let self, !self.isStaleTerminalCompletion(sessionId: sessionId, generation: generation) else { return }
-                switch result {
-                case .success:
+    private func sendPrompt(_ message: String, to sessionId: String, source: SessionSource, completion: RequestCompletion? = nil) {
+        let epoch = connectionEpoch
+        let operationId = UUID()
+        let generation = terminalGeneration
+        promptOperationId = operationId
+        isSendingPrompt = true
+        if source != .terminal {
+            lastUserMessage = message
+            if sessionSettled { resetTurnOutput() }
+        }
+        sendRequest(method: "session.prompt", sessionId: sessionId, params: ["message": message]) { [weak self] result in
+            guard let self, self.connectionEpoch == epoch, self.activeSessionId == sessionId,
+                  self.activeSessionSource == source, self.promptOperationId == operationId,
+                  source != .terminal || !self.isStaleTerminalCompletion(sessionId: sessionId, generation: generation) else { return }
+            self.promptOperationId = nil
+            self.isSendingPrompt = false
+            switch result {
+            case .success:
+                if source == .terminal {
                     Task { await self.refreshTerminalNow(sessionId: sessionId, generation: generation) }
-                case .failure(let error):
+                }
+            case .failure(let error):
+                if (error as NSError).userInfo["relayCode"] == nil {
+                    self.lastError = "发送结果尚未确认，草稿已保留。请核对会话记录后再决定是否重发。"
+                } else {
+                    self.lastError = error.localizedDescription
+                }
+                if source == .terminal, (error as NSError).userInfo["relayCode"] == nil {
                     self.terminal.fail(error.localizedDescription)
                 }
-            }
-            return
-        }
-        lastUserMessage = message
-        if sessionSettled { resetTurnOutput() }
-        let epoch = connectionEpoch
-        sendRequest(method: "session.prompt", sessionId: sessionId, params: ["message": message]) { [weak self] result in
-            guard let self, self.connectionEpoch == epoch, self.activeSessionId == sessionId else { return }
-            if case .failure(let error) = result {
-                self.lastError = error.localizedDescription
                 if self.lastUserMessage == message { self.lastUserMessage = nil }
             }
+            completion?(result)
         }
     }
 
@@ -1216,6 +1287,10 @@ public final class RelayClient {
 
     public func stopTerminalPolling() {
         terminalGeneration += 1
+        if isActiveTerminal {
+            promptOperationId = nil
+            isSendingPrompt = false
+        }
         terminalPollTask?.cancel()
         terminalPollTask = nil
     }
@@ -1439,6 +1514,12 @@ extension RelayClient {
 
     func reconnectForTesting() {
         openSocket()
+    }
+
+    func expireRequestForTesting(_ requestId: String) {
+        guard let pending = pendingRequests.removeValue(forKey: requestId) else { return }
+        pending.timeoutTask.cancel()
+        pending.completion(.failure(Self.error("请求超时")))
     }
 
     func receiveTestFrame(_ frame: [String: Any]) throws {

@@ -55,6 +55,11 @@ struct SessionCreationTests {
         try await pendingRecoveryQueriesSameOperationAndNeverUnlocksEarly()
         try recoveryReconnectAndLateResultNeverLaunchAgainOrStealPage()
         try failedRecoveryRequiresExplicitNewOperation()
+        try modelSwitchCallbacksAreSessionAndRequestScoped()
+        try modelQueriesCannotOverwriteConfirmedSwitches()
+        try modelSwitchTimeoutAndReconnectReconcileActualState()
+        try await promptAcknowledgementPreservesDraft()
+        try recoveredSessionSurvivesModelFailure()
         print("PASS: 新建模式、失败保留草稿、重复创建、旧回调隔离、首条消息路由与终端操作保护")
     }
 
@@ -447,6 +452,188 @@ struct SessionCreationTests {
         f.client.resumeActiveHistory()
         let retry = (try f.request("session.start")["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
         try expect(retry["operationId"] as? String != original && retry["retry"] as? Bool == true && retry["historySessionId"] as? String == "history:failure", "用户重试必须显式创建新操作并重新授权历史")
+    }
+
+    private static let modelA = RemoteModel(provider: "test", modelId: "A", name: "模型 A")
+    private static let modelB = RemoteModel(provider: "test", modelId: "B", name: "模型 B")
+
+    @MainActor
+    private static func enableModels(_ f: Fixture) throws {
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["capabilities": ["modelSelection": true], "sessions": []])
+    }
+
+    private static func modelData(_ model: RemoteModel) -> [String: Any] {
+        ["model": ["provider": model.provider, "modelId": model.modelId, "name": model.name],
+         "models": [modelA.selection, modelB.selection]]
+    }
+
+    @MainActor
+    static func modelSwitchCallbacksAreSessionAndRequestScoped() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try enableModels(f)
+        f.client.openSession(id: "A")
+        try f.respond(try f.request("model.list"), data: modelData(modelA))
+        f.client.setActiveModel(modelB)
+        let old = try f.request("session.set_model")
+        try expect(f.client.isSwitchingModel && !f.client.canSendPrompt, "切换期间禁止发送")
+        f.client.openSession(id: "B")
+        try expect(!f.client.isSwitchingModel, "A 的切换不能锁住 B")
+        f.client.setActiveModel(modelB)
+        let bSwitch = try f.request("session.set_model")
+        try f.respond(old, data: modelData(modelB))
+        try expect(f.client.isSwitchingModel && f.client.activeModel == nil, "旧 A 回调不能结束 B 的切换")
+        f.client.openSession(id: "A")
+        f.client.setActiveModel(modelA)
+        let latest = try f.request("session.set_model")
+        try f.respond(bSwitch, error: ["code": "session_busy", "message": "旧失败"])
+        try expect(f.client.isSwitchingModel && f.client.lastError == nil, "A→B→A 旧回调不能解除新操作")
+        try f.respond(latest, data: modelData(modelA))
+        try expect(!f.client.isSwitchingModel && f.client.activeModel?.id == modelA.id, "新切换可以正常完成")
+    }
+
+    @MainActor
+    static func modelQueriesCannotOverwriteConfirmedSwitches() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try enableModels(f)
+        f.client.openSession(id: "A")
+        let oldList = try f.request("model.list")
+        f.client.setActiveModel(modelB)
+        try f.respond(try f.request("session.set_model"), data: modelData(modelB))
+        try f.respond(oldList, data: modelData(modelA))
+        try expect(f.client.activeModel?.id == modelB.id, "旧查询不能覆盖已确认的新模型")
+        f.client.setActiveModel(modelA)
+        try expect(f.requests("session.set_model").count == 2, "能够切回原模型")
+        try f.respond(try f.request("session.set_model"), data: modelData(modelA))
+        f.client.refreshActiveModels()
+        let first = try f.request("model.list")
+        f.client.refreshActiveModels()
+        try f.respond(try f.request("model.list"), data: modelData(modelB))
+        try f.respond(first, data: modelData(modelA))
+        try expect(f.client.activeModel?.id == modelB.id, "只接受最新查询")
+    }
+
+    @MainActor
+    static func modelSwitchTimeoutAndReconnectReconcileActualState() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try enableModels(f)
+        f.client.openSession(id: "A")
+        f.client.setActiveModel(modelB)
+        f.client.expireRequestForTesting(try f.request("session.set_model")["requestId"] as! String)
+        try expect(!f.client.isSwitchingModel && !f.client.canSendPrompt, "超时解除切换锁，但状态确认前不发送")
+        try f.respond(try f.request("model.list"), data: modelData(modelB))
+        try expect(f.client.canSendPrompt && f.client.activeModel?.id == modelB.id, "超时后读取实际已生效模型")
+        f.client.setActiveModel(modelA)
+        let oldSwitch = try f.request("session.set_model")
+        f.client.reconnectForTesting()
+        try expect(!f.client.isSwitchingModel, "重连复位切换状态")
+        try enableModels(f)
+        let oldList = try f.request("model.list")
+        f.client.setActiveModel(modelB)
+        let current = try f.request("session.set_model")
+        try f.respond(oldSwitch, data: modelData(modelA))
+        try f.respond(oldList, data: modelData(modelA))
+        try expect(f.client.isSwitchingModel, "旧连接响应及早期查询不能解除新切换")
+        try f.respond(current, data: modelData(modelB))
+        f.client.refreshActiveModels()
+        let previousDeviceList = try f.request("model.list")
+        f.client.disconnect()
+        try expect(!f.client.isSwitchingModel, "主动断连复位")
+        try enableModels(f)
+        f.client.openSession(id: "A")
+        try f.respond(try f.request("model.list"), data: modelData(modelB))
+        try f.respond(previousDeviceList, data: modelData(modelA))
+        try expect(f.client.activeModel?.id == modelB.id, "断连或设备切换不接受旧连接模型")
+    }
+
+    @MainActor
+    static func promptAcknowledgementPreservesDraft() async throws {
+        for source in [SessionSource.managed, .terminal] {
+            let f = Fixture()
+            defer { f.client.disconnect() }
+            try enableModels(f)
+            f.client.openSession(id: source == .terminal ? "terminal:A" : "A", source: source)
+            try f.respond(try f.request("model.list"), data: modelData(modelA))
+            if source == .terminal {
+                try f.respond(try await f.nextSnapshot(), data: ["activity": "idle", "messages": []])
+                for _ in 0..<200 where !f.client.terminal.loaded { await Task.yield() }
+            }
+            var draft = "保留原草稿"
+            let send: () -> Void = {
+                let submitted = draft
+                f.client.sendPrompt(submitted) { result in
+                    if case .success = result, draft == submitted { draft = "" }
+                }
+            }
+            f.client.setActiveModel(modelB)
+            send()
+            try expect(f.requests("session.prompt").isEmpty && draft == "保留原草稿", "切模型时不能发送或丢草稿")
+            try f.respond(try f.request("session.set_model"), data: modelData(modelB))
+            send()
+            try expect(draft == "保留原草稿" && !f.client.canSendPrompt, "确认前保留草稿并阻止双击")
+            try f.respond(try f.request("session.prompt"), error: ["code": "session_busy", "message": "明确拒绝"])
+            try expect(draft == "保留原草稿", "明确拒绝保留原草稿")
+            send()
+            f.client.expireRequestForTesting(try f.request("session.prompt")["requestId"] as! String)
+            try expect(draft == "保留原草稿" && f.requests("session.prompt").count == 2, "未知结果不自动重发")
+            try expect(f.client.lastError?.contains("发送结果尚未确认") == true, "未知投递需要明确提示")
+            if source == .terminal {
+                let count = f.requests("session.get").count
+                f.client.stopTerminalPolling()
+                f.client.startTerminalPolling()
+                try f.respond(try await f.nextSnapshot(after: count), data: ["activity": "idle", "messages": []])
+                for _ in 0..<200 where !f.client.canSendPrompt { await Task.yield() }
+            }
+            send()
+            try f.respond(try f.request("session.prompt"), data: ["queued": true])
+            try expect(draft.isEmpty, "只有真实成功确认才清空原草稿")
+            draft = "已提交的草稿"
+            send()
+            draft = "发送等待中修改的新草稿"
+            try f.respond(try f.request("session.prompt"), data: ["queued": true])
+            try expect(draft == "发送等待中修改的新草稿", "晚到成功不得清空后来编辑的草稿")
+            send()
+            let latePrompt = try f.request("session.prompt")
+            if source == .terminal { f.client.stopTerminalPolling() } else { f.client.openSession(id: "B") }
+            try expect(!f.client.isSendingPrompt, "退页或换会话解除等待，不停止后端任务")
+            try f.respond(latePrompt, data: ["queued": true])
+            try expect(draft == "发送等待中修改的新草稿", "离开后的确认不得清空草稿")
+        }
+        let path = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("../PiRemote/Views/ConversationView.swift")
+        let view = try String(contentsOf: path, encoding: .utf8)
+        let send = view.components(separatedBy: "private func send() {")[1].components(separatedBy: "private func followOutput")[0]
+        try expect(send.contains("if case .success = result, inputText == draft"), "页面必须在确认成功且草稿未编辑时才清空")
+    }
+
+    @MainActor
+    static func recoveredSessionSurvivesModelFailure() throws {
+        for operations in [false, true] {
+            let f = Fixture()
+            defer { f.client.disconnect() }
+            try f.connect()
+            try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true, "historyRecoveryOperations": operations]])
+            f.client.openSession(id: "history:model-failure", source: .terminal)
+            f.client.pendingDraft = "恢复后要发送的草稿"
+            f.client.resumeActiveHistory()
+            let start = try f.request("session.start")
+            var response: [String: Any] = ["sessionId": "terminal:restored", "source": "terminal", "status": [
+                "sessionId": "terminal:restored", "source": "terminal", "availability": "live", "canControl": true,
+            ], "modelSelection": ["applied": false, "model": NSNull(), "error": ["code": "session_busy", "message": "模型正在使用中"]]]
+            if operations {
+                let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any]
+                response["operationId"] = params?["operationId"]
+                response["recoveryState"] = "ready"
+                response["phase"] = "ready"
+            }
+            try f.respond(start, data: response)
+            try expect(f.client.activeSessionId == "terminal:restored", "模型失败不能丢弃真实恢复 ID")
+            try expect(f.client.pendingDraft == "恢复后要发送的草稿", "模型失败保留草稿")
+            try expect(f.client.lastError?.contains("模型正在使用中") == true, "模型结果与恢复结果分别展示")
+            try expect(f.requests("session.start").count == 1 && f.requests("session.prompt").isEmpty, "不得再次恢复或误发第一条消息")
+        }
     }
 
     private static func expect(_ condition: Bool, _ message: String) throws {
