@@ -1,6 +1,6 @@
 # 模型选择后端接口
 
-这些接口服务于新建、续接和运行中会话的模型选择。本次只实现后端；iOS 尚未调用这些接口。
+这些接口服务于新建、续接和运行中会话的模型选择。iOS 已接入新建和运行中模型选择；历史恢复的后端同样支持指定模型。
 模型选择作用于当前会话，通过运行时 API 记录，不修改 Mac 的全局默认模型，不发送提示词。
 已在隔离配置下验证 OMP 18.6.3、Pi 0.86.1 的扩展和 RPC 切换，以及默认配置保持不变。
 
@@ -121,3 +121,33 @@ OMP 调用 `models --json`，Pi 调用 `--list-models`，不创建对话进程�
 
 超时或切换后的校验失败不代表运行时一定未执行切换。应先查询当前模型再重试。
 创建请求本身超时沿用既有行为：先刷新会话列表确认结果，再决定是否重新创建。
+
+### 恢复协调器的模型结果（2026-10-08）
+
+生产默认的恢复协调器与旧版等待路径都应用 `model`。只在原文件、会话 ID、工作目录、运行实例及唯一占用验证成功后切换；模型操作不会发送提示词。
+
+协商 `recoveryVersion: 1` 时，首次请求可携带稳定 `operationId`。查询只传 `mode: "terminal"`、`recoveryVersion: 1` 和原 `operationId`，无需再次传历史别名或模型。模型意图与结果保存于私有恢复记录；查询不重复执行已经尝试过的切换。
+
+带模型的恢复响应增加以下字段（不带模型的操作不增加 `modelSelection`）：
+
+```json
+{
+  "operationId": "…",
+  "recoveryState": "ready",
+  "sessionId": "terminal:…",
+  "modelSelection": {
+    "requested": { "provider": "my-provider", "modelId": "my-model" },
+    "state": "applied",
+    "applied": true,
+    "model": { "provider": "my-provider", "modelId": "my-model", "name": "My Model" }
+  }
+}
+```
+
+`modelSelection.state` 为 `pending`、`applying`、`applied`、`failed` 或 `unknown`。前两种不是模型成功确认；新版响应仍为恢复 `pending`，不能发送第一条消息。旧版等待请求会等到模型应用结果确定后返回。
+
+恢复成功但模型不可用、忙碌或结果未知时，仍返回 `ok: true`、`recoveryState: "ready"` 和真实 `sessionId`；`modelSelection.applied` 为 `false`、`model` 为 `null`，并带安全的 `error`。手机保留草稿、展示模型失败原因，不重新恢复、不自动发送或重发。
+
+同一恢复操作绑定最初的精确模型选择，包括“不指定模型”。重复启动必须使用相同选择；两个客户端请求不同模型时，后一个返回 `session_busy`，不覆盖选择、不启动第二份。状态查询可省略模型；若仍传模型则必须与原操作一致。需要更改选择时，先查询原操作，恢复后针对真实 ID 使用 `session.set_model`。
+
+切换意图先落盘再请求运行时。如果助手在应用中重启，结果变为 `unknown`，重连查询不自动重复切换。先用 `session.get_model` / `model.list` 核对实际模型，再由用户明确决定是否切换。`applied` 结果记录的是该恢复操作完成时的确认，不代表用户后来在 Mac 或手机上切换后的当前模型。

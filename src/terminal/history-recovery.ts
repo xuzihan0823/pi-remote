@@ -10,6 +10,16 @@ import { TerminalBridgeError, type TerminalSessionBridge, type TerminalSessionMe
 import type { TerminalResumeTarget, TerminalSessionLauncher } from "./launcher.ts";
 import { sessionOwnerPids } from "./session-owner.ts";
 import { HistoryReadError } from "../history/omp-reader.ts";
+import { readModelSelection, type ModelSelection, type RemoteModel } from "./extension.ts";
+import type { RelayErrorCode } from "../protocol/relay-types.ts";
+
+interface RecoveryModelSelection {
+  requested: ModelSelection;
+  state: "pending" | "applying" | "applied" | "failed" | "unknown";
+  applied: boolean;
+  model: RemoteModel | null;
+  error?: { code: RelayErrorCode; message: string };
+}
 
 export type RecoveryPhase = "validating" | "opening" | "waiting_bridge" | "verifying" | "ready" | "blocked" | "failed" | "outcome_unknown" | "reconciling";
 interface RecoveryRecord {
@@ -30,10 +40,11 @@ interface RecoveryRecord {
   errorCode?: string;
   updatedAt: number;
   createdAt: number;
+  modelSelection?: RecoveryModelSelection;
 }
 export interface RecoveryOptions {
   history: OmpHistoryIndex;
-  bridge: Pick<TerminalSessionBridge, "instances" | "get">;
+  bridge: Pick<TerminalSessionBridge, "instances" | "get"> & Partial<Pick<TerminalSessionBridge, "setModel">>;
   launcher: Pick<TerminalSessionLauncher, "resume">;
   directory?: string;
   workspaceRoot: string;
@@ -67,9 +78,10 @@ export class HistoryRecoveryCoordinator {
   readonly #records = new Map<string, RecoveryRecord>();
   readonly #operations = new Map<string, RecoveryRecord>();
   readonly #jobs = new Map<string, Promise<void>>();
-  readonly #requests = new Map<string, { alias: string; response: Promise<Record<string, unknown>> }>();
+  readonly #requests = new Map<string, { alias: string; model?: ModelSelection; response: Promise<Record<string, unknown>> }>();
   readonly #queries = new Map<string, Promise<Record<string, unknown>>>();
   readonly #saves = new Map<string, Promise<void>>();
+  readonly #modelJobs = new Map<string, Promise<void>>();
   readonly #loaded: Promise<void>;
   #closed = false;
 
@@ -94,6 +106,17 @@ export class HistoryRecoveryCoordinator {
         if (record.version !== 1 || `${record.operationId}.json` !== name || !Number.isSafeInteger(record.createdAt) || typeof record.target?.file !== "string" || typeof record.target.id !== "string" || typeof record.target.cwd !== "string") throw new Error("Invalid recovery record");
         if (!Array.isArray(record.requestIds) || record.requestIds.length > 256 || !record.requestIds.every(id => typeof id === "string" && /^[0-9a-f-]{36}$/.test(id))) throw new Error("Invalid recovery request IDs");
         if (!/^[0-9a-f-]{36}$/.test(record.launchId) || !["validating", "opening", "waiting_bridge", "verifying", "ready", "blocked", "failed", "outcome_unknown", "reconciling"].includes(record.phase) || !Number.isSafeInteger(record.updatedAt) || !/^\d+:\d+$/.test(record.fileIdentity ?? "")) throw new Error("Invalid recovery identity");
+        if (record.modelSelection) {
+          const model = record.modelSelection;
+          if (!readModelSelection(model.requested) || !["pending", "applying", "applied", "failed", "unknown"].includes(model.state) || typeof model.applied !== "boolean") throw new Error("Invalid recovery model selection");
+          if (model.state === "applied" ? !model.applied || !model.model || model.model.provider !== model.requested.provider || model.model.modelId !== model.requested.modelId : model.applied || model.model !== null) throw new Error("Invalid recovery model result");
+          if (model.state === "applying") {
+            model.state = "unknown";
+            model.applied = false;
+            model.model = null;
+            model.error = { code: "internal_error", message: "模型切换结果尚未确认，请读取当前模型；不会自动重复切换。" };
+          }
+        }
         this.#operations.set(record.operationId, record);
         const previous = this.#records.get(record.target.file);
         if (record.phase === "ready" || ["validating", "opening", "waiting_bridge", "verifying"].includes(record.phase)) record.phase = "reconciling";
@@ -118,7 +141,7 @@ export class HistoryRecoveryCoordinator {
     finally { if (this.#saves.get(record.operationId) === saving) this.#saves.delete(record.operationId); }
   }
 
-  async start(alias: string, requestedId?: unknown, retry = false): Promise<Record<string, unknown>> {
+  async start(alias: string, requestedId?: unknown, retry = false, model?: ModelSelection): Promise<Record<string, unknown>> {
     await this.#loaded;
     if (this.#closed) throw new TerminalBridgeError("internal_error", "恢复服务已关闭");
     if (requestedId !== undefined && (typeof requestedId !== "string" || !/^[0-9a-f-]{36}$/i.test(requestedId))) throw new TerminalBridgeError("invalid_frame", "恢复操作 ID 无效");
@@ -126,17 +149,19 @@ export class HistoryRecoveryCoordinator {
     const pending = this.#requests.get(id);
     if (pending) {
       if (pending.alias !== alias) throw new TerminalBridgeError("invalid_frame", "操作 ID 已绑定其他历史引用");
+      this.#assertModel(pending.model, model);
       return pending.response;
     }
     let resolve!: (data: Record<string, unknown>) => void;
     let reject!: (error: unknown) => void;
     const response = new Promise<Record<string, unknown>>((done, fail) => { resolve = done; reject = fail; });
-    this.#requests.set(id, { alias, response });
+    this.#requests.set(id, { alias, model, response });
     void this.#options.history.resume(alias, async target => {
       const fileInfo = await lstat(target.file);
       const known = this.#operations.get(id) ?? [...this.#operations.values()].find(record => record.requestIds.includes(id));
       if (known) {
         if (known.target.file !== target.file) throw new TerminalBridgeError("invalid_frame", "操作 ID 已绑定其他历史");
+        this.#assertModel(known.modelSelection?.requested, model);
         resolve(await this.query(id));
         return;
       }
@@ -144,6 +169,7 @@ export class HistoryRecoveryCoordinator {
       if (existing) {
         const data = await this.query(existing.operationId);
         if (!retry || data.canRetry !== true) {
+          this.#assertModel(existing.modelSelection?.requested, model);
           if (!existing.requestIds.includes(id)) {
             if (existing.requestIds.length >= 256) throw new TerminalBridgeError("session_busy", "恢复操作查询请求过多，请查询现有操作");
             existing.requestIds.push(id);
@@ -154,12 +180,14 @@ export class HistoryRecoveryCoordinator {
         }
         if (this.#records.get(target.file) !== existing) {
           const replacement = this.#records.get(target.file)!;
+          this.#assertModel(replacement.modelSelection?.requested, model);
           if (!replacement.requestIds.includes(id) && replacement.requestIds.length < 256) { replacement.requestIds.push(id); await this.#save(replacement); }
           resolve(await this.query(replacement.operationId));
           return;
         }
       }
       const record: RecoveryRecord = { version: 1, operationId: id, requestIds: [id], target: { file: target.file, id: target.id, cwd: target.cwd }, phase: "validating", launchId: randomUUID(), createdAt: Math.max(Date.now(), (existing?.createdAt ?? 0) + 1), updatedAt: Date.now() };
+      if (model) record.modelSelection = { requested: { ...model }, state: "pending", applied: false, model: null };
       record.fileIdentity = `${fileInfo.dev}:${fileInfo.ino}`;
       this.#records.set(target.file, record);
       this.#operations.set(id, record);
@@ -187,6 +215,7 @@ export class HistoryRecoveryCoordinator {
         },
       } });
       await this.#verify(record, target, meta);
+      await this.#applyModel(record, meta);
     } catch (error) {
       record.errorCode = error instanceof TerminalBridgeError ? error.reason ?? error.code : "validation_failed";
       if (error instanceof TerminalBridgeError && error.message.startsWith("configured PI_BIN")) record.errorCode = "binary_unavailable";
@@ -220,6 +249,41 @@ export class HistoryRecoveryCoordinator {
     return meta;
   }
 
+  #assertModel(expected: ModelSelection | undefined, requested: ModelSelection | undefined): void {
+    if (expected?.provider !== requested?.provider || expected?.modelId !== requested?.modelId) {
+      throw new TerminalBridgeError("session_busy", "此恢复操作已绑定不同模型选择，请查询原操作；恢复后使用真实会话 ID 显式切换模型。");
+    }
+  }
+
+  async #applyModel(record: RecoveryRecord, meta: TerminalSessionMeta): Promise<void> {
+    const pending = this.#modelJobs.get(record.operationId);
+    if (pending) return pending;
+    const selection = record.modelSelection;
+    if (!selection || selection.state !== "pending") return;
+    const job = (async () => {
+      selection.state = "applying";
+      await this.#save(record);
+      try {
+        if (!await this.canControl(meta)) throw new TerminalBridgeError("session_busy", "会话尚未通过恢复验证，不能切换模型");
+        if (!this.#options.bridge.setModel) throw new TerminalBridgeError("not_implemented", "请更新 Mac 桥接以选择模型");
+        const result = await this.#options.bridge.setModel(meta.sessionId, selection.requested);
+        if (result.sessionId !== meta.sessionId || result.model.provider !== selection.requested.provider || result.model.modelId !== selection.requested.modelId) {
+          throw new TerminalBridgeError("internal_error", "模型未按预期生效，请重新读取当前模型");
+        }
+        selection.state = "applied";
+        selection.applied = true;
+        selection.model = { provider: result.model.provider, modelId: result.model.modelId, name: result.model.name };
+      } catch (error) {
+        selection.state = error instanceof TerminalBridgeError && ["invalid_frame", "session_busy", "not_implemented", "unknown_session"].includes(error.code) ? "failed" : "unknown";
+        selection.error = error instanceof TerminalBridgeError ? { code: error.code, message: error.message } : { code: "internal_error", message: "模型切换结果尚未确认，请读取当前模型；不会自动重复切换。" };
+      }
+      await this.#save(record);
+    })();
+    this.#modelJobs.set(record.operationId, job);
+    try { await job; }
+    finally { this.#modelJobs.delete(record.operationId); }
+  }
+
   async reconcile(): Promise<void> {
     await this.#loaded;
     if (this.#closed) return;
@@ -230,8 +294,12 @@ export class HistoryRecoveryCoordinator {
     for (const record of interrupted.slice(0, 64)) await this.query(record.operationId);
   }
 
-  async query(operationId: string): Promise<Record<string, unknown>> {
+  async query(operationId: string, model?: ModelSelection): Promise<Record<string, unknown>> {
     await this.#loaded;
+    if (model) {
+      const record = this.#operations.get(operationId) ?? [...this.#operations.values()].find(value => value.requestIds.includes(operationId));
+      if (record) this.#assertModel(record.modelSelection?.requested, model);
+    }
     const pending = this.#queries.get(operationId);
     if (pending) return pending;
     const result = this.#query(operationId);
@@ -272,6 +340,7 @@ export class HistoryRecoveryCoordinator {
       record.errorCode = transient ? "history_appending" : error instanceof TerminalBridgeError ? error.reason ?? error.code : "validation_failed";
     }
     await this.#save(record);
+    if (session) await this.#applyModel(record, session);
     return this.#public(record, session);
   }
 
@@ -290,6 +359,7 @@ export class HistoryRecoveryCoordinator {
       not_running: "原运行实例已退出，可以重新恢复。",
     };
     const data: Record<string, unknown> = { operationId: record.operationId, recoveryState: state, phase: record.phase === "ready" && !meta ? "verifying" : record.phase, canRetry: record.phase === "failed", branchPolicy: "last_recorded_or_live", approvalLocation: "mac_terminal", ...(record.errorCode ? { errorCode: record.errorCode, message: errors[record.errorCode] ?? "恢复未完成，请检查 Mac 后重试。" } : {}) };
+    if (record.modelSelection) data.modelSelection = { ...record.modelSelection, requested: { ...record.modelSelection.requested } };
     if (meta && record.phase === "ready") {
       const { persistedSessionFile: _file, processId: _pid, instanceId: _instance, launchId: _launch, ...status } = meta;
       Object.assign(data, { sessionId: meta.sessionId, source: "terminal", status: { ...status, source: "terminal", state: "running", availability: "live", canControl: true } });

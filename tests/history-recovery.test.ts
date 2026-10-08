@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { OmpHistoryIndex } from "../src/history/history-index.ts";
 import { TerminalBridgeError, type TerminalSessionMeta } from "../src/terminal/bridge-client.ts";
-import { HistoryRecoveryCoordinator } from "../src/terminal/history-recovery.ts";
+import { HistoryRecoveryCoordinator, type RecoveryOptions } from "../src/terminal/history-recovery.ts";
 import type { TerminalResumeTarget } from "../src/terminal/launcher.ts";
 import { createPiAgentHandler } from "../src/agent/pi-agent-handler.ts";
 import { PiProcessManager } from "../src/pi/process-manager.ts";
@@ -28,12 +28,22 @@ async function fixture(runLaunch?: (target: TerminalResumeTarget) => Promise<Ter
   let owners: number[] = [];
   let identity: string | null = "start-identity";
   let count = 0;
+  let modelCalls = 0;
+  let modelFailure: Error | undefined;
+  let beforeModel = async () => {};
   const bridge = {
     instances: async () => candidates,
     get: async (id: string) => {
       const matching = candidates.filter(meta => meta.sessionId === id);
       if (matching.length !== 1) throw new TerminalBridgeError("session_busy", "conflict");
       return matching[0]!;
+    },
+    setModel: async (sessionId: string, selection: { provider: string; modelId: string }) => {
+      modelCalls++;
+      assert.equal(await recovery.canControl(meta), true, "model changes only after identity and ownership verification");
+      await beforeModel();
+      if (modelFailure) throw modelFailure;
+      return { sessionId, model: { ...selection, name: "Selected" } };
     },
   };
   const meta: TerminalSessionMeta = { sessionId: "terminal:fixture", title: "fixture", runtime: "omp", persistedSessionId: "fixture", persistedSessionFile: file, cwd, activity: "idle", instanceId: "1".repeat(32), processId: 12345 };
@@ -50,8 +60,10 @@ async function fixture(runLaunch?: (target: TerminalResumeTarget) => Promise<Ter
       return meta;
     } },
   };
-  const recovery = new HistoryRecoveryCoordinator(options);
+  const recovery: HistoryRecoveryCoordinator = new HistoryRecoveryCoordinator(options);
   return { root, file, cwd, history, alias, meta, recovery, options,
+    get modelCalls() { return modelCalls; }, setModelFailure(value: Error) { modelFailure = value; },
+    beforeModel(value: () => Promise<void>) { beforeModel = value; },
     get count() { return count; }, setCandidates(value: TerminalSessionMeta[]) { candidates = value; },
     setOwners(value: number[]) { owners = value; }, setIdentity(value: string | null) { identity = value; },
     cleanup() { recovery.close(); history.close(); rmSync(root, { recursive: true, force: true }); },
@@ -302,5 +314,155 @@ test("a live history append racing snapshot validation reconciles without perman
     f.setOwners([]);
     await f.recovery.reconcile();
     assert.equal(await f.recovery.canControl(f.meta), false, "reconciling appends must not auto-clear a confirmed ownership failure");
+  } finally { f.cleanup(); }
+});
+
+const recoveryModel = { provider: "test", modelId: "selected" };
+
+function modelHandler(f: { cwd: string; history: OmpHistoryIndex; recovery: HistoryRecoveryCoordinator; options: RecoveryOptions }) {
+  const manager = new PiProcessManager({ piBin: "must-not-execute" });
+  const handler = createPiAgentHandler({ manager, workspaceRoot: f.cwd, history: f.history,
+    terminalBridge: f.options.bridge as unknown as TerminalSessionBridge, recovery: f.recovery, runtime: "omp",
+    terminalLauncher: { ...f.options.launcher, start: async () => { throw new Error("must-not-create"); } } });
+  return { handler, manager };
+}
+
+test("production recovery applies a selected model once for legacy waits and operation queries", async () => {
+  for (const recoveryVersion of [undefined, 1]) {
+    const f = await fixture();
+    const { handler, manager } = modelHandler(f);
+    try {
+      const started = await handler(requestFrame(randomUUID(), "session.start", { params: {
+        mode: "terminal", historySessionId: f.alias, operationId: randomUUID(), recoveryVersion, model: recoveryModel,
+      } }));
+      assert.equal(started.ok, true);
+      const operation = started.data as Record<string, unknown>;
+      if (recoveryVersion === 1) assert.deepEqual((operation.modelSelection as Record<string, unknown>).requested, recoveryModel);
+      const ready = recoveryVersion === 1 ? await f.recovery.wait(operation.operationId as string) : operation;
+      assert.equal(ready.recoveryState, "ready");
+      assert.equal(ready.sessionId, f.meta.sessionId);
+      assert.deepEqual(ready.modelSelection, { requested: recoveryModel, state: "applied", applied: true, model: { ...recoveryModel, name: "Selected" } });
+      for (const model of [undefined, recoveryModel]) {
+        const queried = await handler(requestFrame(randomUUID(), "session.start", { params: {
+          mode: "terminal", recoveryVersion: 1, operationId: ready.operationId, model,
+        } }));
+        assert.equal(queried.ok, true);
+        assert.deepEqual((queried.data as Record<string, unknown>).modelSelection, ready.modelSelection);
+      }
+      const restarted = new HistoryRecoveryCoordinator(f.options);
+      assert.deepEqual((await restarted.query(ready.operationId as string)).modelSelection, ready.modelSelection);
+      restarted.close();
+      assert.equal(f.count, 1);
+      assert.equal(f.modelCalls, 1, "queries and restarts must not repeat set_model");
+      assert.deepEqual(manager.list(), []);
+    } finally { await manager.closeAll(); f.cleanup(); }
+  }
+});
+
+test("unavailable, busy and unknown model outcomes retain the verified session and never retry", async () => {
+  for (const failure of [new TerminalBridgeError("invalid_frame", "模型不可用"), new TerminalBridgeError("session_busy", "正在执行任务"), new Error("raw secret stderr")]) {
+    const f = await fixture();
+    const { handler, manager } = modelHandler(f);
+    try {
+      f.setModelFailure(failure);
+      const result = await handler(requestFrame(randomUUID(), "session.start", { params: { mode: "terminal", historySessionId: f.alias, model: recoveryModel } }));
+      assert.equal(result.ok, true);
+      const data = result.data as Record<string, unknown>;
+      assert.equal(data.recoveryState, "ready");
+      assert.equal(data.sessionId, f.meta.sessionId);
+      const model = data.modelSelection as Record<string, unknown>;
+      assert.equal(model.applied, false);
+      assert.equal(model.model, null);
+      assert.equal(model.state, failure instanceof TerminalBridgeError ? "failed" : "unknown");
+      assert.ok(!JSON.stringify(data).includes("raw secret stderr"));
+      assert.deepEqual((await f.recovery.query(data.operationId as string)).modelSelection, model);
+      const again = await handler(requestFrame(randomUUID(), "session.start", { params: { mode: "terminal", historySessionId: f.alias, model: recoveryModel } }));
+      assert.equal(again.ok, true);
+      assert.equal((again.data as Record<string, unknown>).sessionId, data.sessionId);
+      assert.equal(f.count, 1);
+      assert.equal(f.modelCalls, 1);
+    } finally { await manager.closeAll(); f.cleanup(); }
+  }
+});
+
+test("two clients requesting different models conflict without mutating the original selection", async () => {
+  const f = await fixture();
+  const { handler, manager } = modelHandler(f);
+  try {
+    const operationId = randomUUID();
+    const params = { mode: "terminal", historySessionId: f.alias, recoveryVersion: 1, operationId, model: recoveryModel };
+    const [first, conflict] = await Promise.all([
+      handler(requestFrame(randomUUID(), "session.start", { params })),
+      handler(requestFrame(randomUUID(), "session.start", { params: { ...params, model: { ...recoveryModel, modelId: "different" } } })),
+    ]);
+    assert.equal(first.ok, true);
+    assert.equal(conflict.error?.code, "session_busy");
+    const ready = await f.recovery.wait(operationId);
+    for (const model of [{ ...recoveryModel, modelId: "different" }, undefined]) {
+      const other = await handler(requestFrame(randomUUID(), "session.start", { params: { ...params, operationId: randomUUID(), model } }));
+      assert.equal(other.error?.code, "session_busy");
+    }
+    const queryConflict = await handler(requestFrame(randomUUID(), "session.start", { params: { mode: "terminal", recoveryVersion: 1, operationId, model: { ...recoveryModel, modelId: "different" } } }));
+    assert.equal(queryConflict.error?.code, "session_busy");
+    const merged = await handler(requestFrame(randomUUID(), "session.start", { params: { ...params, operationId: randomUUID() } }));
+    assert.equal((merged.data as Record<string, unknown>).operationId, operationId);
+    assert.deepEqual((await f.recovery.query(operationId)).modelSelection, ready.modelSelection);
+    assert.equal(f.count, 1);
+    assert.equal(f.modelCalls, 1);
+  } finally { await manager.closeAll(); f.cleanup(); }
+});
+
+test("ownership verification failure never attempts model changes", async () => {
+  const f = await fixture();
+  try {
+    f.setOwners([98765]);
+    const first = await f.recovery.start(f.alias, randomUUID(), false, recoveryModel);
+    const blocked = await f.recovery.wait(first.operationId as string);
+    assert.equal(blocked.recoveryState, "blocked");
+    assert.equal(f.modelCalls, 0);
+    f.setOwners([f.meta.processId!]);
+    const reconciled = await f.recovery.query(first.operationId as string);
+    assert.equal(reconciled.recoveryState, "ready");
+    assert.equal((reconciled.modelSelection as Record<string, unknown>).applied, true);
+    await f.recovery.query(first.operationId as string);
+    assert.equal(f.modelCalls, 1);
+    assert.equal(f.count, 1);
+  } finally { f.cleanup(); }
+});
+
+test("a restart during model application records an unknown outcome and never replays set_model", async () => {
+  const f = await fixture();
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const applying = new Promise<void>(resolve => { entered = resolve; });
+  f.beforeModel(async () => { entered(); await gate; });
+  let waiting: Promise<Record<string, unknown>> | undefined;
+  try {
+    const operation = await f.recovery.start(f.alias, randomUUID(), false, recoveryModel);
+    waiting = f.recovery.wait(operation.operationId as string);
+    await applying;
+    const disk = JSON.parse(readFileSync(join(f.root, "operations", `${operation.operationId}.json`), "utf8"));
+    assert.equal(disk.modelSelection.state, "applying", "intent is persisted before runtime mutation");
+    const restarted = new HistoryRecoveryCoordinator(f.options);
+    const result = await restarted.query(operation.operationId as string);
+    assert.equal(result.recoveryState, "ready");
+    assert.equal(result.sessionId, f.meta.sessionId);
+    assert.equal((result.modelSelection as Record<string, unknown>).state, "unknown");
+    assert.equal((result.modelSelection as Record<string, unknown>).applied, false);
+    await restarted.query(operation.operationId as string);
+    assert.equal(f.modelCalls, 1);
+    restarted.close();
+  } finally { release(); await waiting; f.cleanup(); }
+});
+
+test("a recovery without a selected model preserves the old response and never sets a model", async () => {
+  const f = await fixture();
+  try {
+    const operation = await f.recovery.start(f.alias);
+    const ready = await f.recovery.wait(operation.operationId as string);
+    assert.equal(ready.recoveryState, "ready");
+    assert.equal(ready.modelSelection, undefined);
+    assert.equal(f.modelCalls, 0);
   } finally { f.cleanup(); }
 });

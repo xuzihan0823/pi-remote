@@ -260,7 +260,7 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
             if (!options.terminalLauncher) throw new HandlerError("not_implemented", "terminal session creation is unavailable");
             if (params.operationId !== undefined && params.historySessionId === undefined) {
               if (!options.recovery || params.recoveryVersion !== 1 || typeof params.operationId !== "string" || params.cwd !== undefined) throw new HandlerError("invalid_frame", "恢复查询参数无效");
-              return { ok: true, data: await options.recovery.query(params.operationId) };
+              return { ok: true, data: await options.recovery.query(params.operationId, selection) };
             }
             let session: TerminalSessionMeta;
             if (params.historySessionId !== undefined) {
@@ -269,7 +269,7 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
               }
               if (options.runtime !== "omp" || !options.history || !options.terminalLauncher.resume) throw new HandlerError("not_implemented", "请更新 Mac 助手并选择 OMP 以继续历史会话");
               if (options.recovery) {
-                const operation = await options.recovery.start(params.historySessionId, params.operationId, params.retry === true || params.recoveryVersion !== 1);
+                const operation = await options.recovery.start(params.historySessionId, params.operationId, params.retry === true || params.recoveryVersion !== 1, selection);
                 if (params.recoveryVersion === 1) return { ok: true, data: operation };
                 const result = await options.recovery.wait(operation.operationId as string);
                 if (result.recoveryState !== "ready") throw new HandlerError("session_busy", result.message as string ?? "恢复结果尚未确认，请检查 Mac 后刷新");

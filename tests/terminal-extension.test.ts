@@ -9,6 +9,7 @@ import { TerminalBridgeError, TerminalSessionBridge } from "../src/terminal/brid
 import { createPiAgentHandler } from "../src/agent/pi-agent-handler.ts";
 import { PiProcessManager } from "../src/pi/process-manager.ts";
 import { OmpHistoryIndex } from "../src/history/history-index.ts";
+import { HistoryRecoveryCoordinator } from "../src/terminal/history-recovery.ts";
 import { requestFrame } from "./helpers/relay-harness.ts";
 
 type FakeEvent = { type: string; message?: { role?: string; content?: unknown; timestamp?: number }; toolCallId?: string; toolName?: string; result?: unknown; partialResult?: unknown; isError?: boolean };
@@ -776,4 +777,49 @@ test("new and resumed terminal sessions apply models only after launch, preservi
     assert.deepEqual(h.pi.sent, []);
     assert.deepEqual(readFileSync(file), before);
   } finally { history.close(); bridge.close(); await manager.closeAll(); await h.stop(); }
+});
+
+test("the production coordinator applies and confirms models through the real guarded bridge socket", async () => {
+  process.argv.push("isolated-omp-darwin-test");
+  const h = await startHarness({ sessionId: "coordinated-model" });
+  const state = enableModels(h);
+  const workspace = realpathSync(h.workspace);
+  const root = join(workspace, "history");
+  mkdirSync(join(root, "bucket"), { recursive: true, mode: 0o700 });
+  const file = join(root, "bucket", "original.jsonl");
+  writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "coordinated-model", cwd: workspace, timestamp: "2026-10-08T00:00:00Z" }) + "\n", { mode: 0o600 });
+  h.ctx.sessionManager.getSessionFile = () => file;
+  const before = readFileSync(file);
+  const bridge = new TerminalSessionBridge({ workspaceRoot: workspace, bridgeDir: h.dir });
+  const history = new OmpHistoryIndex({ workspaceRoot: workspace, roots: [root] });
+  let resumes = 0;
+  const launcher = {
+    start: async () => { throw new Error("must-not-create"); },
+    resume: async () => { resumes++; return bridge.get("terminal:coordinated-model"); },
+  };
+  const recovery = new HistoryRecoveryCoordinator({ history, bridge, launcher, workspaceRoot: workspace,
+    directory: join(workspace, "operations"), ownerPids: async () => [process.pid] });
+  bridge.setControlGuard(meta => recovery.canControl(meta));
+  const manager = new PiProcessManager({ piBin: "must-not-spawn" });
+  const handler = createPiAgentHandler({ manager, workspaceRoot: workspace, runtime: "omp", terminalBridge: bridge, history, recovery, terminalLauncher: launcher });
+  try {
+    await history.ready();
+    await waitForSocket(h.dir);
+    const alias = ((await history.list({})).sessions as { sessionId: string }[])[0]!.sessionId;
+    const result = await handler(requestFrame("restore-selected", "session.start", { params: { mode: "terminal", historySessionId: alias, model: chooseB } }));
+    assert.equal(result.ok, true, JSON.stringify(result));
+    const data = result.data as Record<string, unknown>;
+    assert.equal(data.recoveryState, "ready");
+    assert.equal(data.sessionId, "terminal:coordinated-model");
+    assert.equal((data.modelSelection as Record<string, unknown>).applied, true);
+    assert.equal((await bridge.getModel("terminal:coordinated-model")).model?.modelId, chooseB.modelId);
+    const query = await handler(requestFrame("read-status", "session.start", { params: { mode: "terminal", recoveryVersion: 1, operationId: data.operationId } }));
+    assert.deepEqual((query.data as Record<string, unknown>).modelSelection, data.modelSelection);
+    assert.equal(resumes, 1);
+    assert.equal(state.switches, 1);
+    assert.deepEqual(h.pi.sent, []);
+    assert.deepEqual(readFileSync(file), before);
+  } finally {
+    recovery.close(); history.close(); bridge.close(); await manager.closeAll(); await h.stop(); process.argv.pop();
+  }
 });
