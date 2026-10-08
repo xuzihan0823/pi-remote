@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { OmpHistoryIndex } from "../../src/history/history-index.ts";
+import { TerminalSessionBridge } from "../../src/terminal/bridge-client.ts";
+import { TerminalSessionLauncher } from "../../src/terminal/launcher.ts";
+import { HistoryRecoveryCoordinator } from "../../src/terminal/history-recovery.ts";
+import { sessionOwnerPids } from "../../src/terminal/session-owner.ts";
+
+const root = await realpath(await mkdtemp(join(tmpdir(), "pi-offline-recovery-")));
+const sessions = join(root, "sessions");
+const bucket = join(sessions, "synthetic");
+const cwd = join(root, "workspace with 'quotes'");
+const bridgeDir = await realpath(await mkdtemp("/tmp/pi-b-"));
+await mkdir(bucket, { recursive: true, mode: 0o700 });
+await mkdir(cwd, { mode: 0o700 });
+const id = randomUUID();
+const file = join(bucket, `2026-10-07_${id}.jsonl`);
+const timestamp = new Date().toISOString();
+const entries: Record<string, unknown>[] = [];
+let parentId: string | null = null;
+for (let i = 0; i < 130; i++) {
+  const entryId = `msg-${i}`;
+  entries.push({ type: "message", id: entryId, parentId, timestamp, message: { role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: `离线验收合成记录 ${i}` }], timestamp: Date.now(), ...(i % 2 ? { api: "openai-responses", provider: "openai", model: "gpt-5", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop" } : {}) } });
+  parentId = entryId;
+}
+entries.push({ type: "message", id: "tool-call", parentId, timestamp, message: { role: "assistant", content: [{ type: "toolCall", id: "synthetic-tool", name: "read", arguments: { path: "fixture.txt" } }], timestamp: Date.now() } });
+entries.push({ type: "message", id: "tool-result", parentId: "tool-call", timestamp, message: { role: "toolResult", toolCallId: "synthetic-tool", toolName: "read", content: [{ type: "text", text: "合成工具详情\n".repeat(100) }], isError: false, timestamp: Date.now() } });
+entries.push({ type: "compaction", id: "compact", parentId: "tool-result", timestamp, summary: "合成压缩边界", firstKeptEntryId: "msg-128", tokensBefore: 2048, fromHook: false });
+entries.push({ type: "message", id: "sibling", parentId: "compact", timestamp, message: { role: "user", content: [{ type: "text", text: "非恢复目标分支" }], timestamp: Date.now() } });
+entries.push({ type: "message", id: "last-leaf", parentId: "compact", timestamp, message: { role: "user", content: [{ type: "text", text: "最后记录分支" }], timestamp: Date.now() } });
+const titleSlot = { type: "title", v: 1, title: "离线续接真实验收", updatedAt: timestamp, pad: "" };
+titleSlot.pad = " ".repeat(256 - Buffer.byteLength(JSON.stringify(titleSlot) + "\n"));
+await writeFile(file, [JSON.stringify(titleSlot), JSON.stringify({ type: "session", version: 3, id, cwd, timestamp }), ...entries.map(entry => JSON.stringify(entry))].join("\n") + "\n", { mode: 0o600 });
+const original = await readFile(file);
+const history = new OmpHistoryIndex({ workspaceRoot: cwd, roots: [sessions] });
+const bridge = new TerminalSessionBridge({ workspaceRoot: cwd, bridgeDir });
+const launcher = new TerminalSessionLauncher({ piBin: process.env.PI_LIVE_OMP_BIN ?? "/Users/mac/.local/bin/omp", workspaceRoot: cwd, bridge });
+const coordinator = new HistoryRecoveryCoordinator({ history, bridge, launcher, workspaceRoot: cwd, directory: join(root, "operations") });
+bridge.setControlGuard(meta => coordinator.canControl(meta));
+try {
+  await history.ready();
+  const listed = await history.list({});
+  const alias = (listed.sessions as { sessionId: string }[])[0]!.sessionId;
+  assert.deepEqual(await bridge.instances(), []);
+  assert.deepEqual(await sessionOwnerPids({ file, id }), []);
+  const started = await coordinator.start(alias, randomUUID());
+  console.log(JSON.stringify({ root, operationId: started.operationId, phase: started.phase }));
+  const result = await coordinator.wait(started.operationId as string);
+  console.log(JSON.stringify(result));
+  console.log("operation-record", await readFile(join(root, "operations", `${started.operationId}.json`), "utf8"));
+  console.log("wrapper-status", await readFile(join(root, "operations", `${started.operationId}.status`), "utf8").catch(() => "not-consumed"));
+  assert.equal(result.recoveryState, "ready", "must use real open + command + offline OMP, not a fake launcher");
+  assert.deepEqual(await readFile(file), original, "resume alone must not write prompts or fork history");
+  const page = await bridge.view(result.sessionId as string, { viewVersion: 2, limit: 30 });
+  assert.equal(page.canControl, true);
+  const items = page.items as { text?: string }[];
+  assert.ok(items.some(item => item.text === "最后记录分支"));
+  assert.ok(!items.some(item => item.text === "非恢复目标分支"));
+  assert.equal((await bridge.instances()).length, 1);
+  console.log("real-offline-launch-and-last-branch: passed; fixture retained for device verification");
+} finally { coordinator.close(); launcher.close(); bridge.close(); history.close(); }

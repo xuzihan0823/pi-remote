@@ -122,6 +122,12 @@ export class OmpHistoryIndex {
 
   async ready(): Promise<void> { this.#startScan(); await this.#building; }
 
+  async projectDirectories(): Promise<string[]> {
+    await this.ready();
+    return [...new Set([...this.#records.values()].sort((a, b) => b.modifiedAt - a.modifiedAt)
+      .map(record => record.header.cwd))];
+  }
+
   async list(params: Record<string, unknown>, live: readonly Record<string, unknown>[] = []): Promise<Record<string, unknown>> {
     this.#startScan();
     let records = [...this.#records.values()].sort((a, b) => b.modifiedAt - a.modifiedAt || a.alias.localeCompare(b.alias));
@@ -132,7 +138,7 @@ export class OmpHistoryIndex {
       identityCounts.set(key, (identityCounts.get(key) ?? 0) + 1);
     }
     records = records.filter(record => identityCounts.get(`${record.header.cwd}\0${record.header.id}`)! > 1 ||
-      !canonicalLive.some(({ session, cwd }) => session.runtime === "omp" && session.persistedSessionId === record.header.id && cwd === record.header.cwd));
+      !canonicalLive.some(({ session, cwd }) => session.canControl !== false && session.runtime === "omp" && session.persistedSessionId === record.header.id && cwd === record.header.cwd));
     const liveIds = new Set(live.map(session => String(session.sessionId)));
     for (const id of this.#liveTimes.keys()) if (!liveIds.has(id)) this.#liveTimes.delete(id);
     for (const id of liveIds) if (!this.#liveTimes.has(id)) this.#liveTimes.set(id, Date.now());
@@ -164,7 +170,7 @@ export class OmpHistoryIndex {
           sessions.push({ sessionId: record.alias, source: "terminal", runtime: "omp", availability: "archived",
             state: "unknown", activity: "unknown", lastOutcome: "unknown", canControl: false,
             title: header.title || `历史会话 ${header.timestamp.slice(0, 10) || "（无标题）"}`,
-            project: header.cwd.split("/").at(-1), startedAt: record.modifiedAt,
+            cwd: header.cwd, project: header.cwd.split("/").at(-1) || header.cwd, startedAt: record.modifiedAt,
             ...(identityCounts.get(`${header.cwd}\0${header.id}`)! > 1 ? { conflict: true, error: "存在冲突历史副本，仅可只读浏览" } : {}) });
         } catch {
           this.#records.delete(record.file);
@@ -264,6 +270,33 @@ export class OmpHistoryIndex {
       }
       throw new HistoryReadError("changed", "历史持续变化，请重试");
     });
+  }
+
+  async resume<T>(alias: string, operation: (target: { file: string; id: string; cwd: string; verify: () => Promise<void> }) => Promise<T>): Promise<T> {
+    const record = [...this.#records.values()].find(record => record.alias === alias);
+    if (!record) throw new HistoryReadError("alias", "历史引用已失效，请刷新会话列表");
+    const snapshot = await this.#withRead(async () => {
+      const snapshot = await OmpReadSnapshot.open(record.root, record.file, this.#workspace, this.#cancel.signal);
+      try {
+        const header = await snapshot.header();
+        if (header.id !== record.header.id || header.cwd !== record.header.cwd) throw new HistoryReadError("changed", "历史身份已变化，请刷新后重试");
+        if (await this.hasConflict({ runtime: "omp", persistedSessionId: header.id, cwd: header.cwd })) {
+          throw new HistoryReadError("conflict", "存在冲突历史副本，请先在 Mac 上确认要继续的会话");
+        }
+        await snapshot.verify();
+        return snapshot;
+      } catch (error) { await snapshot.close(); throw error; }
+    });
+    try {
+      return await operation({ file: record.file, id: record.header.id, cwd: record.header.cwd, verify: () => snapshot.verify() });
+    } finally { await snapshot.close(); }
+  }
+
+  async resumeStored<T>(target: { file: string; id: string; cwd: string }, operation: (target: { file: string; id: string; cwd: string; verify: () => Promise<void> }) => Promise<T>): Promise<T> {
+    await this.ready();
+    const record = [...this.#records.values()].find(record => record.file === target.file && record.header.id === target.id && record.header.cwd === target.cwd);
+    if (!record) throw new HistoryReadError("alias", "恢复目标已不在授权历史索引中，请刷新会话列表");
+    return this.resume(record.alias, operation);
   }
 
   async hasConflict(session: { runtime?: unknown; persistedSessionId?: unknown; cwd?: unknown }): Promise<boolean> {

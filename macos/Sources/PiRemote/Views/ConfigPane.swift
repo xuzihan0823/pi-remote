@@ -10,41 +10,41 @@ struct ConfigPane: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            SettingsHeader(title: "连接设置", lockedHint: model.canEditConfig ? nil : "断开后可修改配置")
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            SectionTitle(text: "连接设置")
-                            if !model.canEditConfig {
-                                Text("断开后可修改配置")
-                                    .font(Theme.Font.caption)
-                                    .foregroundColor(Theme.textSecondary)
-                            }
-                        }
                         if model.legacyAgentDetected {
                             legacyBanner
                         }
-                        SegmentedChoice(
-                            options: [(ConnectionMode.server, "服务器"), (ConnectionMode.cloudflare, "临时隧道")],
-                            selection: $model.mode,
-                            accessibilityName: "连接方式"
-                        )
-                        .disabled(!model.canEditConfig)
-
-                        Group {
-                            if model.mode == .server {
-                                serverSection
-                            } else {
+                        SettingsGroup(title: "连接方式") {
+                            SegmentedChoice(
+                                options: [(ConnectionMode.server, "服务器"), (ConnectionMode.cloudflare, "临时隧道")],
+                                selection: $model.mode,
+                                accessibilityName: "连接方式"
+                            )
+                            if model.mode == .cloudflare {
                                 tunnelInfo
+                                    .transition(.opacity)
                             }
                         }
-                        .transition(.opacity.combined(with: .offset(y: reduceMotion ? 0 : 4)))
 
-                        workspaceField
-                        advancedSection
-                            .id("advanced")
+                        if model.mode == .server {
+                            serverSection
+                                .transition(.opacity.combined(with: .offset(y: reduceMotion ? 0 : 4)))
+                        }
+
+                        SettingsGroup(title: "本机") {
+                            workspaceField
+                        }
+                        SettingsGroup {
+                            advancedSection
+                        }
+                        .id("advanced")
                     }
-                    .padding(24)
+                    .padding(.horizontal, 24)
+                    .padding(.top, 4)
+                    .padding(.bottom, 24)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .disabled(!model.canEditConfig)
                     .animation(Motion.resolved(Motion.modeSwitch, reduceMotion: reduceMotion), value: model.mode)
@@ -62,7 +62,7 @@ struct ConfigPane: View {
             Divider().overlay(Theme.border)
             actions
                 .padding(.horizontal, 24)
-                .padding(.vertical, 16)
+                .padding(.vertical, 14)
         }
         .onChange(of: focus) { [focus] _ in
             if let previous = focus { model.validateOnBlur(previous) }
@@ -72,7 +72,7 @@ struct ConfigPane: View {
     // MARK: - Sections
 
     private var serverSection: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        SettingsGroup(title: "服务器") {
             SegmentedChoice(
                 options: [(ServerSource.existing, "已有服务器"), (ServerSource.deploy, "部署到我的服务器")],
                 selection: $model.serverSource,
@@ -88,7 +88,7 @@ struct ConfigPane: View {
     }
 
     private var existingServerFields: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             InputField(label: "服务器地址", error: model.fieldErrors[.serverURL]) {
                 TextField("wss://example.com/ws/agent", text: $model.serverURL)
                     .focused($focus, equals: .serverURL)
@@ -105,7 +105,7 @@ struct ConfigPane: View {
     }
 
     private var deployFields: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 16) {
             InputField(label: "服务器地址", help: "IP 或主机名，需可通过 SSH 登录", error: model.fieldErrors[.deployHost]) {
                 TextField("203.0.113.10", text: $model.deployTarget.host)
                     .focused($focus, equals: .deployHost)
@@ -151,10 +151,7 @@ struct ConfigPane: View {
 
     private var tunnelInfo: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("无需配置服务器")
-                .font(Theme.Font.control)
-                .foregroundColor(Theme.textPrimary)
-            Text("自动生成临时公网地址；重新连接后，请用手机重新扫码。")
+            Text("自动生成临时公网地址，无需配置服务器；重新连接后，请用手机重新扫码。")
                 .font(Theme.Font.caption)
                 .foregroundColor(Theme.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -162,13 +159,14 @@ struct ConfigPane: View {
                 .font(Theme.Font.caption)
                 .foregroundColor(Theme.textTertiary)
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, minHeight: 104, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous).fill(Theme.surface))
     }
 
+    @ViewBuilder
     private var workspaceField: some View {
-        InputField(label: "工作区", error: model.fieldErrors[.workspace]) {
+        Label("会话范围：本机全部目录", systemImage: "laptopcomputer")
+            .font(Theme.Font.caption)
+            .foregroundColor(Theme.textSecondary)
+        InputField(label: "默认项目目录", help: "会话范围为本机全部目录；此目录只用于新建会话和项目选择的起始位置。", error: model.fieldErrors[.workspace]) {
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: "folder")
@@ -206,7 +204,7 @@ struct ConfigPane: View {
             .accessibilityLabel(showAdvanced ? "收起高级设置" : "展开高级设置")
 
             if showAdvanced {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 16) {
                     InputField(label: "运行时", help: "共享会话和后台会话使用的程序，支持 pi 与 omp。") {
                         SegmentedChoice(
                             options: [(AgentRuntime.pi, "pi"), (AgentRuntime.omp, "omp")],
@@ -239,13 +237,14 @@ struct ConfigPane: View {
 
     private var actions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            primaryAction
-            HStack {
+            HStack(spacing: 12) {
                 Button("从 .env 导入") { Panels.chooseEnvFile(model: model) }
                     .buttonStyle(LinkButtonStyle())
                     .disabled(!model.canEditConfig)
                     .keyboardShortcut("o", modifiers: .command)
-                Spacer()
+                Spacer(minLength: 0)
+                primaryAction
+                    .frame(width: 168)
             }
             if let info = model.infoMessage {
                 Text(info)
@@ -320,7 +319,7 @@ struct ConfigPane: View {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
-        panel.message = "选择 Agent 使用的工作区目录"
+        panel.message = "选择默认项目目录，不影响本机会话的显示范围"
         if panel.runModal() == .OK, let url = panel.url {
             model.workspacePath = url.path
         }

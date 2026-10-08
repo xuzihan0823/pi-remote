@@ -41,7 +41,7 @@
 
 ```sh
 xcrun swiftc -swift-version 5 \
-  ios/PiRemote/Models/Models.swift \
+  ios/PiRemote/Models/Models.swift ios/PiRemote/Models/TimelineModels.swift \
   ios/PiRemote/Models/ConnectionQRCode.swift \
   ios/Tests/ConnectionQRCodeTests.swift \
   -o /tmp/pi-remote-qr-tests
@@ -52,7 +52,7 @@ xcrun swiftc -swift-version 5 \
 
 ```sh
 xcrun swiftc -swift-version 5 \
-  ios/PiRemote/Models/Models.swift \
+  ios/PiRemote/Models/Models.swift ios/PiRemote/Models/TimelineModels.swift \
   ios/Tests/SessionParsingTests.swift \
   -o /tmp/pi-remote-session-tests
 /tmp/pi-remote-session-tests

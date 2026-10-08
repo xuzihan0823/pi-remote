@@ -13,6 +13,7 @@ struct SessionParsingTests {
         try terminalSnapshotReplacesInsteadOfAppending()
         try resetIsolatesSwitchedSessions()
         try failedTerminalSnapshotIsOffline()
+        try groupsSessionsByProject()
         print("PASS: session.list 字段解析、运行判定与终端快照行为全部通过")
     }
 
@@ -137,6 +138,21 @@ struct SessionParsingTests {
 
         state.apply(["activity": "idle", "messages": []])
         try expect(state.error == nil && !state.isOffline, "重连恢复后自动清除离线状态")
+    }
+
+    static func groupsSessionsByProject() throws {
+        let now = Date()
+        let sessions = [
+            SessionItem(id: "a1", title: "旧", state: .exited, startedAt: now.addingTimeInterval(-300), project: "alpha"),
+            SessionItem(id: "b1", title: "最新", state: .exited, startedAt: now, project: "beta"),
+            SessionItem(id: "a2", title: "新", state: .exited, startedAt: now.addingTimeInterval(-60), project: "alpha"),
+            SessionItem(id: "t1", title: "根目录", state: .exited, startedAt: now.addingTimeInterval(10), project: "tmp"),
+            SessionItem(id: "n1", title: "无项目", state: .exited, startedAt: now.addingTimeInterval(-10)),
+        ]
+        let groups = SessionProjectGroup.group(sessions) { $0.project }
+        try expect(groups.map(\.name) == ["beta", "alpha", SessionProjectGroup.ungroupedName], "项目按最近会话排序，未归属放最后")
+        try expect(groups[1].sessions.map(\.id) == ["a2", "a1"], "项目内按时间倒序")
+        try expect(Set(groups[2].sessions.map(\.id)) == ["t1", "n1"], "/tmp 与无项目会话归入未归属项目")
     }
 
     private static func require<T>(_ value: T?) throws -> T {

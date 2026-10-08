@@ -1,4 +1,5 @@
 import type { UiDialogResponse } from "./types.ts";
+import type { ModelSelection } from "../terminal/extension.ts";
 
 export const RELAY_PROTOCOL_VERSION = 1;
 
@@ -20,6 +21,9 @@ export type RelayRequestMethod =
   | "session.list"
   | "session.start"
   | "session.get"
+  | "model.list"
+  | "session.get_model"
+  | "session.set_model"
   | "session.prompt"
   | "session.abort"
   | "ui.response";
@@ -30,6 +34,9 @@ export const RELAY_REQUEST_METHODS: readonly RelayRequestMethod[] = [
   "session.list",
   "session.start",
   "session.get",
+  "model.list",
+  "session.get_model",
+  "session.set_model",
   "session.prompt",
   "session.abort",
   "ui.response",
@@ -380,7 +387,12 @@ export interface SessionStartParams {
   sessionId?: string;
   cwd?: string;
   args?: string[];
+  historySessionId?: string;
+  model?: ModelSelection;
 }
+
+export interface ModelListParams { cwd?: string; mode?: "terminal" | "rpc"; historySessionId?: string }
+export interface SessionSetModelParams { model: ModelSelection }
 
 export interface SessionGetParams {
   sessionId?: string;

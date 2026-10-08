@@ -10,7 +10,7 @@
 // from the current extension context and forwards prompts/aborts to the very same process, so a
 // remote client never becomes a second writer on a session.
 import { createHash, createHmac, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -73,6 +73,10 @@ interface PiContext {
   ui: PiUi;
   isIdle(): boolean;
   abort(): void;
+  hasPendingMessages?(): boolean;
+  model?: unknown;
+  models?: { list(): unknown[] | Promise<unknown[]>; current(): unknown };
+  modelRegistry?: { getAvailable(): unknown[] | Promise<unknown[]> };
 }
 
 interface PiEvent {
@@ -91,6 +95,47 @@ type PiHandler = (event: PiEvent, ctx: PiContext) => void | Promise<void>;
 interface PiApi {
   on(event: string, handler: PiHandler): void;
   sendUserMessage(content: string): void;
+  setModel?(model: unknown): Promise<boolean>;
+}
+
+export interface ModelSelection { provider: string; modelId: string }
+export interface RemoteModel extends ModelSelection {
+  name: string;
+  reasoning?: boolean;
+  contextWindow?: number;
+}
+
+export function readModelSelection(value: unknown): ModelSelection | null {
+  const record = asRecord(value);
+  const valid = (part: unknown, max: number): part is string =>
+    typeof part === "string" && part.length > 0 && part.length <= max && !/[\s\x00-\x1f\x7f]/u.test(part);
+  return record && valid(record.provider, 128) && valid(record.modelId, 512)
+    ? { provider: record.provider, modelId: record.modelId } : null;
+}
+
+// Runtime model objects may contain credentials and headers. Only these fields cross the bridge.
+export function publicModel(value: unknown): RemoteModel | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const selection = readModelSelection({ provider: record.provider, modelId: record.id ?? record.modelId });
+  if (!selection) return null;
+  return {
+    ...selection,
+    name: typeof record.name === "string" ? record.name.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 256) : selection.modelId,
+    ...(typeof record.reasoning === "boolean" ? { reasoning: record.reasoning } : {}),
+    ...(typeof record.contextWindow === "number" && Number.isSafeInteger(record.contextWindow) && record.contextWindow > 0
+      ? { contextWindow: record.contextWindow } : {}),
+  };
+}
+
+export function publicModels(values: unknown): RemoteModel[] {
+  if (!Array.isArray(values)) throw new Error("模型列表格式无效");
+  const models = new Map<string, RemoteModel>();
+  for (const value of values) {
+    const model = publicModel(value);
+    if (model) models.set(JSON.stringify([model.provider, model.modelId]), model);
+  }
+  return [...models.values()];
 }
 
 interface SessionMeta {
@@ -101,7 +146,10 @@ interface SessionMeta {
   launchId?: string;
   runtime?: "omp" | "pi";
   persistedSessionId?: string;
-  capabilities?: { timelineV2: boolean; toolDetails: boolean };
+  persistedSessionFile?: string;
+  processId?: number;
+  instanceId: string;
+  capabilities?: { timelineV2: boolean; toolDetails: boolean; modelSelection?: boolean };
 }
 
 interface SnapshotMessage {
@@ -121,19 +169,22 @@ type ResponseBody = { ok: true; data: unknown } | { ok: false; error: { code: st
 interface BridgeRegistry {
   registeredApis: WeakSet<object>;
   owners: Map<string, object>;
+  instanceId?: string;
 }
 const BRIDGE_REGISTRY_KEY = Symbol.for("pi-remote.terminalBridge.v1");
 // Both the globally installed copy and the explicitly loaded copy share only our own state.
 const registryHost = globalThis as typeof globalThis & { [BRIDGE_REGISTRY_KEY]?: BridgeRegistry };
 const registry = registryHost[BRIDGE_REGISTRY_KEY] ??= { registeredApis: new WeakSet<object>(), owners: new Map<string, object>() };
+const processInstanceId = registry.instanceId ??= randomBytes(16).toString("hex");
 
 export default function piRemoteBridge(pi: PiApi): void {
   if (registry.registeredApis.has(pi)) return;
   registry.registeredApis.add(pi);
-  const instance = {};
+  const instance = { id: randomBytes(8).toString("hex") };
   let leasedSessionId: string | null = null;
   let duplicate = false;
   let latestContext: PiContext | null = null;
+  let changingModel = false;
   let server: Server | null = null;
   let socketPath: string | null = null;
   let partialAssistant = "";
@@ -153,17 +204,35 @@ export default function piRemoteBridge(pi: PiApi): void {
   const ownsLaunch = launchOwner === undefined || launchOwner === String(process.pid);
   let initialSessionId: string | null = null;
   let launchSessionReplaced = false;
+  const launchStatusPath = process.env.PI_REMOTE_LAUNCH_STATUS_PATH;
+
+  function recordLaunchStage(stage: string, ctx?: PiContext): void {
+    if (!launchStatusPath || !ownsLaunch || !launchId || !/^[0-9a-f-]{36}$/.test(launchId)) return;
+    try {
+      const path = `${launchStatusPath}.bridge.${instance.id}`;
+      writeFileSync(`${path}.tmp`, JSON.stringify({ stage, launchId, instanceId: processInstanceId, extensionInstanceId: instance.id, processId: process.pid,
+        mode: ctx?.mode === "tui" || ctx?.mode === "rpc" || ctx?.mode === "print" ? ctx.mode : "unknown", hasUI: ctx?.hasUI === true,
+        ownsLease: leasedSessionId !== null && registry.owners.get(leasedSessionId) === instance, listening: server?.listening === true,
+        agentKind: ctx?.agent?.kind === "main" || ctx?.agent?.kind === "sub" ? ctx.agent.kind : "unknown" }), { mode: 0o600 });
+      renameSync(`${path}.tmp`, path);
+    } catch {}
+  }
+  recordLaunchStage("extension_loaded");
 
   function isUserTerminal(ctx: PiContext): boolean {
-    if (duplicate || ctx.mode !== "tui" || !ctx.hasUI || ctx.agent?.kind === "sub" || !ownsLaunch) return false;
+    if (duplicate || ctx.mode !== "tui" || !ctx.hasUI || ctx.agent?.kind === "sub" || !ownsLaunch) {
+      recordLaunchStage(duplicate ? "duplicate_extension" : "non_user_terminal", ctx);
+      return false;
+    }
     let id: string;
     try { id = ctx.sessionManager.getSessionId(); }
-    catch { return false; }
-    if (typeof id !== "string" || !id) return false;
+    catch { recordLaunchStage("session_identity_unavailable", ctx); return false; }
+    if (typeof id !== "string" || !id) { recordLaunchStage("session_identity_unavailable", ctx); return false; }
     const owner = registry.owners.get(id);
     if (owner && owner !== instance) {
       // Once identified as a second copy, stay suppressed across /new and shutdown/restart.
       duplicate = true;
+      recordLaunchStage("duplicate_extension", ctx);
       return false;
     }
     if (leasedSessionId !== null && leasedSessionId !== id && registry.owners.get(leasedSessionId) === instance) {
@@ -266,16 +335,26 @@ export default function piRemoteBridge(pi: PiApi): void {
     }
 
     const path = join(dir, `${SOCKET_FILE_PREFIX}${randomBytes(8).toString("hex")}${SOCKET_FILE_SUFFIX}`);
+    const socketLimit = process.platform === "darwin" ? 104 : 108;
+    if (Buffer.byteLength(path) >= socketLimit) {
+      recordLaunchStage("socket_path_too_long", ctx);
+      reportError(new Error("bridge directory path exceeds the local socket length limit"));
+      stopBridge();
+      return;
+    }
     const created = createServer((socket) => handleConnection(socket));
     created.on("error", (error) => {
       reportError(error);
+      recordLaunchStage("bridge_bind_failed", ctx);
       stopBridge();
     });
     created.listen(path, () => {
       try {
         chmodSync(path, SOCKET_MODE);
+        recordLaunchStage("bridge_ready", ctx);
       } catch (error) {
         reportError(error);
+        recordLaunchStage("bridge_bind_failed", ctx);
         stopBridge();
       }
     });
@@ -334,9 +413,12 @@ export default function piRemoteBridge(pi: PiApi): void {
     if (requested !== undefined && requested !== sessionId) {
       return failure("stale_session", `request targets "${requested}" but the current session is "${sessionId}"`);
     }
+    if (request.instanceId !== undefined && request.instanceId !== processInstanceId) {
+      return failure("stale_session", "终端实例已变化，请重新连接");
+    }
     // Control operations must name the target session explicitly; a request bound to a replaced id
     // is rejected above instead of silently acting on whatever session is current now.
-    if (requested === undefined && (request.op === "prompt" || request.op === "abort")) {
+    if (requested === undefined && ["prompt", "abort", "set_model", "get_model", "models"].includes(String(request.op))) {
       return failure("invalid_request", `${request.op} requires an explicit sessionId`);
     }
 
@@ -348,12 +430,47 @@ export default function piRemoteBridge(pi: PiApi): void {
           return success(sessionMeta(ctx, sessionId));
         case "snapshot":
           return success(request.viewVersion === 2 ? buildTimeline(ctx, sessionId, request) : buildSnapshot(ctx, sessionId));
+        case "get_model":
+          if (!supportsModels(ctx)) return failure("unsupported_op", "请更新终端运行时与桥接扩展以选择模型");
+          return success({ sessionId, model: publicModel(currentModel(ctx)) });
+        case "models": {
+          if (!supportsModels(ctx)) return failure("unsupported_op", "请更新终端运行时与桥接扩展以选择模型");
+          const models = publicModels(await availableModels(ctx));
+          if (currentSessionId() !== sessionId) return failure("stale_session", "读取模型期间会话已切换");
+          return success({ sessionId, models, model: publicModel(currentModel(ctx)) });
+        }
+        case "set_model": {
+          const selection = readModelSelection(request.model);
+          if (!selection) return failure("invalid_request", "model 需要有效的 provider 和 modelId");
+          if (!supportsModels(ctx) || !pi.setModel) return failure("unsupported_op", "请更新终端运行时与桥接扩展以选择模型");
+          if (changingModel || !ctx.isIdle() || ctx.hasPendingMessages?.()) return failure("session_busy", "请等待当前任务和模型切换完成");
+          changingModel = true;
+          try {
+            const models = await availableModels(ctx);
+            const selected = models.find(value => {
+              const model = publicModel(value);
+              return model?.provider === selection.provider && model.modelId === selection.modelId;
+            });
+            if (!selected) return failure("invalid_request", "所选模型不可用，请刷新模型列表");
+            if (currentSessionId() !== sessionId) return failure("stale_session", "选择模型期间会话已切换");
+            if (!ctx.isIdle() || ctx.hasPendingMessages?.()) return failure("session_busy", "请等待当前任务完成");
+            if (!await pi.setModel(selected)) return failure("invalid_request", "所选模型未配置可用凭据");
+            if (currentSessionId() !== sessionId) return failure("stale_session", "切换模型期间会话已切换，请重新读取状态");
+            const model = publicModel(currentModel(ctx));
+            if (model?.provider !== selection.provider || model.modelId !== selection.modelId) {
+              return failure("internal_error", "模型未按预期生效，请重新读取状态");
+            }
+            return success({ sessionId, model });
+          } catch {
+            return failure("internal_error", "模型切换失败，请检查 Mac 上的模型配置并重新读取状态");
+          } finally { changingModel = false; }
+        }
         case "prompt": {
           const message = request.message;
           if (typeof message !== "string" || message.trim().length === 0) {
             return failure("invalid_request", "prompt requires a non-empty message");
           }
-          if (!ctx.isIdle()) {
+          if (changingModel || !ctx.isIdle()) {
             return failure("session_busy", "the terminal session is busy; wait for the current turn to settle");
           }
           pi.sendUserMessage(message);
@@ -366,8 +483,21 @@ export default function piRemoteBridge(pi: PiApi): void {
           return failure("unsupported_op", `unsupported op ${JSON.stringify(request.op)}`);
       }
     } catch (error) {
-      return failure("internal_error", describe(error));
+      return failure("internal_error", ["models", "get_model"].includes(String(request.op)) ? "无法读取模型，请检查 Mac 上的模型配置" : describe(error));
     }
+  }
+
+  function supportsModels(ctx: PiContext): boolean {
+    return typeof pi.setModel === "function" &&
+      (typeof ctx.models?.list === "function" || typeof ctx.modelRegistry?.getAvailable === "function");
+  }
+
+  function availableModels(ctx: PiContext): Promise<unknown[]> {
+    return Promise.resolve(ctx.models ? ctx.models.list() : ctx.modelRegistry!.getAvailable());
+  }
+
+  function currentModel(ctx: PiContext): unknown {
+    return ctx.models ? ctx.models.current() : ctx.model;
   }
 
   function sessionMeta(ctx: PiContext, sessionId: string): SessionMeta {
@@ -375,7 +505,10 @@ export default function piRemoteBridge(pi: PiApi): void {
     return {
       sessionId, cwd: ctx.cwd, title: currentTitle(), activity: currentActivity(),
       runtime: runtimeName(), persistedSessionId: ctx.sessionManager.getSessionId(),
-      capabilities: { timelineV2: true, toolDetails: true },
+      persistedSessionFile: ctx.sessionManager.getSessionFile(),
+      processId: process.pid,
+      instanceId: processInstanceId,
+      capabilities: { timelineV2: true, toolDetails: true, ...(supportsModels(ctx) ? { modelSelection: true } : {}) },
       ...(!launchSessionReplaced && launchId && /^[0-9a-f-]{36}$/.test(launchId) && sessionId === initialSessionId ? { launchId } : {}),
     };
   }
@@ -442,6 +575,7 @@ export default function piRemoteBridge(pi: PiApi): void {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    recordLaunchStage("session_seen", ctx);
     if (!isUserTerminal(ctx)) return;
     latestContext = ctx;
     partialAssistant = "";
@@ -458,6 +592,7 @@ export default function piRemoteBridge(pi: PiApi): void {
   });
 
   pi.on("session_shutdown", (_event, ctx) => {
+    recordLaunchStage("shutdown", ctx);
     if (!isUserTerminal(ctx)) return;
     latestContext = ctx;
     stopBridge();

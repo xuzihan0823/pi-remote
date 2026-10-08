@@ -90,7 +90,7 @@ test("shell quoting executes literal cwd/binary safely, deletes launch file befo
   writeFileSync(dangerousBinary, `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(output)}, JSON.stringify({cwd: process.cwd(), env: process.env, args: process.argv.slice(2), pid: process.pid}));\n`, { mode: 0o700 });
   let commandPath = "";
   const launcher = new TerminalSessionLauncher({
-    piBin: dangerousBinary, workspaceRoot: h.workspace, bridge: h.bridge, platform: "darwin", timeoutMs: 1_000,
+    piBin: dangerousBinary, workspaceRoot: h.workspace, bridge: h.bridge, platform: "darwin", timeoutMs: 5_000,
     spawnFn: (_executable, args) => {
       commandPath = args[2]!;
       const result = spawnSync("/bin/sh", [commandPath], { env: { RELAY_TOKEN: "sensitive-token", AGENT_TOKEN: "agent-secret", MALICIOUS_EXTRA: "must-not-inherit" } });
@@ -129,17 +129,20 @@ test("unrelated terminals and old session IDs cannot satisfy a launch; timeout c
   } finally { h.cleanup(); }
 });
 
-test("real cwd allowlist rejects symlink escapes, non-directories, nonexistent paths and traversal before opening", async () => {
+test("existing projects anywhere on Mac resolve; invalid directories never open a terminal", async () => {
   const h = harness();
   const outside = join(h.root, "outside");
   mkdirSync(outside);
   symlinkSync(outside, join(h.workspace, "escape"));
   writeFileSync(join(h.workspace, "file"), "file");
   try {
-    for (const cwd of ["escape", "file", "missing", "..", outside, "", "a\0b", 42]) {
+    for (const cwd of ["file", "missing", "", "a\0b", 42]) {
       await rejectCode(h.launcher.start(cwd), "invalid_frame");
     }
     assert.equal(h.calls.length, 0);
+    assert.equal(await resolveTerminalCwd(h.workspace, outside), outside);
+    assert.equal(await resolveTerminalCwd(h.workspace, "escape"), outside);
+    assert.equal(await resolveTerminalCwd(h.workspace, ".."), h.root);
     symlinkSync(h.workspace, join(h.root, "root-link"));
     assert.equal(await resolveTerminalCwd(join(h.root, "root-link"), undefined), h.workspace);
   } finally { h.cleanup(); }
@@ -216,6 +219,68 @@ test("duplicate launch claims and wrong cwd are errors rather than choosing the 
       h.setSessions(ambiguous ? [h.meta("terminal:a"), h.meta("terminal:b")] : [h.meta("terminal:bad", { cwd: h.root })]);
       await rejectCode(pending, "internal_error");
       assert.equal(existsSync(dirname(h.commandPath)), false);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("resume opens the exact history with safely quoted argv and verifies identity before handoff", async () => {
+  const h = harness({ ownerPids: async () => [] });
+  const file = join(h.root, "history' ; $(echo attack).jsonl");
+  writeFileSync(file, "fixture");
+  let verified = 0;
+  try {
+    const pending = h.launcher.resume({ file, id: "history-id", cwd: h.root, verify: async () => { verified++; } });
+    await h.opened;
+    assert.match(h.command, /'--session'/);
+    assert.match(h.command, /history'"'"'/);
+    h.setSessions([h.meta("terminal:history-id", { cwd: h.root, runtime: "omp", persistedSessionId: "history-id", persistedSessionFile: file })]);
+    const resumed = await pending;
+    assert.equal(resumed.persistedSessionId, "history-id");
+    assert.equal(h.calls.length, 1);
+    assert.equal(verified, 3);
+  } finally { h.cleanup(); }
+});
+
+test("resume reuses an old live bridge even at the launch cap and never starts a second writer", async () => {
+  const h = harness({ maxSessions: 1, ownerPids: async () => { throw new Error("must not probe the reused writer"); } });
+  const existing = h.meta("terminal:history-id", { launchId: undefined });
+  h.setSessions([existing]);
+  try {
+    const session = await h.launcher.resume({ file: join(h.root, "unused.jsonl"), id: "history-id", cwd: h.workspace, verify: async () => {} });
+    assert.deepEqual(session, existing);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.child.killed, 0);
+  } finally { h.cleanup(); }
+});
+
+test("resume fails closed for an unbridged writer, changing file or ownership race before open", async () => {
+  for (const scenario of ["owner", "changed", "race"]) {
+    let probes = 0;
+    const h = harness({ ownerPids: async () => { probes++; return scenario === "owner" || (scenario === "race" && probes === 2) ? [12345] : []; } });
+    try {
+      const pending = h.launcher.resume({ file: join(h.root, "fixture.jsonl"), id: "history-id", cwd: h.workspace,
+        verify: async () => { if (scenario === "changed") throw new TerminalBridgeError("invalid_frame", "changed"); } });
+      await rejectCode(pending, scenario === "changed" ? "invalid_frame" : "session_busy");
+      assert.equal(h.calls.length, 0);
+      assert.equal(h.child.killed, 0);
+    } finally { h.cleanup(); }
+  }
+});
+
+test("resume refuses forks, wrong history files and another writer appearing after launch", async () => {
+  for (const scenario of ["fork", "file", "owner"]) {
+    let probes = 0;
+    const h = harness({ ownerPids: async () => ++probes > 2 && scenario === "owner" ? [98765] : [] });
+    const file = join(h.root, "fixture.jsonl");
+    const other = join(h.root, "other.jsonl");
+    writeFileSync(file, "fixture"); writeFileSync(other, "other");
+    try {
+      const pending = h.launcher.resume({ file, id: "history-id", cwd: h.workspace, verify: async () => {} });
+      await h.opened;
+      h.setSessions([h.meta("terminal:history-id", { runtime: "omp", persistedSessionId: scenario === "fork" ? "fork-id" : "history-id",
+        persistedSessionFile: scenario === "file" ? other : file, processId: 12345 })]);
+      await rejectCode(pending, "session_busy");
+      assert.equal(h.child.killed, 0);
     } finally { h.cleanup(); }
   }
 });

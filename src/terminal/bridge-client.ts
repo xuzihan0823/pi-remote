@@ -3,9 +3,10 @@ import { lstatSync } from "node:fs";
 import { readdir, realpath } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import type { RelayErrorCode } from "../protocol/relay-types.ts";
-import type { TimelineItem } from "./extension.ts";
+import { publicModel, publicModels, type ModelSelection, type RemoteModel, type TimelineItem } from "./extension.ts";
+import { sessionRoots, within } from "../session-scope.ts";
 
 /** Every session served by the terminal bridge is addressed with this prefix. */
 export const TERMINAL_SESSION_PREFIX = "terminal:";
@@ -30,7 +31,12 @@ export interface TerminalSessionMeta {
   launchId?: string;
   runtime?: "omp" | "pi";
   persistedSessionId?: string;
-  capabilities?: { timelineV2: boolean; toolDetails: boolean };
+  persistedSessionFile?: string;
+  processId?: number;
+  instanceId?: string;
+  canControl?: boolean;
+  error?: string;
+  capabilities?: { timelineV2: boolean; toolDetails: boolean; modelSelection?: boolean };
 }
 
 export interface TerminalSnapshotMessage {
@@ -72,11 +78,13 @@ export function defaultBridgeDir(): string {
 /** Error carrying a relay-compatible code so the agent handler can forward it unchanged. */
 export class TerminalBridgeError extends Error {
   readonly code: RelayErrorCode;
+  readonly reason?: string;
 
-  constructor(code: RelayErrorCode, message: string) {
+  constructor(code: RelayErrorCode, message: string, reason?: string) {
     super(message);
     this.name = "TerminalBridgeError";
     this.code = code;
+    this.reason = reason;
   }
 }
 
@@ -107,8 +115,8 @@ export class TerminalSessionBridge {
   readonly #logger: (message: string) => void;
   readonly #sockets = new Set<Socket>();
 
+  #controlGuard: ((meta: TerminalSessionMeta) => Promise<boolean>) | undefined;
   #closed = false;
-  #realRoot: string | null = null;
 
   constructor(options: TerminalSessionBridgeOptions) {
     this.#workspaceRoot = resolve(options.workspaceRoot);
@@ -126,16 +134,29 @@ export class TerminalSessionBridge {
     return this.#dirs;
   }
 
+  setControlGuard(guard: (meta: TerminalSessionMeta) => Promise<boolean>): void {
+    this.#controlGuard = guard;
+  }
+
+  async instances(): Promise<TerminalSessionMeta[]> {
+    return (await this.#discover()).map(entry => entry.meta);
+  }
+
   async list(): Promise<TerminalSessionMeta[]> {
-    const discovered = await this.#discover();
-    const seen = new Set<string>();
+    const discovered = await this.instances();
     const metas: TerminalSessionMeta[] = [];
-    for (const entry of discovered) {
-      if (seen.has(entry.meta.sessionId)) continue;
-      seen.add(entry.meta.sessionId);
-      metas.push(entry.meta);
+    for (const id of new Set(discovered.map(meta => meta.sessionId))) {
+      const candidates = discovered.filter(meta => meta.sessionId === id);
+      const meta = candidates[0]!;
+      const authorized = await this.canControl(meta);
+      const canControl = candidates.length === 1 && authorized;
+      metas.push({ ...meta, canControl, ...(!canControl ? { error: "会话正在恢复或存在实例冲突，已禁止控制" } : {}) });
     }
     return metas;
+  }
+
+  async canControl(meta: TerminalSessionMeta): Promise<boolean> {
+    return !this.#controlGuard || await this.#controlGuard(meta);
   }
 
   async get(sessionId: string): Promise<TerminalSessionMeta> {
@@ -165,12 +186,44 @@ export class TerminalSessionBridge {
 
   async prompt(sessionId: string, message: string): Promise<void> {
     const entry = await this.#resolve(sessionId);
-    await this.#call(entry.socketPath, { op: "prompt", sessionId, message }, this.#requestTimeoutMs);
+    if (!await this.canControl(entry.meta)) throw new TerminalBridgeError("session_busy", "此实例尚未通过恢复验证，不能发送消息");
+    await this.#call(entry.socketPath, { op: "prompt", sessionId, instanceId: entry.meta.instanceId, message }, this.#requestTimeoutMs);
   }
 
   async abort(sessionId: string): Promise<void> {
     const entry = await this.#resolve(sessionId);
-    await this.#call(entry.socketPath, { op: "abort", sessionId }, this.#requestTimeoutMs);
+    if (!await this.canControl(entry.meta)) throw new TerminalBridgeError("session_busy", "此实例尚未通过恢复验证，不能停止任务");
+    await this.#call(entry.socketPath, { op: "abort", sessionId, instanceId: entry.meta.instanceId }, this.#requestTimeoutMs);
+  }
+
+  async models(sessionId: string): Promise<{ sessionId: string; models: RemoteModel[]; model: RemoteModel | null }> {
+    const data = await this.#modelRequest(sessionId, "models");
+    return { sessionId, models: publicModels(data.models), model: publicModel(data.model) };
+  }
+
+  async getModel(sessionId: string): Promise<{ sessionId: string; model: RemoteModel | null }> {
+    const data = await this.#modelRequest(sessionId, "get_model");
+    return { sessionId, model: publicModel(data.model) };
+  }
+
+  async setModel(sessionId: string, selection: ModelSelection): Promise<{ sessionId: string; model: RemoteModel }> {
+    const data = await this.#modelRequest(sessionId, "set_model", selection);
+    const model = publicModel(data.model);
+    if (!model || model.provider !== selection.provider || model.modelId !== selection.modelId) {
+      throw new TerminalBridgeError("internal_error", "终端未确认所选模型，请重新读取模型状态");
+    }
+    return { sessionId, model };
+  }
+
+  async #modelRequest(sessionId: string, op: string, model?: ModelSelection): Promise<Record<string, unknown>> {
+    const entry = await this.#resolve(sessionId);
+    if (op === "set_model" && !await this.canControl(entry.meta)) throw new TerminalBridgeError("session_busy", "此实例尚未通过恢复验证，不能切换模型");
+    if (!entry.meta.capabilities?.modelSelection) throw new TerminalBridgeError("not_implemented", "请在 Mac 上更新桥接扩展并执行 /reload 以选择模型");
+    const data = await this.#call(entry.socketPath, { op, sessionId, instanceId: entry.meta.instanceId, ...(model ? { model } : {}) }, Math.max(5_000, this.#requestTimeoutMs));
+    if (!data || typeof data !== "object" || (data as Record<string, unknown>).sessionId !== sessionId) {
+      throw new TerminalBridgeError("internal_error", "终端返回的模型会话不匹配");
+    }
+    return data as Record<string, unknown>;
   }
 
   /** Drops in-flight client sockets. It must never touch the terminal process itself. */
@@ -210,8 +263,8 @@ export class TerminalSessionBridge {
       const data = await this.#call(socketPath, { op: "list" }, this.#probeTimeoutMs);
       const meta = parseSessionMeta(firstSession(data));
       if (!meta) return null;
-      if (!(await this.#withinWorkspace(meta.cwd))) {
-        this.#logger(`ignoring terminal bridge socket ${socketPath}: cwd is outside the workspace`);
+      if (!(await this.#withinSessionRoots(meta.cwd))) {
+        this.#logger(`ignoring terminal bridge socket ${socketPath}: cwd is outside the workspace and temporary directories`);
         return null;
       }
       return { meta, socketPath };
@@ -226,30 +279,22 @@ export class TerminalSessionBridge {
       throw new TerminalBridgeError("internal_error", "terminal bridge client is closed");
     }
     const discovered = await this.#discover();
-    const entry = discovered.find((candidate) => candidate.meta.sessionId === sessionId);
-    if (!entry) {
-      throw new TerminalBridgeError("unknown_session", `No live terminal session "${sessionId}"`);
-    }
-    return entry;
+    const entries = discovered.filter(candidate => candidate.meta.sessionId === sessionId);
+    if (!entries.length) throw new TerminalBridgeError("unknown_session", "终端会话已离线");
+    if (entries.length !== 1) throw new TerminalBridgeError("session_busy", "同一会话存在多个终端实例，请在 Mac 上确认");
+    return entries[0]!;
   }
 
-  async #withinWorkspace(cwd: string): Promise<boolean> {
+  async #withinSessionRoots(cwd: string): Promise<boolean> {
     try {
-      const root = await this.#resolvedRoot();
+      const roots = await sessionRoots(this.#workspaceRoot);
       const realCwd = await realpath(cwd);
-      const rel = relative(root, realCwd);
-      return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+      return roots.some(root => within(root, realCwd));
     } catch {
       return false;
     }
   }
 
-  async #resolvedRoot(): Promise<string> {
-    if (this.#realRoot === null) {
-      this.#realRoot = await realpath(this.#workspaceRoot).catch(() => this.#workspaceRoot);
-    }
-    return this.#realRoot;
-  }
 
   #call(socketPath: string, payload: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
     if (this.#closed) {
@@ -398,10 +443,14 @@ function parseSessionMeta(value: unknown): TerminalSessionMeta | null {
     sessionId, title, cwd, activity: parseActivity(record.activity), ...(launchId ? { launchId } : {}),
     ...(record.runtime === "omp" || record.runtime === "pi" ? { runtime: record.runtime } : {}),
     ...(typeof record.persistedSessionId === "string" ? { persistedSessionId: record.persistedSessionId } : {}),
+    ...(typeof record.persistedSessionFile === "string" ? { persistedSessionFile: record.persistedSessionFile } : {}),
+    ...(typeof record.processId === "number" && Number.isSafeInteger(record.processId) && record.processId > 0 ? { processId: record.processId } : {}),
+    ...(typeof record.instanceId === "string" && /^[0-9a-f]{32}$/.test(record.instanceId) ? { instanceId: record.instanceId } : {}),
     ...(typeof record.capabilities === "object" && record.capabilities !== null ? {
       capabilities: {
         timelineV2: (record.capabilities as Record<string, unknown>).timelineV2 === true,
         toolDetails: (record.capabilities as Record<string, unknown>).toolDetails === true,
+        ...((record.capabilities as Record<string, unknown>).modelSelection === true ? { modelSelection: true } : {}),
       },
     } : {}),
   };

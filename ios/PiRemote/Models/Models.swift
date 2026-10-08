@@ -30,6 +30,76 @@ public struct ConnectionConfig: Codable, Equatable {
     public func save() {
         guard let data = try? JSONEncoder().encode(self) else { return }
         UserDefaults.standard.set(data, forKey: Self.storageKey)
+        var devices = Self.savedDevices().filter { $0.serverUrl != serverUrl }
+        devices.insert(self, at: 0)
+        Self.storeSavedDevices(devices)
+    }
+
+    private static let savedDevicesKey = "piRemote.savedDevices"
+
+    /// 连接过的设备，最近使用的在前。旧版本只存了单个配置，首次读取时把它补进来。
+    public static func savedDevices() -> [ConnectionConfig] {
+        if let data = UserDefaults.standard.data(forKey: savedDevicesKey),
+           let devices = try? JSONDecoder().decode([ConnectionConfig].self, from: data) {
+            return devices
+        }
+        let current = load()
+        return current == .default ? [] : [current]
+    }
+
+    public static func forgetDevice(serverUrl: String) {
+        storeSavedDevices(savedDevices().filter { $0.serverUrl != serverUrl })
+    }
+
+    private static func storeSavedDevices(_ devices: [ConnectionConfig]) {
+        guard let data = try? JSONEncoder().encode(devices) else { return }
+        UserDefaults.standard.set(data, forKey: savedDevicesKey)
+    }
+}
+
+public enum AppAppearance: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    public static let storageKey = "piRemote.appearance"
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .system: return "跟随系统"
+        case .light: return "浅色"
+        case .dark: return "深色"
+        }
+    }
+}
+
+/// 精确的模型标识：同名 modelId 可能属于不同供应商，所以用 provider + modelId 作为 ID。
+public struct RemoteModel: Identifiable, Hashable {
+    public let provider: String
+    public let modelId: String
+    public let name: String
+
+    public var id: String { "\(provider)/\(modelId)" }
+    public var selection: [String: Any] { ["provider": provider, "modelId": modelId] }
+
+    public init(provider: String, modelId: String, name: String) {
+        self.provider = provider
+        self.modelId = modelId
+        self.name = name
+    }
+
+    public init?(remote: Any?) {
+        guard let record = remote as? [String: Any],
+              let provider = record["provider"] as? String, !provider.isEmpty,
+              let modelId = record["modelId"] as? String, !modelId.isEmpty else { return nil }
+        let name = (record["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? modelId
+        self.init(provider: provider, modelId: modelId, name: name)
+    }
+
+    public static func list(_ remote: Any?) -> [RemoteModel] {
+        (remote as? [Any] ?? []).compactMap(RemoteModel.init(remote:))
     }
 }
 
@@ -182,6 +252,35 @@ public enum SessionFilter: String, CaseIterable, Identifiable {
     public func label(count: Int) -> String {
         guard self != .all, count > 0 else { return rawValue }
         return "\(rawValue) \(count)"
+    }
+}
+
+public struct SessionProjectGroup: Identifiable, Equatable {
+    public static let ungroupedName = "未归属项目"
+    public static let temporaryProjects: Set<String> = ["tmp", "private", "T"]
+
+    public var name: String
+    public var sessions: [SessionItem]
+
+    public var id: String { name }
+    public var isUngrouped: Bool { name == Self.ungroupedName }
+
+    /// 按项目分组：项目内按时间倒序，项目按最近会话倒序，/tmp 等临时目录和无项目的会话统一放到最后。
+    public static func group(_ sessions: [SessionItem], projectName: (SessionItem) -> String?) -> [SessionProjectGroup] {
+        var buckets: [String: [SessionItem]] = [:]
+        for session in sessions {
+            let raw = projectName(session)?.trimmingCharacters(in: .whitespaces) ?? ""
+            let name = raw.isEmpty || temporaryProjects.contains(raw) ? ungroupedName : raw
+            buckets[name, default: []].append(session)
+        }
+        let latest = { (items: [SessionItem]) in items.compactMap(\.startedAt).max() ?? .distantPast }
+        return buckets
+            .map { SessionProjectGroup(name: $0.key, sessions: $0.value.sorted { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }) }
+            .sorted { lhs, rhs in
+                if lhs.isUngrouped != rhs.isUngrouped { return rhs.isUngrouped }
+                let (l, r) = (latest(lhs.sessions), latest(rhs.sessions))
+                return l != r ? l > r : lhs.name < rhs.name
+            }
     }
 }
 
@@ -346,4 +445,34 @@ public struct ApprovalRequest: Identifiable, Equatable {
         self.command = command
         self.options = options
     }
+}
+
+public struct MacProject: Identifiable, Hashable {
+    public var name: String
+    public var path: String
+    public var id: String { path }
+
+    public init(name: String, path: String) {
+        self.name = name
+        self.path = path
+    }
+
+    public init?(remote: [String: Any]) {
+        guard let name = remote["name"] as? String, let path = remote["path"] as? String,
+              path.hasPrefix("/"), !path.contains("\0") else { return nil }
+        self.init(name: name, path: path)
+    }
+}
+
+public struct MacProjectList {
+    public var projects: [MacProject]
+    public var home: String
+    public var defaultDirectory: String
+}
+
+public struct MacDirectoryPage {
+    public var path: String
+    public var parent: String?
+    public var directories: [MacProject]
+    public var nextOffset: Int?
 }

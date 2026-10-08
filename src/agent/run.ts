@@ -6,6 +6,8 @@ import { TerminalSessionLauncher } from "../terminal/launcher.ts";
 import { AgentClient } from "./agent-client.ts";
 import { createPiAgentHandler } from "./pi-agent-handler.ts";
 import { defaultOmpHistoryRoots, OmpHistoryIndex } from "../history/history-index.ts";
+import { HistoryRecoveryCoordinator } from "../terminal/history-recovery.ts";
+import { createModelCatalog } from "../pi/model-catalog.ts";
 
 export interface AgentRuntimeOptions {
   client: AgentClient;
@@ -126,12 +128,17 @@ export async function main(): Promise<void> {
 
   let client: AgentClient | undefined;
   const history = new OmpHistoryIndex({ workspaceRoot: config.piWorkspaceRoot, roots: config.ompHistoryRoots ?? defaultOmpHistoryRoots() });
+  const recovery = config.piRuntime === "omp" ? new HistoryRecoveryCoordinator({ history, bridge: terminalBridge, launcher: terminalLauncher, workspaceRoot: config.piWorkspaceRoot }) : undefined;
+  if (recovery) terminalBridge.setControlGuard(meta => recovery.canControl(meta));
   const handler = createPiAgentHandler({
     manager,
     workspaceRoot: config.piWorkspaceRoot,
+    runtime: config.piRuntime,
+    modelCatalog: createModelCatalog({ piBin: config.piBin, runtime: config.piRuntime }),
     terminalBridge,
     terminalLauncher,
     history,
+    recovery,
     emitSessionEvent: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
     logger,
   });
@@ -151,6 +158,7 @@ export async function main(): Promise<void> {
     shuttingDown = true;
     logger(`received ${signal}, shutting down`);
     terminalLauncher.close();
+    recovery?.close();
     try {
       await runtime.stop();
     } catch (error) {

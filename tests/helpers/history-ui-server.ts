@@ -17,6 +17,7 @@ const bucket = join(archiveRoot, "synthetic-workspace");
 const bridgeDir = join(dir, "bridge");
 mkdirSync(workspace, { mode: 0o700 }); mkdirSync(bucket, { mode: 0o700, recursive: true });
 process.env.PI_REMOTE_BRIDGE_DIR = bridgeDir;
+process.argv.push("omp-darwin-ui-fixture");
 const markdown = "## 合成 Markdown 验收\n\n**粗体保持正常**\n\n7. 第一项\n   列表续行\n   - 嵌套子项\n8. 第二项\n\n````swift\nlet value = \"中文😀\"\n~~~\n```\n````\n\n| 第一列 | 第二列 |\n| --- | --- |\n| a\\|b | 中文 |\n\n最后一条合成消息";
 const entries = (count: number): PiSessionEntry[] => Array.from({ length: count }, (_, i) => ({
   type: "message", id: `entry-${i}`, parentId: i === 0 ? null : `entry-${i - 1}`,
@@ -38,7 +39,7 @@ let idle = true;
 let controlCalls = 0;
 const handlers = new Map<string, ((event: { type: string; message?: PiMessage }, ctx: typeof context) => unknown)[]>();
 const context = { hasUI: true, mode: "tui", cwd: workspace,
-  sessionManager: { getSessionId: () => "ui-live-fixture", getSessionFile: () => undefined, getSessionName: () => "合成实时会话", getBranch: () => liveEntries },
+  sessionManager: { getSessionId: () => "ui-live-fixture", getSessionFile: (): string | undefined => undefined, getSessionName: () => "合成实时会话", getBranch: () => liveEntries },
   ui: { notify: () => {} }, isIdle: () => idle, abort: () => { controlCalls++; } };
 bridgeExtension({ on: (event, handler) => { handlers.set(event, [...(handlers.get(event) ?? []), handler]); }, sendUserMessage: () => { controlCalls++; } });
 for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start" }, context);
@@ -48,22 +49,52 @@ await history.ready();
 for (let i = 0; i < 100 && !(await bridge.list()).length; i++) await delay(10);
 if (!(await bridge.list()).length) throw new Error("Synthetic terminal socket did not become ready");
 const manager = new PiProcessManager({ piBin: "synthetic-no-execution", spawnFn: () => { throw new Error("Synthetic fixture forbids process execution"); } });
+let resumeCalls = 0;
+let resumedContext: typeof context | undefined;
+const resumedHandlers = new Map<string, ((event: { type: string; message?: PiMessage }, ctx: typeof context) => unknown)[]>();
+const launcher = {
+  start: async () => { throw new Error("Synthetic fixture only restores its own archive"); },
+  resume: async (target: { file: string; id: string; cwd: string; verify: () => Promise<void> }) => {
+    await target.verify();
+    if (target.file !== archiveFile || target.id !== "ui-archive-fixture") throw new Error("Wrong synthetic history");
+    resumeCalls++;
+    if (!resumedContext) {
+      const nextContext: typeof context = { ...context, sessionManager: {
+        getSessionId: () => target.id, getSessionFile: () => archiveFile, getSessionName: () => "合成历史会话",
+        getBranch: () => archived.filter(entry => entry.id !== "sibling"),
+      } };
+      resumedContext = nextContext;
+      bridgeExtension({ on: (event, handler) => { resumedHandlers.set(event, [...(resumedHandlers.get(event) ?? []), handler]); }, sendUserMessage: () => { controlCalls++; } });
+      for (const handler of resumedHandlers.get("session_start") ?? []) await handler({ type: "session_start" }, nextContext);
+      await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
+    }
+    const session = (await bridge.list()).find(meta => meta.persistedSessionId === target.id);
+    if (!session) throw new Error("Synthetic restored bridge did not become ready");
+    return session;
+  },
+};
 const relayLog: string[] = [];
 const { server } = await startTestServer({ relayPort: 18789, piWorkspaceRoot: workspace },
   { logger: message => { relayLog.push(message); if (relayLog.length > 100) relayLog.shift(); } });
 const client = new AgentClient({ url: "ws://127.0.0.1:18789/ws/agent", token: TEST_TOKEN, deviceId: "synthetic-ui-agent",
-  handler: createPiAgentHandler({ manager, workspaceRoot: workspace, terminalBridge: bridge, history }) });
+  handler: createPiAgentHandler({ manager, workspaceRoot: workspace, terminalBridge: bridge, history, terminalLauncher: launcher, runtime: "omp" }) });
 await client.connect();
-const controller = createServer((request, response) => {
+const controller = createServer(async (request, response) => {
   if (request.url === "/append" && request.method === "POST") {
     const previous = liveEntries.at(-1)?.id ?? null;
     liveEntries.push({ type: "message", id: `append-${liveEntries.length}`, parentId: previous,
       message: { role: "assistant", content: [{ type: "text", text: `新到达合成消息 ${liveEntries.length}，不应抢走旧消息阅读位置。` }] } });
   } else if (request.url === "/reset" && request.method === "POST") {
     liveEntries = entries(90); idle = true; controlCalls = 0;
+    if (resumedContext) {
+      for (const handler of resumedHandlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, resumedContext);
+      resumedContext = undefined;
+      resumedHandlers.clear();
+    }
+    resumeCalls = 0;
   }
   response.setHeader("Content-Type", "application/json");
-  response.end(JSON.stringify({ ready: true, controlCalls, liveMessages: liveEntries.length, relayLog }));
+  response.end(JSON.stringify({ ready: true, controlCalls, resumeCalls, liveMessages: liveEntries.length, relayLog }));
 });
 await new Promise<void>((resolveListen, reject) => { controller.once("error", reject); controller.listen(18790, "127.0.0.1", resolveListen); });
 console.log("SYNTHETIC_HISTORY_UI_READY");
@@ -72,6 +103,7 @@ async function close(): Promise<void> {
   if (closing) return; closing = true;
   client.disconnect(); history.close(); bridge.close();
   for (const handler of handlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, context);
+  if (resumedContext) for (const handler of resumedHandlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, resumedContext);
   await manager.closeAll(); await server.stop();
   controller.close(); rmSync(dir, { recursive: true, force: true });
 }

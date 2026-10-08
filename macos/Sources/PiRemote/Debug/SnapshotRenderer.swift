@@ -120,6 +120,13 @@ enum SnapshotRenderer {
             model.serverSource = .deploy
         },
         Fixture(name: "23-settings-claude-running", size: CGSize(width: 380, height: 600), settings: true, configure: claude(.running, mode: .cloudflare)),
+        Fixture(name: "24-settings-pi-connected", size: CGSize(width: 380, height: 600), settings: true) { model in
+            model.token = demoToken
+            model.phase = .connected
+        },
+        Fixture(name: "25-settings-tunnel-dark", size: CGSize(width: 380, height: 600), dark: true, settings: true) { model in
+            model.mode = .cloudflare
+        },
     ]
 
     static func renderAll() {

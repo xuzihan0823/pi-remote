@@ -8,7 +8,6 @@ struct PairingCodeView: View {
     let placeholderSymbol: String
     let placeholderTone: StatusTone
     let placeholderText: String
-    var scanHint = "打开 iPhone 上的 Pi Remote，选择扫码连接"
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.displayScale) private var displayScale
 
@@ -17,24 +16,21 @@ struct PairingCodeView: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            VStack(spacing: 4) {
-                Text(image == nil ? "手机连接码" : "用手机扫码")
-                    .font(Theme.Font.section)
-                    .foregroundColor(Theme.textPrimary)
-                Text(image == nil ? placeholderText : scanHint)
-                    .font(Theme.Font.body)
-                    .foregroundColor(Theme.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
             if let image {
                 code(image)
             } else {
+                VStack(spacing: 4) {
+                    Text("手机连接码")
+                        .font(Theme.Font.section)
+                        .foregroundColor(Theme.textPrimary)
+                    Text(placeholderText)
+                        .font(Theme.Font.body)
+                        .foregroundColor(Theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 placeholder
             }
-            Text("连接码包含访问密钥，仅供自己的设备使用")
-                .font(Theme.Font.caption)
-                .foregroundColor(Theme.textTertiary)
         }
         .padding(24)
         .frame(maxWidth: 440)

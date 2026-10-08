@@ -14,39 +14,46 @@ struct ClaudeConfigPane: View {
     var body: some View {
         let editable = claude.state.canEdit
         VStack(spacing: 0) {
+            SettingsHeader(title: "Claude 服务设置", lockedHint: editable ? nil : "停止服务后可修改配置")
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        SectionTitle(text: "Claude 服务设置")
-                        if !editable {
-                            Text("停止服务后可修改配置")
-                                .font(Theme.Font.caption)
-                                .foregroundColor(Theme.textSecondary)
-                        }
-                    }
-                    InputField(label: "访问方式", help: modeHelp) {
+                    SettingsGroup(title: "访问方式") {
                         SegmentedChoice(
                             options: [(ClaudeServiceMode.local, "仅本机"), (ClaudeServiceMode.cloudflare, "临时隧道")],
                             selection: $draft.mode,
                             accessibilityName: "Claude 访问方式"
                         )
+                        Text(modeHelp)
+                            .font(Theme.Font.caption)
+                            .foregroundColor(Theme.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    InputField(label: "端口", help: "本机后端监听 127.0.0.1 上的这个端口。") {
-                        TextField("8788", value: $draft.port, format: .number.grouping(.never))
-                            .focused($focus, equals: .port)
-                            .fieldBox(focused: focus == .port)
+                    SettingsGroup(title: "本机") {
+                        InputField(label: "端口", help: "本机后端监听 127.0.0.1 上的这个端口。") {
+                            TextField("8788", value: $draft.port, format: .number.grouping(.never))
+                                .focused($focus, equals: .port)
+                                .fieldBox(focused: focus == .port)
+                        }
                     }
-                    advancedSection
+                    SettingsGroup {
+                        advancedSection
+                    }
                 }
-                .padding(24)
+                .padding(.horizontal, 24)
+                .padding(.top, 4)
+                .padding(.bottom, 24)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .disabled(!editable)
                 .animation(Motion.resolved(Motion.modeSwitch, reduceMotion: reduceMotion), value: draft.mode)
             }
             Divider().overlay(Theme.border)
-            primaryAction
-                .padding(.horizontal, 24)
-                .padding(.vertical, 16)
+            HStack {
+                Spacer(minLength: 0)
+                primaryAction
+                    .frame(width: 168)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 14)
         }
         .onAppear { draft = claude.configuration }
         .onChange(of: claude.configuration) { draft = $0 }
@@ -77,7 +84,7 @@ struct ClaudeConfigPane: View {
             .accessibilityLabel(showAdvanced ? "收起高级设置" : "展开高级设置")
 
             if showAdvanced {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 16) {
                     InputField(label: "Claude 可执行文件", help: "CLAUDE_BIN · 通常无需修改") {
                         TextField("/usr/local/bin/claude", text: $draft.executablePath)
                             .focused($focus, equals: .executable)

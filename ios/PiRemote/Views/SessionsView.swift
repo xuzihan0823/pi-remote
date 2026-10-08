@@ -5,38 +5,53 @@ public struct SessionsView: View {
     public var onNewSessionTapped: () -> Void = {}
     public var onSessionSelected: (SessionItem) -> Void = { _ in }
     public var onDisconnectTapped: () -> Void = {}
+    public var onDeviceSwitched: () -> Void = {}
 
     @State private var searchText = ""
     @State private var selectedFilter: SessionFilter = .all
-    @State private var selectedTab = 0
+    @State private var showSettings = false
+    @State private var collapsedProjects: Set<String> = []
+    @State private var seenSessionIds: Set<String> = []
+    @State private var freshSessionIds: Set<String> = []
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
         client: RelayClient,
         onNewSessionTapped: @escaping () -> Void = {},
         onSessionSelected: @escaping (SessionItem) -> Void = { _ in },
-        onDisconnectTapped: @escaping () -> Void = {}
+        onDisconnectTapped: @escaping () -> Void = {},
+        onDeviceSwitched: @escaping () -> Void = {}
     ) {
         self.client = client
         self.onNewSessionTapped = onNewSessionTapped
         self.onSessionSelected = onSessionSelected
         self.onDisconnectTapped = onDisconnectTapped
+        self.onDeviceSwitched = onDeviceSwitched
     }
 
     private var visibleSessions: [SessionItem] {
         client.sessions
             .filter(selectedFilter.matches)
-            .filter { searchText.isEmpty || $0.title.localizedCaseInsensitiveContains(searchText) }
+            .filter {
+                searchText.isEmpty
+                    || $0.title.localizedCaseInsensitiveContains(searchText)
+                    || (client.projectName(for: $0.id)?.localizedCaseInsensitiveContains(searchText) ?? false)
+            }
+    }
+
+    private var projectGroups: [SessionProjectGroup] {
+        SessionProjectGroup.group(visibleSessions) { client.projectName(for: $0.id) }
     }
 
     public var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack(alignment: .bottomLeading) {
             DesignTokens.Colors.background
                 .ignoresSafeArea()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
-                        Text(selectedTab == 0 ? "会话" : "设备")
+                        Text("会话")
                             .font(DesignTokens.Fonts.notoBold(32))
                             .foregroundColor(DesignTokens.Colors.textPrimary)
 
@@ -47,40 +62,58 @@ public struct SessionsView: View {
                                 .padding(.trailing, 8)
                         }
 
-                        if selectedTab == 0 {
-                            Button(action: onNewSessionTapped) {
-                                Image(systemName: "plus")
-                                    .font(.system(size: 16, weight: .semibold))
-                                    .foregroundColor(DesignTokens.Colors.textPrimary)
-                                    .frame(width: 44, height: 44)
-                                    .glassCircle()
-                            }
+                        Button(action: onNewSessionTapped) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundColor(DesignTokens.Colors.textPrimary)
+                                .frame(width: 44, height: 44)
+                                .glassCircle()
                         }
+                        .accessibilityLabel("新建会话")
                     }
                     .padding(.horizontal, 20)
                     .padding(.top, 12)
 
-                    if selectedTab == 0 {
-                        sessionsTab
-                    } else {
-                        deviceTab
-                    }
+                    sessionsTab
 
-                    Spacer().frame(height: 100)
+                    Spacer().frame(height: 80)
                 }
             }
             .refreshable {
                 client.refreshSessions()
             }
 
-            tabBar
+            settingsButton
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(
+                client: client,
+                onDeviceSwitched: onDeviceSwitched,
+                onDisconnectTapped: onDisconnectTapped
+            )
+        }
+    }
+
+    private var settingsButton: some View {
+        Button { showSettings = true } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 16, weight: .semibold))
+                Text("设置")
+                    .font(DesignTokens.Fonts.notoBold(14))
+            }
+            .foregroundColor(DesignTokens.Colors.textPrimary)
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .glassCapsule()
+        }
+        .buttonStyle(.plain)
+        .padding(.leading, 20)
+        .padding(.bottom, 8)
     }
 
     private var sessionsTab: some View {
         VStack(alignment: .leading, spacing: 16) {
-            deviceCard
-
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: 14))
@@ -95,15 +128,17 @@ public struct SessionsView: View {
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .padding(.horizontal, 20)
 
-            HStack(spacing: 8) {
+            HStack(spacing: 4) {
                 ForEach(SessionFilter.allCases) { filter in
                     let isSelected = selectedFilter == filter
                     let count = client.sessions.filter(filter.matches).count
                     Button(action: { selectedFilter = filter }) {
                         Text(filter.label(count: count))
                             .font(DesignTokens.Fonts.notoRegular(13))
+                            .lineLimit(1)
+                            .fixedSize()
                             .foregroundColor(isSelected ? Color.white : DesignTokens.Colors.textSecondary)
-                            .padding(.horizontal, 16)
+                            .padding(.horizontal, 12)
                             .padding(.vertical, 8)
                             .background(isSelected ? DesignTokens.Colors.darkButton : Color.clear)
                             .clipShape(Capsule())
@@ -130,140 +165,119 @@ public struct SessionsView: View {
             }
 
             if !visibleSessions.isEmpty {
-                Text(selectedFilter == .history ? "历史快照 · 只读" : "会话")
-                    .font(DesignTokens.Fonts.notoRegular(12))
-                    .foregroundColor(DesignTokens.Colors.textSecondary)
-                    .padding(.horizontal, 24)
-                    .padding(.top, 8)
+                if selectedFilter == .history {
+                    Text("历史快照 · 只读")
+                        .font(DesignTokens.Fonts.notoRegular(12))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                        .padding(.horizontal, 24)
+                        .padding(.top, 8)
+                }
 
-                VStack(spacing: 0) {
-                    ForEach(Array(visibleSessions.enumerated()), id: \.element.id) { index, session in
-                        SessionRowView(session: session, projectName: client.projectName(for: session.id)) {
-                            onSessionSelected(session)
-                        }
-                        if index < visibleSessions.count - 1 {
-                            Divider()
-                                .background(DesignTokens.Colors.divider)
-                                .padding(.horizontal, 24)
-                        }
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(projectGroups) { group in
+                        projectSection(group)
                     }
                 }
-                .background(DesignTokens.Colors.background)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .padding(.horizontal, 20)
+                .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.82), value: visibleSessions.map(\.id))
             } else {
                 emptyState
             }
-            if client.sessionsCursor != nil {
-                Button("加载更多历史会话") { client.loadMoreSessions() }
-                    .frame(maxWidth: .infinity, minHeight: 44)
-                    .tint(DesignTokens.Colors.accentGreen)
-            }
+        }
+        .onAppear { seenSessionIds = Set(client.sessions.map(\.id)) }
+        .onChange(of: client.sessions.map(\.id)) { _, ids in
+            markFreshSessions(ids)
         }
     }
 
-    private var deviceCard: some View {
-        Button(action: { selectedTab = 1 }) {
-            HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(DesignTokens.Colors.glassMedium)
-                        .frame(width: 42, height: 42)
-                    Image(systemName: "laptopcomputer")
-                        .font(.system(size: 18))
-                        .foregroundColor(DesignTokens.Colors.textPrimary)
-                }
+    /// 只高亮比已见会话更新的条目，分页补齐的旧历史和首次加载不触发动画。
+    private func markFreshSessions(_ ids: [String]) {
+        let current = Set(ids)
+        guard !seenSessionIds.isEmpty else {
+            seenSessionIds = current
+            return
+        }
+        let newestSeen = client.sessions
+            .filter { seenSessionIds.contains($0.id) }
+            .compactMap(\.startedAt)
+            .max() ?? .distantPast
+        let added = client.sessions
+            .filter { !seenSessionIds.contains($0.id) && ($0.startedAt ?? .distantPast) >= newestSeen }
+            .map(\.id)
+        seenSessionIds.formUnion(current)
+        guard !added.isEmpty else { return }
+        freshSessionIds.formUnion(added)
+        Task {
+            try? await Task.sleep(for: .seconds(1.6))
+            withAnimation(.easeOut(duration: 0.6)) { freshSessionIds.subtract(added) }
+        }
+    }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(client.agentName ?? "我的 MacBook Pro")
-                        .font(DesignTokens.Fonts.notoBold(15))
-                        .foregroundColor(DesignTokens.Colors.textPrimary)
-                    Text(deviceSubtitle)
-                        .font(DesignTokens.Fonts.notoRegular(12))
+    private func projectSection(_ group: SessionProjectGroup) -> some View {
+        let isCollapsed = searchText.isEmpty && collapsedProjects.contains(group.id)
+
+        return VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(reduceMotion ? nil : .snappy) {
+                    if collapsedProjects.contains(group.id) {
+                        collapsedProjects.remove(group.id)
+                    } else {
+                        collapsedProjects.insert(group.id)
+                    }
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: group.isUngrouped ? "tray" : (isCollapsed ? "folder" : "folder.fill"))
+                        .font(.system(size: 15))
                         .foregroundColor(DesignTokens.Colors.textSecondary)
-                }
-
-                Spacer()
-
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(DesignTokens.Colors.textSecondary)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .glassCard(cornerRadius: 18)
-        .padding(.horizontal, 20)
-    }
-
-    private var deviceSubtitle: String {
-        if !client.isConnected {
-            return client.connectionError ?? "尚未连接 Relay"
-        }
-        if !client.agentConnected {
-            return "Relay 已连接 · 等待 Mac 上的 pi"
-        }
-        let running = client.sessions.filter { $0.isActive }.count
-        return running > 0 ? "已连接 · \(running) 个任务运行中" : "已连接 · 暂无运行中的任务"
-    }
-
-    private var deviceTab: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            deviceCard
-
-            VStack(alignment: .leading, spacing: 12) {
-                infoRow(label: "服务器", value: client.config.serverUrl)
-                infoRow(label: "本机设备名", value: client.config.deviceName)
-                infoRow(label: "Relay", value: client.isConnected ? "已连接" : "未连接")
-                infoRow(label: "Mac 上的 pi", value: client.agentName ?? (client.agentConnected ? "已连接" : "未连接"))
-                infoRow(label: "会话数", value: "\(client.sessions.count)")
-            }
-            .padding(16)
-            .cardSurface()
-            .padding(.horizontal, 20)
-
-            VStack(spacing: 10) {
-                Button {
-                    client.refreshSessions()
-                } label: {
-                    Text("刷新会话")
+                        .frame(width: 20)
+                    Text(group.name)
                         .font(DesignTokens.Fonts.notoBold(15))
                         .foregroundColor(DesignTokens.Colors.textPrimary)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 48)
+                        .lineLimit(1)
+                    Text("\(group.sessions.count)")
+                        .font(DesignTokens.Fonts.sfProRegular(12))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                    Spacer()
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                        .rotationEffect(.degrees(isCollapsed ? -90 : 0))
                 }
-                .glassCard(cornerRadius: 16)
-                .disabled(!client.isConnected)
-
-                Button {
-                    onDisconnectTapped()
-                } label: {
-                    Text("断开连接")
-                        .font(DesignTokens.Fonts.notoBold(15))
-                        .foregroundColor(DesignTokens.Colors.textOnGreen)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 52)
-                        .background(DesignTokens.Colors.darkButton)
-                        .clipShape(Capsule())
-                }
+                .padding(.horizontal, 4)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 20)
-        }
-    }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(group.name)，\(group.sessions.count) 个会话")
+            .accessibilityValue(isCollapsed ? "已折叠" : "已展开")
+            .accessibilityHint("轻点以\(isCollapsed ? "展开" : "折叠")")
 
-    private func infoRow(label: String, value: String) -> some View {
-        HStack(alignment: .top) {
-            Text(label)
-                .font(DesignTokens.Fonts.notoRegular(13))
-                .foregroundColor(DesignTokens.Colors.textSecondary)
-            Spacer(minLength: 16)
-            Text(value)
-                .font(DesignTokens.Fonts.sfProRegular(13))
-                .foregroundColor(DesignTokens.Colors.textPrimary)
-                .multilineTextAlignment(.trailing)
+            if !isCollapsed {
+                VStack(spacing: 0) {
+                    ForEach(Array(group.sessions.enumerated()), id: \.element.id) { index, session in
+                        SessionRowView(session: session) {
+                            onSessionSelected(session)
+                        }
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(DesignTokens.Colors.accentGreen.opacity(freshSessionIds.contains(session.id) ? 0.14 : 0))
+                        )
+                        .transition(reduceMotion ? .opacity : .asymmetric(
+                            insertion: .move(edge: .top).combined(with: .opacity).combined(with: .scale(scale: 0.96, anchor: .top)),
+                            removal: .opacity
+                        ))
+                        if index < group.sessions.count - 1 {
+                            Divider()
+                                .background(DesignTokens.Colors.divider)
+                                .padding(.leading, 34)
+                        }
+                    }
+                }
+                .transition(.opacity)
+            }
         }
+        .padding(.bottom, 8)
     }
 
     private func noticeRow(text: String, color: Color) -> some View {
@@ -290,85 +304,45 @@ public struct SessionsView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 40)
     }
-
-    private var tabBar: some View {
-        HStack(spacing: 40) {
-            Button(action: { selectedTab = 0 }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "bubble.left.and.bubble.right.fill")
-                        .font(.system(size: 15))
-                    Text("会话")
-                        .font(DesignTokens.Fonts.notoBold(14))
-                }
-                .foregroundColor(selectedTab == 0 ? DesignTokens.Colors.accentGreen : DesignTokens.Colors.textSecondary)
-            }
-
-            Button(action: { selectedTab = 1 }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "laptopcomputer")
-                        .font(.system(size: 15))
-                    Text("设备")
-                        .font(DesignTokens.Fonts.notoBold(14))
-                }
-                .foregroundColor(selectedTab == 1 ? DesignTokens.Colors.accentGreen : DesignTokens.Colors.textSecondary)
-            }
-        }
-        .padding(.horizontal, 36)
-        .padding(.vertical, 16)
-        .glassCapsule(isSelected: true)
-        .padding(.bottom, 4)
-    }
 }
 
 private struct SessionRowView: View {
     let session: SessionItem
-    let projectName: String?
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text(session.title)
-                        .font(DesignTokens.Fonts.notoRegular(16))
-                        .foregroundColor(DesignTokens.Colors.textPrimary)
-                        .lineLimit(1)
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DesignTokens.Colors.textSecondary)
-                }
-
-                Text(session.subtitle)
-                    .font(DesignTokens.Fonts.notoRegular(13))
-                    .foregroundColor(DesignTokens.Colors.textSecondary)
-                    .lineLimit(1)
-
-                HStack {
-                    if let projectName {
-                        HStack(spacing: 4) {
-                            Circle()
-                                .fill(dotColor)
-                                .frame(width: 7, height: 7)
-                            Text(projectName)
-                                .font(DesignTokens.Fonts.sfProRegular(11))
-                                .foregroundColor(DesignTokens.Colors.textSecondary)
-                        }
+            HStack(spacing: 10) {
+                Group {
+                    if session.status == .running {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(DesignTokens.Colors.accentGreen)
+                    } else {
+                        Circle()
+                            .fill(dotColor)
+                            .frame(width: 7, height: 7)
                     }
-
-                    Spacer()
-
-                    Text(session.timeAgo)
-                        .font(DesignTokens.Fonts.notoRegular(11))
-                        .foregroundColor(DesignTokens.Colors.textSecondary)
                 }
+                .frame(width: 20, height: 20)
+
+                Text(session.title)
+                    .font(DesignTokens.Fonts.notoRegular(15))
+                    .foregroundColor(DesignTokens.Colors.textPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Text(session.timeAgo)
+                    .font(DesignTokens.Fonts.notoRegular(11))
+                    .foregroundColor(DesignTokens.Colors.textSecondary)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 14)
-            .background(DesignTokens.Colors.background)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 12)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue(session.subtitle)
     }
 
     private var dotColor: Color {

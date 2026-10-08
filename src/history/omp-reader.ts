@@ -27,9 +27,10 @@ SOFTWARE.
 import { createHash } from "node:crypto";
 import { constants, type Stats } from "node:fs";
 import { lstat, open, realpath, stat, type FileHandle } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, resolve, sep } from "node:path";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { projectTranscript, safeText, type PiSessionEntry } from "../terminal/extension.ts";
+import { sessionRoots, within } from "../session-scope.ts";
 
 export const HISTORY_LIMITS = { fileBytes: 128 * 1024 * 1024, recordBytes: 8 * 1024 * 1024, entries: 200_000, headerBytes: 64 * 1024 };
 export class HistoryReadError extends Error {
@@ -47,10 +48,6 @@ export interface HistoryTree {
 }
 interface ChainEntry { path: string; stat: Stats; handle: FileHandle }
 
-export function within(root: string, candidate: string): boolean {
-  const rel = relative(root, candidate);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
-}
 function identity(a: Stats, b: Stats, content = false): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.mode === b.mode && a.uid === b.uid &&
     (!content || (a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs));
@@ -62,15 +59,15 @@ export class OmpReadSnapshot {
   readonly stat: Stats;
   readonly #chain: ChainEntry[];
   readonly #workspace: string;
-  readonly #workspaceReal: string;
+  readonly #roots: readonly string[];
   readonly #file: string;
   readonly #signal?: AbortSignal;
   #authorized: { path: string; canonical: string; identity: Stats }[] = [];
   #closed = false;
 
-  private constructor(handle: FileHandle, stat: Stats, chain: ChainEntry[], workspace: string, workspaceReal: string, file: string, signal?: AbortSignal) {
+  private constructor(handle: FileHandle, stat: Stats, chain: ChainEntry[], workspace: string, roots: readonly string[], file: string, signal?: AbortSignal) {
     this.handle = handle; this.stat = stat; this.#chain = chain;
-    this.#workspace = workspace; this.#workspaceReal = workspaceReal; this.#file = file;
+    this.#workspace = workspace; this.#roots = roots; this.#file = file;
     this.#signal = signal;
   }
 
@@ -79,7 +76,7 @@ export class OmpReadSnapshot {
     const absoluteRoot = resolve(root);
     const absoluteFile = resolve(file);
     if (!within(absoluteRoot, absoluteFile)) throw new HistoryReadError("outside_root", "历史路径越界");
-    const workspaceReal = await realpath(workspace);
+    const roots = await sessionRoots(workspace);
     const chain: ChainEntry[] = [];
     let handle: FileHandle | undefined;
     try {
@@ -101,7 +98,7 @@ export class OmpReadSnapshot {
       if (stat.size > HISTORY_LIMITS.fileBytes) throw new HistoryReadError("file_limit", "历史文件超过 128 MiB 读取上限");
       handle = await open(absoluteFile, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       if (!identity(stat, await handle.stat(), true)) throw new HistoryReadError("changed", "历史文件已变化，请重试");
-      return new OmpReadSnapshot(handle, stat, chain, workspace, workspaceReal, absoluteFile, signal);
+      return new OmpReadSnapshot(handle, stat, chain, workspace, roots, absoluteFile, signal);
     } catch (error) {
       await handle?.close();
       await Promise.all(chain.map(item => item.handle.close()));
@@ -121,9 +118,12 @@ export class OmpReadSnapshot {
     if (!identity(this.stat, await lstat(this.#file), true) || !identity(this.stat, await this.handle.stat(), true)) {
       throw new HistoryReadError("changed", "历史文件已变化，请刷新");
     }
-    if (await realpath(this.#workspace) !== this.#workspaceReal) throw new HistoryReadError("changed", "授权工作区已变化");
+    const roots = await sessionRoots(this.#workspace);
+    if (roots.length !== this.#roots.length || roots.some((root, index) => root !== this.#roots[index])) {
+      throw new HistoryReadError("changed", "授权会话目录已变化");
+    }
     for (const entry of this.#authorized) {
-      if (await realpath(entry.path) !== entry.canonical || !within(this.#workspaceReal, entry.canonical) ||
+      if (await realpath(entry.path) !== entry.canonical || !this.#roots.some(root => within(root, entry.canonical)) ||
         !identity(entry.identity, await stat(entry.canonical))) throw new HistoryReadError("workspace", "历史工作区授权已失效");
     }
   }
@@ -146,8 +146,16 @@ export class OmpReadSnapshot {
     if (value.additionalDirectories !== undefined && (!Array.isArray(value.additionalDirectories) ||
       !value.additionalDirectories.every(item => typeof item === "string" && isAbsolute(item)))) throw new HistoryReadError("workspace", "无效的附加工作区");
     const directories = [value.cwd, ...(value.additionalDirectories as string[] | undefined ?? [])];
-    const canonical = await Promise.all(directories.map(path => realpath(path)));
-    if (!canonical.every(path => within(this.#workspaceReal, path))) throw new HistoryReadError("workspace", "历史会话不在允许的工作区内");
+    const canonical = await Promise.all(directories.map(async path => {
+      try {
+        const canonical = await realpath(path);
+        if (!(await stat(canonical)).isDirectory()) throw new Error("not a directory");
+        return canonical;
+      } catch {
+        throw new HistoryReadError("workspace", "历史项目目录不存在或无法访问");
+      }
+    }));
+    if (!canonical.every(path => this.#roots.some(root => within(root, path)))) throw new HistoryReadError("workspace", "历史项目目录不在本机文件系统内");
     // Keep both spelling and identity: deleted/symlink-swapped workspaces fail closed.
     this.#authorized = await Promise.all(directories.map(async (path, index) => ({
       path, canonical: canonical[index]!, identity: await stat(canonical[index]!),

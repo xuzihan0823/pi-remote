@@ -31,7 +31,7 @@ public struct ConnectView: View {
                 .ignoresSafeArea()
 
             RadialGradient(
-                colors: [Color.white.opacity(0.8), DesignTokens.Colors.background.opacity(0.1)],
+                colors: [DesignTokens.Colors.surface.opacity(0.8), DesignTokens.Colors.background.opacity(0.1)],
                 center: .top,
                 startRadius: 40,
                 endRadius: 360
@@ -66,7 +66,7 @@ public struct ConnectView: View {
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
                         .fill(
                             LinearGradient(
-                                colors: [Color.white.opacity(0.85), DesignTokens.Colors.glassCard.opacity(0.65)],
+                                colors: [DesignTokens.Colors.surface.opacity(0.85), DesignTokens.Colors.glassCard.opacity(0.65)],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             )
@@ -74,7 +74,7 @@ public struct ConnectView: View {
                         .frame(width: 233, height: 165)
                         .overlay(
                             RoundedRectangle(cornerRadius: 24, style: .continuous)
-                                .stroke(Color.white.opacity(0.9), lineWidth: 1)
+                                .stroke(DesignTokens.Colors.surface.opacity(0.9), lineWidth: 1)
                         )
                         .shadow(color: Color.black.opacity(0.04), radius: 12, x: 0, y: 4)
 
@@ -87,13 +87,13 @@ public struct ConnectView: View {
                         }
 
                         RoundedRectangle(cornerRadius: 2)
-                            .fill(Color(hex: 0xAFC4B5))
+                            .fill(Color(light: 0xAFC4B5, dark: 0x4A5E51))
                             .frame(width: 108, height: 5)
                         RoundedRectangle(cornerRadius: 2)
-                            .fill(Color(hex: 0xC3D1C4))
+                            .fill(Color(light: 0xC3D1C4, dark: 0x3E4D43))
                             .frame(width: 87, height: 5)
                         RoundedRectangle(cornerRadius: 2)
-                            .fill(Color(hex: 0xD5DFD2))
+                            .fill(Color(light: 0xD5DFD2, dark: 0x343F38))
                             .frame(width: 116, height: 5)
                     }
                     .padding(24)

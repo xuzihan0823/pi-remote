@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AgentClient } from "../src/agent/agent-client.ts";
 import { createPiAgentHandler } from "../src/agent/pi-agent-handler.ts";
 import { PiProcessManager } from "../src/pi/process-manager.ts";
@@ -15,7 +18,10 @@ import {
   startTestServer,
 } from "./helpers/relay-harness.ts";
 
-const WORKSPACE = "/tmp/pi-agent-workspace";
+const WORKSPACE = realpathSync(mkdtempSync(join(tmpdir(), "pi-agent-workspace-")));
+for (const directory of ["sub/dir", "inside", "proj"]) mkdirSync(join(WORKSPACE, directory), { recursive: true });
+writeFileSync(join(WORKSPACE, "file"), "not a directory");
+after(() => rmSync(WORKSPACE, { recursive: true, force: true }));
 
 interface Harness {
   fake: FakeChild;
@@ -59,7 +65,7 @@ test("session.list reports the current process state", async () => {
   const { manager, handler } = createHarness();
   try {
     assert.deepEqual(await handler(requestFrame("r1", "session.list")), {
-      ok: true, data: { sessions: [], capabilities: { timelineV2: true, ompArchiveRead: false, historyPagination: true, toolDetails: true } },
+      ok: true, data: { sessions: [], capabilities: { timelineV2: true, ompArchiveRead: false, historyPagination: true, toolDetails: true, historyResume: false, historyRecoveryOperations: false, projectSelection: true, modelSelection: true, modelCatalog: false } },
     });
 
     await handler(requestFrame("r2", "session.start", { params: { sessionId: "s1" } }));
@@ -107,10 +113,10 @@ test("session.start generates a random UUID when sessionId is missing", async ()
   }
 });
 
-test("session.start rejects cwd escapes without spawning a process", async () => {
+test("session.start rejects invalid or nonexistent project directories without spawning", async () => {
   const { fake, manager, handler } = createHarness();
   try {
-    const escapes = ["..", "../outside", "sub/../../..", "/etc", `${WORKSPACE}/../other`];
+    const escapes = ["missing", `${WORKSPACE}/file`, "", "a\0b", 42];
     for (const [index, cwd] of escapes.entries()) {
       const result = await handler(requestFrame(`r${index}`, "session.start", { params: { cwd } }));
       assert.equal(result.ok, false, `expected ${cwd} to be rejected`);
@@ -120,6 +126,33 @@ test("session.start rejects cwd escapes without spawning a process", async () =>
   } finally {
     await manager.closeAll();
   }
+});
+
+test("session.start accepts an existing project outside the default directory", async () => {
+  const outside = realpathSync(mkdtempSync(join(tmpdir(), "pi-other-project-")));
+  const { fake, manager, handler } = createHarness();
+  try {
+    const result = await handler(requestFrame("r1", "session.start", { params: { cwd: outside } }));
+    assert.equal(result.ok, true);
+    assert.equal(fake.spawnedOptions[0]?.cwd, outside);
+  } finally {
+    await manager.closeAll();
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("project browsing uses the existing relay protocol and never starts a session", async () => {
+  const { fake, manager, handler } = createHarness();
+  try {
+    const result = await handler(requestFrame("p1", "session.list", { params: { projectView: "directory", path: WORKSPACE } }));
+    assert.equal(result.ok, true);
+    const directories = (result.data as { directories: { path: string }[] }).directories;
+    assert.deepEqual(directories.map(project => project.path).sort(), ["inside", "proj", "sub"].map(name => join(WORKSPACE, name)));
+    const recent = await handler(requestFrame("p2", "session.list", { params: { projectView: "recent" } }));
+    assert.equal(recent.ok, true);
+    assert.equal((recent.data as { defaultDirectory: string }).defaultDirectory, WORKSPACE);
+    assert.equal(fake.spawnedArgs.length, 0);
+  } finally { await manager.closeAll(); }
 });
 
 test("session.start maps a duplicate running session to session_busy", async () => {

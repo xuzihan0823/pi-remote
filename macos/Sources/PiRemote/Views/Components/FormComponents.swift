@@ -31,6 +31,50 @@ struct SectionTitle: View {
     }
 }
 
+/// Titled card that groups related settings; the title sits outside the card like macOS Settings.
+struct SettingsGroup<Content: View>: View {
+    var title: String? = nil
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let title {
+                Text(title)
+                    .font(Theme.Font.caption.weight(.medium))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.leading, 4)
+                    .accessibilityAddTraits(.isHeader)
+            }
+            VStack(alignment: .leading, spacing: 16) { content }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: Theme.Radius.segment, style: .continuous).fill(Theme.canvas))
+                .overlay(RoundedRectangle(cornerRadius: Theme.Radius.segment, style: .continuous).stroke(Theme.border, lineWidth: 1))
+        }
+    }
+}
+
+/// Fixed header for a settings pane: title plus an optional lock hint.
+struct SettingsHeader: View {
+    let title: String
+    var lockedHint: String? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SectionTitle(text: title)
+            if let lockedHint {
+                Label(lockedHint, systemImage: "lock.fill")
+                    .font(Theme.Font.caption)
+                    .foregroundColor(Theme.textSecondary)
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 20)
+        .padding(.bottom, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 /// Label + control + help/error text. The control keeps its own focus binding for the ring.
 struct InputField<Content: View>: View {
     let label: String
@@ -115,7 +159,7 @@ struct SegmentedChoice<Value: Hashable>: View {
             ForEach(options, id: \.value) { option in
                 let selected = option.value == selection
                 Button {
-                    guard selection != option.value else { return }
+                    guard isEnabled, selection != option.value else { return }
                     withAnimation(Motion.resolved(Motion.modeSwitch, reduceMotion: reduceMotion)) {
                         selection = option.value
                     }
@@ -137,6 +181,7 @@ struct SegmentedChoice<Value: Hashable>: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel(option.title)
                 .accessibilityAddTraits(selected ? [.isSelected, .isButton] : .isButton)
+                .accessibilityHint(isEnabled ? "" : "当前不可修改")
             }
         }
         .padding(3)
@@ -144,7 +189,11 @@ struct SegmentedChoice<Value: Hashable>: View {
             RoundedRectangle(cornerRadius: Theme.Radius.segment, style: .continuous)
                 .fill(Theme.surfaceHover)
         )
-        .opacity(isEnabled ? 1 : 0.6)
+        // System dimming of disabled plain buttons makes the selection unreadable; keep the
+        // buttons drawn as enabled, block input above, and signal the lock with a light fade.
+        .environment(\.isEnabled, true)
+        .allowsHitTesting(isEnabled)
+        .opacity(isEnabled ? 1 : 0.75)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(accessibilityName)
     }

@@ -137,24 +137,19 @@ struct SettingsSheet: View {
     let dismiss: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            Group {
-                if model.activeService == .pi {
-                    ConfigPane(model: model)
-                } else {
-                    ClaudeConfigPane(claude: model.claudeService)
-                }
+        Group {
+            if model.activeService == .pi {
+                ConfigPane(model: model)
+            } else {
+                ClaudeConfigPane(claude: model.claudeService)
             }
-            .frame(maxHeight: .infinity)
-            Divider().overlay(Theme.border)
-            HStack {
-                Spacer()
-                Button("完成", action: dismiss)
-                    .buttonStyle(SecondaryButtonStyle())
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 12)
+        }
+        .overlay(alignment: .topTrailing) {
+            Button("完成", action: dismiss)
+                .buttonStyle(SecondaryButtonStyle())
+                .keyboardShortcut(.cancelAction)
+                .padding(.top, 18)
+                .padding(.trailing, 20)
         }
         .frame(width: 380, height: 600)
         .background(Theme.sidebar)

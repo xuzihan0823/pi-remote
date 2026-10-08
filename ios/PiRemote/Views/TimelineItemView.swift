@@ -7,14 +7,15 @@ struct TimelineItemView: View {
 
     var body: some View {
         if item.kind == "message" {
-            VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: item.role == "user" ? .trailing : .leading, spacing: 8) {
                 if item.role == "user" {
-                    Text(verbatim: item.text ?? "").font(.body).textSelection(.enabled)
+                    UserMessageBubble(text: item.text ?? "")
                 } else {
                     MarkdownMessageView(text: item.text ?? "", messageID: item.id)
                 }
                 if item.truncated { detailsDisclosure(label: "正文已截断，展开已记录内容") }
             }
+            .frame(maxWidth: .infinity, alignment: item.role == "user" ? .trailing : .leading)
         } else if item.kind == "toolCall" || item.kind == "toolResult" {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
@@ -116,5 +117,23 @@ struct TimelineItemView: View {
             if client.loadingDetails.contains(key) { ProgressView().accessibilityLabel("正在读取\(label)") }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// 用户消息：右对齐的圆角气泡，回复则保持左侧通栏正文，靠位置区分说话方
+struct UserMessageBubble: View {
+    let text: String
+
+    var body: some View {
+        Text(verbatim: text)
+            .font(DesignTokens.Fonts.notoRegular(15))
+            .foregroundColor(DesignTokens.Colors.textPrimary)
+            .textSelection(.enabled)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(DesignTokens.Colors.glassCard)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .padding(.leading, 48)
+            .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }

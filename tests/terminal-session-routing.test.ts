@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -67,7 +67,7 @@ test("session.list merges managed and terminal sessions with source, title, cwd 
     assert.equal(managed?.source, "managed");
     assert.equal(managed?.state, "running");
     assert.equal(managed?.activity, "idle");
-    assert.equal(managed?.cwd, workspace);
+    assert.equal(managed?.cwd, realpathSync(workspace));
 
     const terminal = sessions.find((entry) => entry.sessionId === "terminal:t1");
     assert.equal(terminal?.source, "terminal");
@@ -188,6 +188,44 @@ test("session.prompt, session.abort and ui.response route terminal ids to the or
     await manager.closeAll();
     await instance.stop();
   }
+});
+
+test("temporary terminal sessions are visible and controllable without spawning or taking over a process", async () => {
+  const { root, workspace, bridgeDir } = tempWorkspace();
+  const { fake, manager, handler, bridge } = createHarness(bridgeDir, workspace);
+  try {
+    for (const cwd of ["/tmp", realpathSync("/tmp"), tmpdir(), root]) {
+      const instance = await FakeTerminalInstance.start({
+        dir: bridgeDir, sessionId: "terminal:temp", cwd,
+        messages: [{ role: "assistant", text: "temporary output" }],
+      });
+      try {
+        const listed = await handler(requestFrame("list", "session.list", { params: { viewVersion: 2, includeArchived: true } }));
+        assert.equal(listed.ok, true);
+        const sessions = sessionsOf(listed);
+        assert.equal(sessions.length, 1);
+        assert.equal(sessions[0]?.sessionId, "terminal:temp");
+        assert.equal(sessions[0]?.availability, "live");
+        assert.equal(sessions[0]?.canControl, true);
+        const snapshot = await handler(requestFrame("get", "session.get", { sessionId: "terminal:temp", params: { viewVersion: 2 } }));
+        assert.equal(snapshot.ok, true);
+        assert.deepEqual((snapshot.data as Record<string, unknown>).messages, [{ role: "assistant", text: "temporary output" }]);
+        const prompt = await handler(requestFrame("prompt", "session.prompt", { sessionId: "terminal:temp", params: { message: "hello temp" } }));
+        assert.equal(prompt.ok, true);
+        const abort = await handler(requestFrame("abort", "session.abort", { sessionId: "terminal:temp" }));
+        assert.equal(abort.ok, true);
+        assert.deepEqual(instance.calls.filter(call => call.op !== "list"), [
+          { op: "snapshot", sessionId: "terminal:temp" },
+          { op: "prompt", sessionId: "terminal:temp", message: "hello temp" },
+          { op: "abort", sessionId: "terminal:temp" },
+        ]);
+        assert.equal(fake.spawnedArgs.length, 0);
+        assert.equal(fake.killedWith.length, 0);
+        assert.deepEqual(manager.list(), []);
+        assert.equal(instance.listening, true);
+      } finally { await instance.stop(); }
+    }
+  } finally { bridge.close(); await manager.closeAll(); rmSync(root, { recursive: true, force: true }); }
 });
 
 test("a busy terminal prompt surfaces session_busy without touching the process list", async () => {

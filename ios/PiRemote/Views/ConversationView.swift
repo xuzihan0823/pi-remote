@@ -3,7 +3,7 @@ import SwiftUI
 public struct ConversationView: View {
     @Bindable var client: RelayClient
     public var session: SessionItem?
-    public var onBackTapped: () -> Void = {}
+    public var onSidebarTapped: () -> Void = {}
 
     @State private var inputText = ""
     @State private var showMenu = false
@@ -24,11 +24,11 @@ public struct ConversationView: View {
     public init(
         client: RelayClient,
         session: SessionItem? = nil,
-        onBackTapped: @escaping () -> Void = {}
+        onSidebarTapped: @escaping () -> Void = {}
     ) {
         self.client = client
         self.session = session
-        self.onBackTapped = onBackTapped
+        self.onSidebarTapped = onSidebarTapped
     }
 
     public var body: some View {
@@ -166,9 +166,7 @@ public struct ConversationView: View {
                 }
 
                 if client.isActiveArchive {
-                    Text("历史快照 · 只读；不会恢复或运行工具")
-                        .font(.caption).foregroundColor(DesignTokens.Colors.textSecondary)
-                        .padding(12)
+                    historyResumeBar
                 } else {
                     inputBar
                 }
@@ -179,8 +177,17 @@ public struct ConversationView: View {
                 .presentationDetents([.height(460)])
                 .presentationDragIndicator(.hidden)
         }
-        .onAppear { subscribeIfNeeded() }
-        .onDisappear { client.stopTerminalPolling() }
+        .onAppear {
+            subscribeIfNeeded()
+            if let draft = client.pendingDraft {
+                inputText = draft
+                client.pendingDraft = nil
+            }
+        }
+        .onDisappear {
+            client.cancelSessionCreation()
+            client.stopTerminalPolling()
+        }
         .onChange(of: client.isConnected) { _, _ in subscribeIfNeeded() }
         .onChange(of: client.activeSessionId) { _, _ in
             didOpenLatest = false
@@ -289,13 +296,15 @@ public struct ConversationView: View {
 
     private var navigationBar: some View {
         HStack(spacing: 12) {
-            Button(action: onBackTapped) {
-                Image(systemName: "chevron.left")
+            Button(action: onSidebarTapped) {
+                Image(systemName: "sidebar.left")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .frame(width: 44, height: 44)
                     .glassCircle()
             }
+            .accessibilityLabel("会话列表")
+            .accessibilityIdentifier("open-sidebar")
 
             Spacer(minLength: 0)
 
@@ -312,7 +321,7 @@ public struct ConversationView: View {
             Spacer(minLength: 0)
 
             Button(action: { showMenu = true }) {
-                Image(systemName: "line.3.horizontal")
+                Image(systemName: "ellipsis")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .frame(width: 44, height: 44)
@@ -353,38 +362,23 @@ public struct ConversationView: View {
     }
 
     private func userMessage(_ message: String) -> some View {
-        Text(message)
-            .font(DesignTokens.Fonts.notoRegular(14))
-            .foregroundColor(DesignTokens.Colors.textPrimary)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        UserMessageBubble(text: message)
             .padding(.top, 6)
     }
 
     private func terminalAssistantMessage(_ text: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("pi")
-                .font(DesignTokens.Fonts.sfProBold(18))
-                .foregroundColor(DesignTokens.Colors.textPrimary)
-
-            MarkdownMessageView(text: text)
-                .font(DesignTokens.Fonts.notoRegular(14))
-                .foregroundColor(DesignTokens.Colors.textPrimary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-        }
+        MarkdownMessageView(text: text)
+            .font(DesignTokens.Fonts.notoRegular(14))
+            .foregroundColor(DesignTokens.Colors.textPrimary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
     }
 
     private var agentBlock: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Text("pi")
-                    .font(DesignTokens.Fonts.sfProBold(18))
-                    .foregroundColor(DesignTokens.Colors.textPrimary)
-
-                Text(statusLine)
-                    .font(DesignTokens.Fonts.notoRegular(11))
-                    .foregroundColor(DesignTokens.Colors.textSecondary)
-            }
+            Text(statusLine)
+                .font(DesignTokens.Fonts.notoRegular(11))
+                .foregroundColor(DesignTokens.Colors.textSecondary)
 
             if !client.streamingText.isEmpty {
                 MarkdownMessageView(text: client.streamingText, baseFontSize: client.sessionSettled ? 14 : 15)
@@ -488,6 +482,42 @@ public struct ConversationView: View {
         return rest == 0 ? "\(minutes) 分钟" : "\(minutes) 分 \(rest) 秒"
     }
 
+    private var historyResumeBar: some View {
+        VStack(spacing: 8) {
+            Text(client.supportsHistoryResume ? "离线时恢复最后记录分支；在线时连接当前分支。审批可能仍需在 Mac 终端完成。" : "请更新 Mac 助手并选择 OMP，以继续历史会话")
+                .font(.caption)
+                .foregroundColor(DesignTokens.Colors.textSecondary)
+                .multilineTextAlignment(.center)
+            if let message = client.historyRecoveryMessage {
+                Label(message, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundColor(DesignTokens.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("history-recovery-message")
+            }
+            Button(action: { client.resumeActiveHistory() }) {
+                HStack(spacing: 8) {
+                    if client.isResumingHistory {
+                        ProgressView().tint(DesignTokens.Colors.textOnGreen)
+                    } else {
+                        Image(systemName: "play.fill")
+                    }
+                    Text(client.historyResumeButtonTitle)
+                }
+                .font(.body.weight(.semibold))
+                .foregroundColor(DesignTokens.Colors.textOnGreen)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .background(DesignTokens.Colors.darkButton)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+            .disabled(!client.isConnected || !client.agentConnected || !client.supportsHistoryResume || client.isCreatingSession)
+            .opacity(client.isConnected && client.agentConnected && client.supportsHistoryResume ? 1 : 0.5)
+            .accessibilityIdentifier("resume-history")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
     private var inputBar: some View {
         VStack(spacing: 8) {
             if let reconnectSeconds = client.reconnectSeconds {
@@ -503,39 +533,57 @@ public struct ConversationView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
+            VStack(alignment: .leading, spacing: 6) {
                 TextField(placeholder, text: $inputText, axis: .vertical)
                     .font(DesignTokens.Fonts.notoRegular(14))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .lineLimit(1...4)
                     .disabled(!client.isConnected || terminalOffline || !client.activeCanControl)
+                    .padding(.horizontal, 6)
+                    .frame(minHeight: 32)
 
-                if client.isSessionRunning {
-                    Button(action: { client.abortActiveSession() }) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(DesignTokens.Colors.textOnGreen)
-                            .frame(width: 40, height: 40)
-                            .background(DesignTokens.Colors.darkButton)
-                            .clipShape(Circle())
+                HStack(spacing: 10) {
+                    Spacer(minLength: 0)
+
+                    if client.supportsModelSelection, !client.activeModels.isEmpty || client.activeModel != nil {
+                        ModelMenu(
+                            models: client.activeModels,
+                            selected: client.activeModel,
+                            isLoading: client.isSwitchingModel,
+                            defaultTitle: "当前模型",
+                            onSelect: { model in
+                                if let model { client.setActiveModel(model) }
+                            }
+                        )
+                        .disabled(!client.activeCanControl || client.isSessionRunning || client.isSwitchingModel)
                     }
-                    .disabled(!client.canAbortSession)
-                    .accessibilityLabel("停止任务")
-                } else {
-                    Button(action: send) {
-                        Image(systemName: "arrow.up")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundColor(DesignTokens.Colors.textOnGreen)
-                            .frame(width: 40, height: 40)
-                            .background(canSend ? DesignTokens.Colors.darkButton : DesignTokens.Colors.textPlaceholder)
-                            .clipShape(Circle())
+
+                    if client.isSessionRunning {
+                        Button(action: { client.abortActiveSession() }) {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(DesignTokens.Colors.textOnGreen)
+                                .frame(width: 40, height: 40)
+                                .background(DesignTokens.Colors.darkButton)
+                                .clipShape(Circle())
+                        }
+                        .disabled(!client.canAbortSession)
+                        .accessibilityLabel("停止任务")
+                    } else {
+                        Button(action: send) {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(DesignTokens.Colors.textOnGreen)
+                                .frame(width: 40, height: 40)
+                                .background(canSend ? DesignTokens.Colors.darkButton : DesignTokens.Colors.textPlaceholder)
+                                .clipShape(Circle())
+                        }
+                        .disabled(!canSend)
+                        .accessibilityLabel("发送消息")
                     }
-                    .disabled(!canSend)
-                    .accessibilityLabel("发送消息")
                 }
             }
-            .padding(.leading, 18)
-            .padding(.trailing, 12)
+            .padding(.horizontal, 12)
             .padding(.vertical, 12)
             .glassCard(cornerRadius: 24)
 

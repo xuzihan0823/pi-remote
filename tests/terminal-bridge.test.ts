@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { TerminalBridgeError, TerminalSessionBridge, defaultBridgeDirs } from "../src/terminal/bridge-client.ts";
@@ -51,12 +51,11 @@ test("default bridge discovery scans both runtime directories and honors an expl
   }
 });
 
-test("list returns live in-workspace terminal sessions and ignores unrelated or unsafe sockets", async () => {
+test("list returns live sessions from all Mac directories and still ignores unsafe sockets", async () => {
   const root = tempDir();
   const bridgeDir = join(root, "bridge");
   const ws = workspaceUnder(root);
-  const outside = join(root, "outside");
-  mkdirSync(outside);
+  const outside = homedir();
   symlinkSync(outside, join(ws, "escape"));
 
   const live = await FakeTerminalInstance.start({
@@ -80,12 +79,17 @@ test("list returns live in-workspace terminal sessions and ignores unrelated or 
     const metas = await bridge.list();
 
     assert.deepEqual(
-      metas.map((meta) => meta.sessionId),
-      ["terminal:s1"],
+      metas.map((meta) => meta.sessionId).sort(),
+      ["terminal:escape", "terminal:other", "terminal:s1"],
     );
-    assert.equal(metas[0]?.title, "hello terminal");
-    assert.equal(metas[0]?.activity, "idle");
-    assert.equal(metas[0]?.cwd, join(ws, "proj"));
+    const session = metas.find(meta => meta.sessionId === "terminal:s1");
+    assert.equal(session?.title, "hello terminal");
+    assert.equal(session?.activity, "idle");
+    assert.equal(session?.cwd, join(ws, "proj"));
+    await bridge.prompt("terminal:other", "remote prompt");
+    await bridge.abort("terminal:other");
+    assert.equal(unrelated.calls.filter(call => call.op === "prompt").length, 1);
+    assert.equal(unrelated.calls.filter(call => call.op === "abort").length, 1);
   } finally {
     await live.stop();
     await unrelated.stop();
@@ -349,7 +353,7 @@ test("a multi-byte character split across two socket chunks is decoded intact", 
     const metas = await bridge.list();
     assert.equal(writes, 2, "the fixture must have split the response into two writes");
     assert.equal(firstFragment.at(-1)! & 0b1100_0000, 0b1000_0000, "the first fragment must end inside a multi-byte character");
-    assert.deepEqual(metas, [{ sessionId, title, cwd: ws, activity: "idle" }]);
+    assert.deepEqual(metas, [{ sessionId, title, cwd: ws, activity: "idle", canControl: true }]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     try {
@@ -358,4 +362,29 @@ test("a multi-byte character split across two socket chunks is decoded intact", 
       // already gone
     }
   }
+});
+
+test("same-ID sockets remain separate evidence and never route control to the first instance", async () => {
+  const root = tempDir();
+  const ws = workspaceUnder(root);
+  const dir = join(root, "bridge");
+  const first = await FakeTerminalInstance.start({ dir, sessionId: "terminal:duplicate", cwd: ws });
+  const second = await FakeTerminalInstance.start({ dir, sessionId: "terminal:duplicate", cwd: ws });
+  const bridge = new TerminalSessionBridge({ workspaceRoot: ws, bridgeDir: dir });
+  try {
+    assert.equal((await bridge.instances()).length, 2);
+    const listed = await bridge.list();
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0]!.canControl, false);
+    for (const operation of [() => bridge.get("terminal:duplicate"), () => bridge.snapshot("terminal:duplicate"), () => bridge.prompt("terminal:duplicate", "must-not-deliver"), () => bridge.abort("terminal:duplicate")]) {
+      await assert.rejects(operation(), (error: unknown) => error instanceof TerminalBridgeError && error.code === "session_busy");
+    }
+    assert.ok(![...first.calls, ...second.calls].some(call => call.op === "prompt" || call.op === "abort"));
+    await second.stop();
+    bridge.setControlGuard(async () => false);
+    assert.equal((await bridge.list())[0]!.canControl, false);
+    await assert.rejects(bridge.prompt("terminal:duplicate", "still-not-deliver"));
+    await assert.rejects(bridge.abort("terminal:duplicate"));
+    assert.ok(!first.calls.some(call => call.op === "prompt" || call.op === "abort"));
+  } finally { bridge.close(); await first.stop(); await second.stop(); }
 });

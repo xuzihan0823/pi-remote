@@ -8,8 +8,6 @@ struct ClaudeStatusPane: View {
     let showDiagnostics: () -> Void
     @State private var qrImage: NSImage?
     @State private var pairError: String?
-    @State private var didCopy = false
-    @State private var copyTask: Task<Void, Never>?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var mode: ClaudeServiceMode { claude.configuration.mode }
@@ -17,55 +15,54 @@ struct ClaudeStatusPane: View {
 
     var body: some View {
         let presentation = ClaudePresentation.make(state: claude.state, mode: mode)
-        ScrollView {
-            VStack(alignment: .leading, spacing: 28) {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(presentation.title)
-                        .font(Theme.Font.hero)
-                        .foregroundColor(Theme.textPrimary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text(presentation.subtitle)
-                        .font(Theme.Font.body)
-                        .foregroundColor(Theme.textSecondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .animation(Motion.crossfade, value: presentation)
+        GeometryReader { geo in
+            ScrollView {
+                HStack(alignment: .center, spacing: 40) {
+                    VStack(alignment: .leading, spacing: 28) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(presentation.title)
+                                .font(Theme.Font.hero)
+                                .foregroundColor(Theme.textPrimary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(presentation.subtitle)
+                                .font(Theme.Font.body)
+                                .foregroundColor(Theme.textSecondary)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .animation(Motion.crossfade, value: presentation)
 
-                if let message = claude.state.failureMessage {
-                    Notice(title: "原因", message: message, tone: .danger, actionTitle: "查看诊断", action: showDiagnostics)
-                } else if let pairError, claude.state == .running, isTunnel {
-                    Notice(title: "连接码暂不可用", message: pairError, tone: .warning)
-                }
+                        if let message = claude.state.failureMessage {
+                            Notice(title: "原因", message: message, tone: .danger, actionTitle: "查看诊断", action: showDiagnostics)
+                        } else if let pairError, claude.state == .running, isTunnel {
+                            Notice(title: "连接码暂不可用", message: pairError, tone: .warning)
+                        }
 
-                VStack(spacing: 28) {
-                    ConnectionRouteView(
-                        relayTitle: isTunnel ? "临时隧道" : "Claude 后端",
-                        relaySymbol: isTunnel ? "cloud" : "terminal",
-                        state: routeState,
-                        windowVisible: windowVisible
-                    )
+                        ConnectionRouteView(
+                            relayTitle: isTunnel ? "临时隧道" : "Claude 后端",
+                            relaySymbol: isTunnel ? "cloud" : "terminal",
+                            state: routeState,
+                            windowVisible: windowVisible
+                        )
+                    }
+                    .frame(maxWidth: 440, alignment: .leading)
                     PairingCodeView(
                         image: claude.state == .running && isTunnel ? qrImage : nil,
                         placeholderSymbol: placeholderSymbol,
                         placeholderTone: presentation.tone,
-                        placeholderText: placeholderText,
-                        scanHint: "打开 iPhone 上的 Claude Remote，扫码完成配对"
+                        placeholderText: placeholderText
                     )
-                    summary.frame(maxWidth: 440)
+                    .frame(width: 360)
                 }
-                .frame(maxWidth: .infinity)
+                .padding(32)
+                .frame(maxWidth: .infinity, minHeight: geo.size.height)
             }
-            .frame(maxWidth: 640, alignment: .leading)
-            .padding(32)
-            .frame(maxWidth: .infinity)
+            .scrollIndicators(.hidden)
         }
-        .scrollIndicators(.hidden)
         .task(id: PairKey(state: claude.state, publicURL: claude.publicURL, mode: mode)) { await loadPairCode() }
         .onChange(of: claude.state) { state in
             ContentView.announce("Claude \(ClaudePresentation.make(state: state, mode: mode).badge)")
         }
-        .onDisappear { copyTask?.cancel() }
     }
 
     private struct PairKey: Equatable {
@@ -100,46 +97,7 @@ struct ClaudeStatusPane: View {
         return try await claude.readPairInfo()
     }
 
-    private var summary: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(addressTitle)
-                    .font(Theme.Font.control)
-                    .foregroundColor(Theme.textPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(copyableAddress?.absoluteString ?? "")
-                Text("\(isTunnel ? "临时隧道" : "仅本机") · 端口 \(String(claude.configuration.port)) · \((claude.configuration.projectsDirectory as NSString).abbreviatingWithTildeInPath)")
-                    .font(Theme.Font.caption)
-                    .foregroundColor(Theme.textSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(claude.configuration.projectsDirectory)
-            }
-            Spacer(minLength: 0)
-            Button(didCopy ? "已复制" : "复制地址") {
-                if let url = copyableAddress { copy(url) }
-            }
-            .buttonStyle(SecondaryButtonStyle())
-            .frame(width: 96)
-            .disabled(copyableAddress == nil)
-            .accessibilityLabel(didCopy ? "Claude 服务地址已复制" : "复制 Claude 服务地址")
-        }
-    }
-
     // MARK: - Derived
-
-    /// Never includes the token: tunnel mode uses the verified public origin, local mode the loopback base.
-    private var copyableAddress: URL? {
-        guard claude.state == .running else { return nil }
-        return isTunnel ? claude.publicURL : claude.configuration.baseURL
-    }
-
-    private var addressTitle: String {
-        if let url = copyableAddress { return isTunnel ? (url.host ?? url.absoluteString) : url.absoluteString }
-        if claude.state == .starting && isTunnel { return "临时地址将在启动后生成" }
-        return isTunnel ? "临时隧道" : "127.0.0.1:\(String(claude.configuration.port))"
-    }
 
     private var routeState: RouteState {
         switch claude.state {
@@ -166,17 +124,6 @@ struct ClaudeStatusPane: View {
         case .running: return isTunnel ? "正在准备连接码。" : "仅本机模式不生成手机连接码；需要手机访问请改用临时隧道。"
         case .stopping: return "连接码已移除。"
         case .failed: return "处理问题后，重新启动服务。"
-        }
-    }
-
-    private func copy(_ url: URL) {
-        NSPasteboard.general.clearContents()
-        guard NSPasteboard.general.setString(url.absoluteString, forType: .string) else { return }
-        withAnimation(Motion.feedback) { didCopy = true }
-        copyTask?.cancel()
-        copyTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            if !Task.isCancelled { withAnimation(Motion.feedback) { didCopy = false } }
         }
     }
 }

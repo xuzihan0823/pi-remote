@@ -303,11 +303,16 @@ function validateRoutedRequest(frame: RelayRequestFrame): ValidationResult {
 
   switch (frame.payload.method) {
     case "session.list":
+    case "model.list":
       return { ok: true, sessionId };
     case "session.start":
       return { ok: true, sessionId };
     case "session.get":
       if (!sessionId) return invalid("session.get requires sessionId", sessionId);
+      return { ok: true, sessionId };
+    case "session.get_model":
+    case "session.set_model":
+      if (!sessionId) return invalid(`${frame.payload.method} requires sessionId`, sessionId);
       return { ok: true, sessionId };
     case "session.prompt": {
       if (!sessionId) return invalid("session.prompt requires sessionId", sessionId);

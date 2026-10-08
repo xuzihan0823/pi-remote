@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { defaultOmpHistoryRoots, OmpHistoryIndex } from "../src/history/history-index.ts";
@@ -67,18 +67,84 @@ test("missing parents, duplicates and cycles reject affected branches", async ()
   }
 });
 
-test("header authorization rejects unknown versions, similar-prefix and additional workspaces", async () => {
+test("header rejects unknown versions and invalid directories, not projects outside the default directory", async () => {
   const f = fixture();
-  const outside = join(f.dir, "workspace-other"); mkdirSync(outside);
+  const workspace = mkdtempSync(join(homedir(), ".omp-history-workspace-"));
+  const outside = `${workspace}-other`; mkdirSync(outside);
   try {
-    for (const extra of [{ version: 2 }, { cwd: outside }, { additionalDirectories: [outside] }]) {
+    for (const extra of [{ version: 2 }, { cwd: "relative" }, { cwd: `${outside}/missing` }, { additionalDirectories: ["relative"] }]) {
       f.save([], extra);
-      const snapshot = await OmpReadSnapshot.open(f.root, f.file, f.workspace);
+      const snapshot = await OmpReadSnapshot.open(f.root, f.file, workspace);
       try { await assert.rejects(snapshot.header(), HistoryReadError); } finally { await snapshot.close(); }
     }
+    f.save([msg("a", null, "outside project")], { cwd: outside, additionalDirectories: [homedir()] });
+    const index = new OmpHistoryIndex({ workspaceRoot: workspace, roots: [f.root] });
+    try {
+      const alias = await aliasOf(index);
+      const list = await index.list({});
+      assert.equal((list.sessions as { cwd: string }[])[0]?.cwd, realpathSync(outside));
+      assert.deepEqual(await index.projectDirectories(), [realpathSync(outside)]);
+      const page = await index.get(alias, { viewVersion: 2 });
+      assert.deepEqual((page.items as { text: string }[]).map(item => item.text), ["outside project"]);
+      let resumed = false;
+      await index.resume(alias, async target => {
+        await target.verify();
+        assert.equal(target.cwd, realpathSync(outside));
+        resumed = true;
+        return { sessionId: "terminal:fixture", cwd: target.cwd, title: "", activity: "idle" };
+      });
+      assert.equal(resumed, true);
+    } finally { index.close(); }
     writeFileSync(f.file, "{bad header}\n");
-    const snapshot = await OmpReadSnapshot.open(f.root, f.file, f.workspace);
+    const snapshot = await OmpReadSnapshot.open(f.root, f.file, workspace);
     try { await assert.rejects(snapshot.header(), HistoryReadError); } finally { await snapshot.close(); }
+  } finally { f.cleanup(); rmSync(workspace, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
+});
+
+test("temporary history is listed and readable through /tmp, its canonical alias and the system temp directory", async () => {
+  const f = fixture();
+  try {
+    for (const cwd of ["/tmp", realpathSync("/tmp"), tmpdir(), f.dir]) {
+      f.save([msg("a", null, "temporary transcript")], { cwd, additionalDirectories: [f.workspace] });
+      const before = readFileSync(f.file);
+      const index = new OmpHistoryIndex({ workspaceRoot: f.workspace, roots: [f.root] });
+      try {
+        const alias = await aliasOf(index);
+        const listed = await index.list({});
+        const sessions = listed.sessions as Record<string, unknown>[];
+        assert.equal(sessions.length, 1);
+        assert.equal(sessions[0]?.canControl, false);
+        assert.deepEqual(listed.warnings, []);
+        const page = await index.get(alias, { viewVersion: 2 });
+        assert.equal(page.availability, "archived");
+        assert.equal(page.canControl, false);
+        assert.deepEqual((page.items as { text: string }[]).map(item => item.text), ["temporary transcript"]);
+        assert.deepEqual(readFileSync(f.file), before);
+      } finally { index.close(); }
+    }
+  } finally { f.cleanup(); }
+});
+
+test("project symlinks anywhere on Mac are allowed, but swapping one invalidates the snapshot", async () => {
+  const f = fixture();
+  const cwd = join(f.dir, "cwd-link");
+  try {
+    symlinkSync(f.dir, cwd);
+    f.save([msg("a", null, "safe")], { cwd });
+    const snapshot = await OmpReadSnapshot.open(f.root, f.file, f.workspace);
+    try {
+      await snapshot.header();
+      await snapshot.verify();
+      rmSync(cwd);
+      symlinkSync(homedir(), cwd);
+      await assert.rejects(snapshot.verify(), error => error instanceof HistoryReadError && error.reason === "workspace");
+    } finally { await snapshot.close(); }
+    const escaped = await OmpReadSnapshot.open(f.root, f.file, f.workspace);
+    try {
+      assert.equal((await escaped.header()).cwd, realpathSync(homedir()));
+      await escaped.verify();
+    }
+    finally { await escaped.close(); }
   } finally { f.cleanup(); }
 });
 
@@ -178,7 +244,7 @@ test("history aliases never reach managed writer routes and legacy lists omit ar
   const manager = new PiProcessManager({ piBin: "fixture-must-not-execute", spawnFn: () => { spawns++; throw new Error("no writer allowed"); } });
   const handler = createPiAgentHandler({ manager, workspaceRoot: f.workspace, history: index });
   try {
-    f.save([msg("a", null, "合成历史")]);
+    f.save([msg("a", null, "合成历史")], { cwd: "/tmp" });
     const alias = await aliasOf(index);
     assert.deepEqual((await handler(requestFrame("legacy", "session.list"))).data && ((await handler(requestFrame("legacy2", "session.list"))).data as { sessions: unknown[] }).sessions, []);
     const listed = await handler(requestFrame("new", "session.list", { params: { viewVersion: 2, includeArchived: true } }));
@@ -286,5 +352,70 @@ test("reader bounds sparse files and records, and cancels between streamed chunk
       await assert.rejects(async () => { for await (const _ of iterator) {} },
         error => error instanceof HistoryReadError && error.reason === "closed");
     } finally { await snapshot.close(); }
+  } finally { f.cleanup(); }
+});
+
+test("history resume uses only an authorized alias, returns a controllable terminal and never spawns RPC", async () => {
+  const f = fixture();
+  const index = new OmpHistoryIndex({ workspaceRoot: f.workspace, roots: [f.root] });
+  let resumed = 0;
+  const manager = new PiProcessManager({ piBin: "must-not-execute", spawnFn: () => { throw new Error("no RPC writer allowed"); } });
+  const launcher = {
+    start: async () => { throw new Error("resume must not create an empty session"); },
+    resume: async (target: { file: string; id: string; cwd: string; verify: () => Promise<void> }) => {
+      resumed++;
+      assert.equal(target.file, f.file); assert.equal(target.id, "fixture"); assert.equal(target.cwd, realpathSync("/tmp"));
+      await target.verify();
+      return { sessionId: "terminal:fixture", title: "合成历史", cwd: target.cwd, activity: "idle" as const,
+        runtime: "omp" as const, persistedSessionId: "fixture", persistedSessionFile: target.file, processId: 12345 };
+    },
+  };
+  const handler = createPiAgentHandler({ manager, workspaceRoot: f.workspace, history: index, terminalLauncher: launcher, runtime: "omp" });
+  try {
+    f.save([msg("a", null, "resume fixture")], { cwd: "/tmp" });
+    const before = readFileSync(f.file);
+    const alias = await aliasOf(index);
+    const capabilities = await handler(requestFrame("list", "session.list", { params: { viewVersion: 2, includeArchived: true } }));
+    assert.ok(capabilities.data && typeof capabilities.data === "object" && "capabilities" in capabilities.data);
+    const flags = capabilities.data.capabilities;
+    assert.ok(flags && typeof flags === "object" && "historyResume" in flags);
+    assert.equal(flags.historyResume, true);
+    const result = await handler(requestFrame("resume", "session.start", { params: { mode: "terminal", historySessionId: alias } }));
+    assert.equal(result.ok, true);
+    const data = result.data as { sessionId: string; status: Record<string, unknown> };
+    assert.equal(data.sessionId, "terminal:fixture");
+    assert.equal(data.status.availability, "live"); assert.equal(data.status.canControl, true);
+    assert.equal(data.status.persistedSessionFile, undefined); assert.equal(data.status.processId, undefined);
+    assert.equal(resumed, 1);
+    for (const params of [
+      { mode: "terminal", historySessionId: f.file }, { mode: "terminal", historySessionId: "history:fake" },
+      { mode: "terminal", historySessionId: alias, cwd: "/tmp" }, { mode: "terminal", historySessionId: alias, args: ["--session", f.file] },
+      { mode: "rpc", historySessionId: alias },
+    ]) {
+      assert.equal((await handler(requestFrame("invalid", "session.start", { params }))).ok, false);
+    }
+    assert.equal(resumed, 1);
+    assert.deepEqual(readFileSync(f.file), before);
+  } finally { index.close(); await manager.closeAll(); f.cleanup(); }
+});
+
+test("history resume reauthorizes changed files and conflicting copies before executing", async () => {
+  const f = fixture();
+  let called = false;
+  try {
+    f.save([msg("a", null, "fixture")]);
+    const index = new OmpHistoryIndex({ workspaceRoot: f.workspace, roots: [f.root] });
+    try {
+      const alias = await aliasOf(index);
+      f.save([], { id: "replacement" });
+      await assert.rejects(index.resume(alias, async () => { called = true; }), HistoryReadError);
+    } finally { index.close(); }
+    f.save([msg("a", null, "fixture")]); copyFileSync(f.file, join(f.bucket, "copy.jsonl"));
+    const conflict = new OmpHistoryIndex({ workspaceRoot: f.workspace, roots: [f.root] });
+    try {
+      const alias = await aliasOf(conflict);
+      await assert.rejects(conflict.resume(alias, async () => { called = true; }), error => error instanceof HistoryReadError && error.reason === "conflict");
+    } finally { conflict.close(); }
+    assert.equal(called, false);
   } finally { f.cleanup(); }
 });

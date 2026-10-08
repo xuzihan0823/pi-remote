@@ -50,6 +50,11 @@ struct SessionCreationTests {
         try sendsOnlyToCreatedIDBeforeNavigation()
         try requiresMacConnection()
         try await terminalCommandsRespectActivityAndKeepHistory()
+        try await resumesHistoryWithoutSendingPrompt()
+        try historyResumeFailureAndStaleResponses()
+        try await pendingRecoveryQueriesSameOperationAndNeverUnlocksEarly()
+        try recoveryReconnectAndLateResultNeverLaunchAgainOrStealPage()
+        try failedRecoveryRequiresExplicitNewOperation()
         print("PASS: 新建模式、失败保留草稿、重复创建、旧回调隔离、首条消息路由与终端操作保护")
     }
 
@@ -130,18 +135,18 @@ struct SessionCreationTests {
             .appendingPathComponent("../PiRemote/Views/NewSessionView.swift")
         let view = try String(contentsOf: file, encoding: .utf8)
         guard let send = view.components(separatedBy: "private func send() {").dropFirst().first?
-            .components(separatedBy: "private func suggestionCard").first else {
+            .components(separatedBy: "private func chip").first else {
             throw Failure(message: "未找到新建页提交入口")
         }
         try expect(!send.contains("promptText ="), "提交请求或失败回调不能清空输入草稿")
         try expect(view.contains(".onDisappear { client.cancelSessionCreation() }"), "页面离开必须使创建回调失效")
-        guard let backAction = view.components(separatedBy: "Button {").dropFirst().first?
-            .components(separatedBy: "} label:").first,
-              let cancel = backAction.range(of: "client.cancelSessionCreation()"),
-              let navigate = backAction.range(of: "onBackTapped()") else {
-            throw Failure(message: "返回按钮必须先取消创建回调，再导航")
+        let root = try String(contentsOf: file.deletingLastPathComponent().appendingPathComponent("RootView.swift"), encoding: .utf8)
+        guard let select = root.components(separatedBy: "onSessionSelected: { session in").dropFirst().first,
+              let cancel = select.range(of: "relayClient.cancelSessionCreation()"),
+              let open = select.range(of: "relayClient.openSession(session)") else {
+            throw Failure(message: "侧边栏切换会话必须先取消创建回调")
         }
-        try expect(cancel.lowerBound < navigate.lowerBound, "返回列表必须在页面退出动画前作废回调")
+        try expect(cancel.lowerBound < open.lowerBound, "切换到其他会话前必须作废创建回调")
         f.client.startNewSession(prompt: "不要丢失这条提示词")
         try expect(f.requests("session.start").count == 2, "明确重试可重新创建")
     }
@@ -307,6 +312,141 @@ struct SessionCreationTests {
         try expect(f.client.canSendPrompt && !f.client.canAbortSession, "idle 恢复发送")
         f.client.sendPrompt("继续当前终端")
         try expect(f.requests("session.prompt").count == 1 && f.requests("subscribe").isEmpty, "终端仅使用 prompt 和 snapshot")
+    }
+
+    @MainActor
+    static func resumesHistoryWithoutSendingPrompt() async throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true]])
+        f.client.openSession(id: "history:old", title: "旧对话", source: .terminal)
+        let oldSnapshot = try await f.nextSnapshot()
+        f.client.resumeActiveHistory()
+        f.client.resumeActiveHistory()
+        try expect(f.client.isResumingHistory && f.requests("session.start").count == 1, "恢复期间只发送一次请求")
+        let start = try f.request("session.start")
+        let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any]
+        try expect(params?["mode"] as? String == "terminal" && params?["historySessionId"] as? String == "history:old" && params?.count == 2,
+                   "恢复仅发送别名与模式，不向手机暴露文件或指定目录")
+        try f.respond(start, data: ["sessionId": "terminal:restored", "source": "terminal", "status": [
+            "sessionId": "terminal:restored", "source": "terminal", "state": "running", "activity": "idle",
+            "availability": "live", "canControl": true, "runtime": "omp",
+        ]])
+        try expect(f.client.activeSessionId == "terminal:restored" && !f.client.isActiveArchive && !f.client.isResumingHistory,
+                   "恢复成功切换至真实终端，并清除只读与加载状态")
+        try expect(f.requests("session.prompt").isEmpty && f.requests("session.abort").isEmpty, "恢复操作本身不得发送模型请求或停止任务")
+        let snapshot = try await f.nextSnapshot(after: 1)
+        try expect(snapshot["sessionId"] as? String == "terminal:restored", "恢复后轮询真实 ID")
+        try f.respond(oldSnapshot, data: ["availability": "archived", "canControl": false, "activity": "unknown", "messages": []])
+        try f.respond(snapshot, data: ["availability": "live", "canControl": true, "activity": "idle", "messages": []])
+        await Task.yield()
+        try expect(f.client.canSendPrompt, "收到实时快照后可继续发送，旧历史快照不能锁回只读")
+    }
+
+    @MainActor
+    static func historyResumeFailureAndStaleResponses() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        f.client.openSession(id: "history:old", source: .terminal)
+        f.client.resumeActiveHistory()
+        try expect(f.requests("session.start").isEmpty, "旧 Mac 未协商能力时不能恢复")
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true]])
+        f.client.resumeActiveHistory()
+        try f.respond(try f.request("session.start"), error: ["code": "session_busy", "message": "历史已被占用"])
+        try expect(f.client.activeSessionId == "history:old" && f.client.lastError == "历史已被占用" && !f.client.isResumingHistory,
+                   "恢复失败仍可读历史，展示原因并允许重试")
+        f.client.resumeActiveHistory()
+        let old = try f.request("session.start")
+        f.client.openSession(id: "history:new", source: .terminal)
+        try f.respond(old, data: ["sessionId": "terminal:late", "source": "terminal", "status": [
+            "sessionId": "terminal:late", "source": "terminal", "availability": "live", "canControl": true,
+        ]])
+        try expect(f.client.activeSessionId == "history:new" && !f.client.isResumingHistory, "离开历史后迟到的恢复成功不得抢走当前会话")
+        f.client.resumeActiveHistory()
+        let invalid = try f.request("session.start")
+        try f.respond(invalid, data: ["sessionId": "history:readonly", "source": "terminal", "status": [:]])
+        try expect(f.client.activeSessionId == "history:new" && f.client.lastError != nil, "不能把只读历史响应误判为已恢复")
+    }
+
+    @MainActor
+    static func pendingRecoveryQueriesSameOperationAndNeverUnlocksEarly() async throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true, "historyRecoveryOperations": true]])
+        f.client.openSession(id: "history:pending", source: .terminal)
+        f.client.resumeActiveHistory()
+        f.client.resumeActiveHistory()
+        try expect(f.requests("session.start").count == 1, "重复点击不能重复发起恢复")
+        let start = try f.request("session.start")
+        let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+        guard let operationId = params["operationId"] as? String else { throw Failure(message: "缺少稳定恢复操作 ID") }
+        try expect(UUID(uuidString: operationId) != nil && params["recoveryVersion"] as? Int == 1, "新契约必须显式协商与携带有效操作 ID")
+        try f.respond(start, data: ["operationId": operationId, "recoveryState": "pending", "phase": "waiting_bridge", "canRetry": false])
+        try expect(f.client.isActiveArchive && !f.client.canSendPrompt && !f.client.canAbortSession && f.client.isResumingHistory, "pending 必须保持历史可读与输入锁定")
+        try expect(f.client.historyResumeButtonTitle == "正在等待 OMP 桥接…", "按钮必须显示真实阶段")
+        try await Task.sleep(for: .milliseconds(1100))
+        let query = try f.request("session.start")
+        let queryParams = (query["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+        try expect(queryParams["operationId"] as? String == operationId && queryParams["historySessionId"] == nil, "后续轮询只能查询原操作，不能再次启动")
+        try f.respond(query, data: ["operationId": operationId, "recoveryState": "ready", "phase": "ready", "sessionId": "terminal:verified", "source": "terminal", "status": [
+            "sessionId": "terminal:verified", "source": "terminal", "state": "running", "activity": "idle", "availability": "live", "canControl": true,
+        ]])
+        try expect(f.client.activeSessionId == "terminal:verified" && !f.client.isResumingHistory, "只有 ready 验证通过后才能进入运行会话")
+        try expect(f.requests("session.prompt").isEmpty && f.requests("session.abort").isEmpty && f.requests("ui.response").isEmpty, "恢复不能发送、停止或自动审批")
+    }
+
+    @MainActor
+    static func recoveryReconnectAndLateResultNeverLaunchAgainOrStealPage() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        let capabilities: [String: Any] = ["historyResume": true, "historyRecoveryOperations": true]
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": capabilities])
+        f.client.openSession(id: "history:reconnect", source: .terminal)
+        f.client.resumeActiveHistory()
+        let start = try f.request("session.start")
+        let operationId = ((start["payload"] as? [String: Any])?["params"] as? [String: Any])?["operationId"] as! String
+        f.client.reconnectForTesting()
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": capabilities])
+        let query = try f.request("session.start")
+        let params = (query["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+        try expect(params["operationId"] as? String == operationId && params["historySessionId"] == nil, "断线重连必须查询同一次操作")
+        f.client.cancelSessionCreation()
+        let frameCount = f.frames.count
+        try f.respond(query, data: ["operationId": operationId, "recoveryState": "ready", "phase": "ready", "sessionId": "terminal:late", "source": "terminal", "status": [
+            "sessionId": "terminal:late", "source": "terminal", "availability": "live", "canControl": true,
+        ]])
+        try expect(f.client.activeSessionId == "history:reconnect" && f.frames.count == frameCount, "离页后的迟到成功不能导航或追加控制请求")
+        try expect(f.requests("session.abort").isEmpty && f.requests("session.prompt").isEmpty, "取消等待不能停止恢复进程")
+    }
+
+    @MainActor
+    static func failedRecoveryRequiresExplicitNewOperation() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true, "historyRecoveryOperations": true]])
+        f.client.openSession(id: "history:failure", source: .terminal)
+        f.client.resumeActiveHistory()
+        let start = try f.request("session.start")
+        let original = ((start["payload"] as? [String: Any])?["params"] as? [String: Any])?["operationId"] as! String
+        try f.respond(start, data: ["operationId": original, "recoveryState": "failed", "phase": "failed", "canRetry": true, "message": "OMP 提前退出"])
+        try expect(!f.client.isResumingHistory && f.client.isActiveArchive && f.client.historyRecoveryMessage == "OMP 提前退出", "失败后仍可读历史并显示真实错误")
+        try expect(f.client.historyResumeButtonTitle == "重试恢复", "只能对确认失败的结果提示重试")
+        f.client.reconnectForTesting()
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true, "historyRecoveryOperations": true]])
+        let query = try f.request("session.start")
+        let queryParams = (query["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+        try expect(queryParams["operationId"] as? String == original && queryParams["historySessionId"] == nil && queryParams["retry"] == nil, "确认失败后的自动重连只能查询，不能隐式重试")
+        try f.respond(query, data: ["operationId": original, "recoveryState": "failed", "phase": "failed", "canRetry": true, "message": "OMP 提前退出"])
+        f.client.resumeActiveHistory()
+        let retry = (try f.request("session.start")["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+        try expect(retry["operationId"] as? String != original && retry["retry"] as? Bool == true && retry["historySessionId"] as? String == "history:failure", "用户重试必须显式创建新操作并重新授权历史")
     }
 
     private static func expect(_ condition: Bool, _ message: String) throws {

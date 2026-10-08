@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 import { TerminalBridgeError, TerminalSessionBridge } from "../src/terminal/bridge-client.ts";
+import { createPiAgentHandler } from "../src/agent/pi-agent-handler.ts";
+import { PiProcessManager } from "../src/pi/process-manager.ts";
+import { OmpHistoryIndex } from "../src/history/history-index.ts";
+import { requestFrame } from "./helpers/relay-harness.ts";
 
 type FakeEvent = { type: string; message?: { role?: string; content?: unknown; timestamp?: number }; toolCallId?: string; toolName?: string; result?: unknown; partialResult?: unknown; isError?: boolean };
 type FakeHandler = (event: FakeEvent, ctx: FakeContext) => void | Promise<void>;
@@ -201,13 +205,17 @@ test("list and snapshot expose the live terminal session with user/assistant tex
 
   try {
     const bridge = new TerminalSessionBridge({ workspaceRoot: workspace, bridgeDir: harness.dir });
-    assert.deepEqual(await bridge.list(), [
+    const metas = await bridge.list();
+    assert.match(metas[0]!.instanceId!, /^[0-9a-f]{32}$/);
+    assert.deepEqual(metas, [
       {
         sessionId: "terminal:abc-123",
         title: "My terminal session",
         cwd: join(workspace, "proj"),
         activity: "idle",
         runtime: "pi", persistedSessionId: "abc-123", capabilities: { timelineV2: true, toolDetails: true },
+        processId: process.pid,
+        instanceId: metas[0]!.instanceId, canControl: true,
       },
     ]);
 
@@ -226,6 +234,8 @@ test("list and snapshot expose the live terminal session with user/assistant tex
       title: "My terminal session",
       activity: "idle",
       runtime: "pi", persistedSessionId: "abc-123", capabilities: { timelineV2: true, toolDetails: true },
+      processId: process.pid,
+      instanceId: metas[0]!.instanceId,
     });
   } finally {
     await harness.stop();
@@ -611,4 +621,159 @@ test("v2 tool events expose running and staged safe results through the real bri
     const legacy = await bridge.snapshot("terminal:v2-tools");
     assert.deepEqual(legacy.messages, [], "legacy text-only contract must still omit tool content");
   } finally { bridge.close(); await harness.stop(); }
+});
+
+const modelA = { provider: "test", id: "a", name: "A", headers: { Authorization: "secret" } };
+const modelB = { provider: "test", id: "b", name: "B", apiKey: "secret" };
+const chooseB = { provider: "test", modelId: "b" };
+
+function enableModels(h: BridgeHarness, dialect: "omp" | "pi" = "omp") {
+  const state = { current: modelA as typeof modelA | typeof modelB, pending: false, reject: false,
+    beforeList: async () => {}, beforeSet: async () => {}, switches: 0 };
+  const list = async () => { await state.beforeList(); return [modelA, modelB]; };
+  if (dialect === "omp") Object.assign(h.ctx, { models: { list, current: () => state.current } });
+  else Object.defineProperties(h.ctx, {
+    modelRegistry: { value: { getAvailable: list } }, model: { get: () => state.current },
+  });
+  Object.assign(h.ctx, { hasPendingMessages: () => state.pending });
+  Object.assign(h.pi, { setModel: async (model: typeof modelA | typeof modelB) => {
+    await state.beforeSet();
+    if (state.reject) return false;
+    state.switches++;
+    state.current = model;
+    return true;
+  } });
+  return state;
+}
+
+test("terminal model API supports OMP and Pi, hides secrets, and preserves conversation", async () => {
+  for (const dialect of ["omp", "pi"] as const) {
+    const h = await startHarness({ sessionId: `models-${dialect}`, branch: [message("user", "keep this history")] });
+    const state = enableModels(h, dialect);
+    const bridge = new TerminalSessionBridge({ workspaceRoot: h.workspace, bridgeDir: h.dir });
+    const id = `terminal:models-${dialect}`;
+    try {
+      await waitForSocket(h.dir);
+      assert.equal((await bridge.get(id)).capabilities?.modelSelection, true);
+      assert.deepEqual(await bridge.models(id), { sessionId: id, models: [
+        { provider: "test", modelId: "a", name: "A" }, { ...chooseB, name: "B" }], model: { provider: "test", modelId: "a", name: "A" } });
+      assert.deepEqual(await bridge.setModel(id, chooseB), { sessionId: id, model: { ...chooseB, name: "B" } });
+      assert.deepEqual(await bridge.getModel(id), { sessionId: id, model: { ...chooseB, name: "B" } });
+      state.current = modelA;
+      assert.equal((await bridge.getModel(id)).model?.modelId, "a", "Mac model changes must be observed live");
+      assert.deepEqual((await bridge.snapshot(id)).messages, [{ role: "user", text: "keep this history" }]);
+      assert.deepEqual(h.pi.sent, []);
+      assert.equal(state.switches, 1);
+    } finally { bridge.close(); await h.stop(); }
+  }
+});
+
+test("terminal model changes require idle state, valid credentials, and an explicit current session", async () => {
+  const h = await startHarness({ sessionId: "model-guards" });
+  const state = enableModels(h);
+  const socket = await waitForSocket(h.dir);
+  const bridge = new TerminalSessionBridge({ workspaceRoot: h.workspace, bridgeDir: h.dir });
+  const id = "terminal:model-guards";
+  try {
+    const missing = await rawCall(socket, { op: "set_model", model: chooseB });
+    assert.equal((missing.error as { code: string }).code, "invalid_request");
+    const stale = await rawCall(socket, { op: "set_model", sessionId: "terminal:old", model: chooseB });
+    assert.equal((stale.error as { code: string }).code, "stale_session");
+    h.ctx.idle = false;
+    await assert.rejects(bridge.setModel(id, chooseB), { code: "session_busy" });
+    h.ctx.idle = true;
+    state.pending = true;
+    await assert.rejects(bridge.setModel(id, chooseB), { code: "session_busy" });
+    state.pending = false;
+    await assert.rejects(bridge.setModel(id, { ...chooseB, modelId: "missing" }), { code: "invalid_frame" });
+    state.reject = true;
+    await assert.rejects(bridge.setModel(id, chooseB), { code: "invalid_frame" });
+    assert.equal(state.switches, 0);
+    state.reject = false;
+    await bridge.setModel(id, chooseB);
+    assert.equal(state.switches, 1, "rejected switches release the lock");
+  } finally { bridge.close(); await h.stop(); }
+});
+
+test("terminal switching blocks prompts and rechecks session identity after asynchronous discovery", async () => {
+  const h = await startHarness({ sessionId: "model-race" });
+  const state = enableModels(h);
+  await waitForSocket(h.dir);
+  const bridge = new TerminalSessionBridge({ workspaceRoot: h.workspace, bridgeDir: h.dir });
+  const id = "terminal:model-race";
+  let release!: () => void;
+  state.beforeList = () => new Promise<void>(resolve => { release = resolve; });
+  try {
+    const pending = bridge.setModel(id, chooseB);
+    for (let i = 0; i < 100 && !release; i++) await delay(5);
+    assert.ok(release);
+    await assert.rejects(bridge.prompt(id, "must not send"), { code: "session_busy" });
+    await assert.rejects(bridge.setModel(id, chooseB), { code: "session_busy" });
+    h.ctx.sessionId = "model-replaced";
+    release();
+    await assert.rejects(pending, { code: "unknown_session" });
+    assert.equal(state.switches, 0);
+    assert.deepEqual(h.pi.sent, []);
+  } finally { release?.(); bridge.close(); await h.stop(); }
+});
+
+test("old terminal bridges advertise no model capability and fail with upgrade guidance", async () => {
+  const h = await startHarness({ sessionId: "old-model-bridge" });
+  const bridge = new TerminalSessionBridge({ workspaceRoot: h.workspace, bridgeDir: h.dir });
+  try {
+    await waitForSocket(h.dir);
+    assert.equal((await bridge.get("terminal:old-model-bridge")).capabilities?.modelSelection, undefined);
+    await assert.rejects(bridge.setModel("terminal:old-model-bridge", chooseB), { code: "not_implemented" });
+  } finally { bridge.close(); await h.stop(); }
+});
+
+test("new and resumed terminal sessions apply models only after launch, preserving IDs on failure", async () => {
+  const h = await startHarness({ sessionId: "model-resume", branch: [message("user", "original history")] });
+  const state = enableModels(h);
+  const bridge = new TerminalSessionBridge({ workspaceRoot: h.workspace, bridgeDir: h.dir });
+  const manager = new PiProcessManager({ piBin: "must-not-spawn", spawnFn: () => { throw new Error("must not spawn RPC"); } });
+  const root = join(realpathSync(h.workspace), "history");
+  mkdirSync(join(root, "bucket"), { recursive: true, mode: 0o700 });
+  const file = join(root, "bucket", "model-resume.jsonl");
+  writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: "model-resume", cwd: h.workspace, timestamp: "2026-10-07T00:00:00Z" }) + "\n", { mode: 0o600 });
+  const before = readFileSync(file);
+  const history = new OmpHistoryIndex({ workspaceRoot: h.workspace, roots: [root] });
+  let launched = 0;
+  let resumed = 0;
+  const handler = createPiAgentHandler({ manager, workspaceRoot: h.workspace, runtime: "omp", terminalBridge: bridge, history,
+    modelCatalog: async cwd => { assert.equal(cwd, realpathSync(h.workspace)); return [{ ...chooseB, name: "B" }]; },
+    terminalLauncher: {
+      start: async () => { launched++; return bridge.get("terminal:model-resume"); },
+      resume: async target => { resumed++; assert.equal(target.file, file); await target.verify(); return bridge.get("terminal:model-resume"); },
+    },
+  });
+  try {
+    await waitForSocket(h.dir);
+    await history.ready();
+    const alias = ((await history.list({})).sessions as { sessionId: string }[])[0]!.sessionId;
+    const catalog = await handler(requestFrame("catalog", "model.list", { params: { historySessionId: alias } }));
+    assert.equal(catalog.ok, true, JSON.stringify(catalog));
+    assert.equal(launched + resumed, 0, "reading models must not restore a session");
+    for (const [restore, reject] of [[false, false], [true, false], [true, true]]) {
+      state.reject = reject!;
+      const started = await handler(requestFrame("start", "session.start", { params: { mode: "terminal", model: chooseB,
+        ...(restore ? { historySessionId: alias } : {}) } }));
+      assert.equal(started.ok, true);
+      const data = started.data as { sessionId: string; modelSelection: { applied: boolean } };
+      assert.equal(data.sessionId, "terminal:model-resume");
+      assert.equal(data.modelSelection.applied, !reject);
+    }
+    assert.equal(launched, 1);
+    assert.equal(resumed, 2);
+    state.reject = false;
+    assert.equal((await handler(requestFrame("retry", "session.set_model", { sessionId: "terminal:model-resume", params: { model: chooseB } }))).ok, true);
+    assert.equal(launched + resumed, 3, "retry switches the returned session instead of relaunching");
+    const switches = state.switches;
+    history.hasConflict = async () => true;
+    const conflict = await handler(requestFrame("conflict", "session.set_model", { sessionId: "terminal:model-resume", params: { model: chooseB } }));
+    assert.equal(conflict.error?.code, "invalid_frame");
+    assert.equal(state.switches, switches);
+    assert.deepEqual(h.pi.sent, []);
+    assert.deepEqual(readFileSync(file), before);
+  } finally { history.close(); bridge.close(); await manager.closeAll(); await h.stop(); }
 });
