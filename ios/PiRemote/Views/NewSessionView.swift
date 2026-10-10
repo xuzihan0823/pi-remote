@@ -230,25 +230,13 @@ struct ModelMenu: View {
     var isLoading = false
     let defaultTitle: String
     let onSelect: (RemoteModel?) -> Void
+    @State private var isPresented = false
+    @State private var search = ""
 
     var body: some View {
-        Menu {
-            Button {
-                onSelect(nil)
-            } label: {
-                if selected == nil { Label(defaultTitle, systemImage: "checkmark") } else { Text(defaultTitle) }
-            }
-            ForEach(groupedProviders, id: \.self) { provider in
-                Section(provider) {
-                    ForEach(models.filter { $0.provider == provider }) { model in
-                        Button {
-                            onSelect(model)
-                        } label: {
-                            if model == selected { Label(model.name, systemImage: "checkmark") } else { Text(model.name) }
-                        }
-                    }
-                }
-            }
+        Button {
+            search = ""
+            isPresented = true
         } label: {
             HStack(spacing: 4) {
                 if isLoading {
@@ -262,15 +250,74 @@ struct ModelMenu: View {
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(DesignTokens.Colors.textSecondary)
             }
-            .frame(minHeight: 40)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .accessibilityLabel("选择模型，当前\(selected?.name ?? defaultTitle)")
+        .sheet(isPresented: $isPresented) {
+            NavigationStack {
+                List {
+                    Button {
+                        onSelect(nil)
+                        isPresented = false
+                    } label: {
+                        selectionLabel(defaultTitle, isSelected: selected == nil)
+                    }
+                    ForEach(groupedProviders, id: \.self) { provider in
+                        Section(provider) {
+                            ForEach(filteredModels.filter { $0.provider == provider }) { model in
+                                Button {
+                                    onSelect(model)
+                                    isPresented = false
+                                } label: {
+                                    selectionLabel(model.name, isSelected: model == selected)
+                                }
+                            }
+                        }
+                    }
+                    if isLoading { ProgressView("正在读取模型…") }
+                    if !search.isEmpty && filteredModels.isEmpty {
+                        Text("没有匹配的模型").foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityIdentifier("model-selection-list")
+                .navigationTitle("选择模型")
+                .navigationBarTitleDisplayMode(.inline)
+                .searchable(text: $search, prompt: "搜索模型或提供商")
+                .tint(DesignTokens.Colors.accentGreen)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("取消") { isPresented = false }
+                    }
+                }
+            }
+        }
+    }
+
+    private func selectionLabel(_ title: String, isSelected: Bool) -> some View {
+        HStack {
+            Text(title).foregroundStyle(DesignTokens.Colors.textPrimary)
+            Spacer()
+            if isSelected { Image(systemName: "checkmark") }
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var filteredModels: [RemoteModel] {
+        models.filter {
+            search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) ||
+                $0.modelId.localizedCaseInsensitiveContains(search) ||
+                $0.provider.localizedCaseInsensitiveContains(search)
+        }
     }
 
     private var groupedProviders: [String] {
         var seen = Set<String>()
-        return models.map(\.provider).filter { seen.insert($0).inserted }
+        return filteredModels.map(\.provider).filter { seen.insert($0).inserted }
     }
 }
 

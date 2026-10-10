@@ -2,6 +2,29 @@
 
 本文档只覆盖东京服务器上 `pi-remote-relay` 的公网部署配置与连通性验证，不改变服务器上其它服务。
 
+## 当前部署状态（2026-10-10 会话记录与直接发送）
+
+- 用户授权全部替换并提交推送。Relay 已升级为本地构建的 linux/amd64 镜像 `pi-remote-relay:session-records-20261009`，同时标记 latest；升级完成时容器为 healthy，其他服务器容器 ID 不变，原 `.env` 摘要校验一致。仅重建 Relay，未修改 Caddy。
+- 当前项目备份为 `/var/backups/pi-remote/20261009-before-session-records-final/project.tar.gz`，gzip/tar 校验通过，SHA-256 `1b5735bcda5b2b8d9cc6eb55def3317ec7fadf4647c1f700114d7adc3a222b3a`。验证后清理上一份项目备份；回退镜像为 `pi-remote-relay:before-session-records-20261009`。
+- iOS 最终版已签名构建、升级安装并启动于实体 iPhone 17。Mac 助手已重新打包、验签并原位替换 `/Users/mac/Applications/Pi Remote.app`；原应用与双运行时桥接扩展备份位于 `~/Library/Application Support/Pi Remote/backups/20261009-before-session-records/`。pi/OMP 桥接扩展已更新，已打开的交互式终端仍需在空闲时执行 `/reload`。
+- 旧助手正常退出会关闭后台实例，不能宣称 PID 保持不变。三个原空闲后台实例随后用已安装包的正式恢复实现恢复至同一历史，全部 ready、原 session ID 一致；未发送提示词、未变更模型。安装包本地检查覆盖 76 条记录的全部分页，时间戳有效且无重复条目。
+- 本轮类型检查通过，后端隔离回归 225 通过、6 预设跳过、0 失败；Mac 构建、单元测试、supervisor 生命周期和打包运行时校验通过；最终模拟器直接发送续接及恢复前选模型路径通过。分页、分支回切与键盘相关阅读定位仍不稳定，试验性滚动修改已撤回。
+- 最新公网 TLS 健康检查返回 `status=ok`，但 `agentConnected=false`；本机域名解析与 SSH 通道不稳定，助手尚未恢复公网连接，完整手机至 Mac 的在线验收未完成。后续检查应确认助手连接状态与真实 `session.list`，不能将本地恢复校验视为公网验收通过。
+
+以下部署章节为历史记录；当前版本与备份以本节为准。
+
+
+## 当前部署状态（2026-10-09 模型协议修复）
+
+- 用户授权升级 `pi.anyyu.cyou` 的 Relay 并更新手机。旧九月 Relay 不接受 `model.list`，已由本地构建并验过的 linux/amd64 镜像 `pi-remote-relay:model-protocol-20261009` 替换，同时标记 latest。
+- `/opt/pi-remote` 源码同步新镜像；保留原 `.env`（校验摘要不变）、Compose 项目/网络和 Caddy，只重建 Relay。容器状态 healthy，其他容器 ID 不变，Mac Agent 自动重连；用户后台 OMP PID/启动身份及原会话不变。
+- 新备份 `/var/backups/pi-remote/20261009-before-model-protocol/project.tar.gz` 已验证 gzip/tar 可读，SHA-256 `0d31980d91953291cb83255dc7260b15006979045cd92c235e49a2867030b795`；验证后清理本项目上一份九月备份。旧运行镜像保留为 `pi-remote-relay:before-model-fix-20261009`，部署命令有启动失败回退。
+- 真实公网握手返回 supportedMethods，`model.list` 返回 29 个可用模型，`session.get_model` 与列表当前模型一致，原会话空闲可控。验收只读，未给用户会话发提示词或更改模型。
+- iOS 修复版已签名构建、升级安装并启动于实体 iPhone 17。旧 Relay 错误兼容、模型加载/重试及未知模型切换门禁均通过 Swift 回归；真实公网返回数据在 RelayClient 中解除发送门禁。全量严格回归 225 项，224 通过、1 预设跳过、0 失败。
+
+后面的九月状态是历史记录；当前运行镜像、备份与真机安装状态以本节为准。
+
+
 ## 当前部署状态（2026-09-18）
 
 - 东京服务器：`43.130.228.225`。已更新 `/opt/pi-remote` 和 Relay 容器，镜像 `pi-remote-relay:terminal-bridge-20260918`（同时标记为 `latest`），平台 `linux/amd64`；镜像在 Mac 本地构建后传入服务器，支持终端快照接口 `session.get`。

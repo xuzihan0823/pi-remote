@@ -36,6 +36,10 @@ export interface TerminalSessionMeta {
   instanceId?: string;
   canControl?: boolean;
   error?: string;
+  source?: "terminal" | "managed";
+  fileIdentity?: string;
+  rewriteGeneration?: number;
+  subagentModelIsolation?: boolean;
   capabilities?: { timelineV2: boolean; toolDetails: boolean; modelSelection?: boolean };
 }
 
@@ -453,6 +457,7 @@ function parseSessionMeta(value: unknown): TerminalSessionMeta | null {
         ...((record.capabilities as Record<string, unknown>).modelSelection === true ? { modelSelection: true } : {}),
       },
     } : {}),
+    ...(record.subagentModelIsolation === true ? { subagentModelIsolation: true } : {}),
   };
 }
 

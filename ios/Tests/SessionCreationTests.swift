@@ -60,6 +60,17 @@ struct SessionCreationTests {
         try modelSwitchTimeoutAndReconnectReconcileActualState()
         try await promptAcknowledgementPreservesDraft()
         try recoveredSessionSurvivesModelFailure()
+        try await backgroundRecoveryUsesTimelineAndScopesApproval()
+        try oldRelayModelRejectionDoesNotStrandInitialSend()
+        try modelReadFailureCanRetryWithoutUnlockingUnknownSwitch()
+        try relayMethodsConstrainAgentModelCapabilities()
+        try historyModelSelectionIsLocalUntilResumeAndSurvivesReconnect()
+        try historyModelCatalogDiscardsStaleResults()
+        try modelMenuRemainsAvailableDuringBackgroundRefresh()
+        try sessionListRefreshWaitsForAllPages()
+        try await timelineCatchesUpWithoutSkippingAndPagesWhileLive()
+        try await historyPromptRestoresThenSendsOnce()
+        try await historyPromptFailuresAndLeavingPreserveDraft()
         print("PASS: 新建模式、失败保留草稿、重复创建、旧回调隔离、首条消息路由与终端操作保护")
     }
 
@@ -391,7 +402,7 @@ struct SessionCreationTests {
         try expect(UUID(uuidString: operationId) != nil && params["recoveryVersion"] as? Int == 1, "新契约必须显式协商与携带有效操作 ID")
         try f.respond(start, data: ["operationId": operationId, "recoveryState": "pending", "phase": "waiting_bridge", "canRetry": false])
         try expect(f.client.isActiveArchive && !f.client.canSendPrompt && !f.client.canAbortSession && f.client.isResumingHistory, "pending 必须保持历史可读与输入锁定")
-        try expect(f.client.historyResumeButtonTitle == "正在等待 OMP 桥接…", "按钮必须显示真实阶段")
+        try expect(f.client.historyRecoveryStageTitle == "正在等待 OMP 桥接…", "恢复必须显示真实阶段")
         try await Task.sleep(for: .milliseconds(1100))
         let query = try f.request("session.start")
         let queryParams = (query["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
@@ -441,7 +452,7 @@ struct SessionCreationTests {
         let original = ((start["payload"] as? [String: Any])?["params"] as? [String: Any])?["operationId"] as! String
         try f.respond(start, data: ["operationId": original, "recoveryState": "failed", "phase": "failed", "canRetry": true, "message": "OMP 提前退出"])
         try expect(!f.client.isResumingHistory && f.client.isActiveArchive && f.client.historyRecoveryMessage == "OMP 提前退出", "失败后仍可读历史并显示真实错误")
-        try expect(f.client.historyResumeButtonTitle == "重试恢复", "只能对确认失败的结果提示重试")
+        try expect(f.client.canSubmitPrompt, "确认失败后允许通过发送重新续接")
         f.client.reconnectForTesting()
         try f.connect()
         try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true, "historyRecoveryOperations": true]])
@@ -633,6 +644,358 @@ struct SessionCreationTests {
             try expect(f.client.pendingDraft == "恢复后要发送的草稿", "模型失败保留草稿")
             try expect(f.client.lastError?.contains("模型正在使用中") == true, "模型结果与恢复结果分别展示")
             try expect(f.requests("session.start").count == 1 && f.requests("session.prompt").isEmpty, "不得再次恢复或误发第一条消息")
+        }
+    }
+
+    @MainActor
+    static func backgroundRecoveryUsesTimelineAndScopesApproval() async throws {
+        for operations in [false, true] {
+            let f = Fixture()
+            defer { f.client.disconnect() }
+            try f.connect()
+            try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": [
+                "historyResume": true, "historyRecoveryOperations": operations, "backgroundHistoryResume": true, "timelineV2": true
+            ]])
+            f.client.openSession(id: "history:background", source: .terminal)
+            try f.respond(try await f.nextSnapshot(), data: ["availability": "archived", "canControl": false, "messages": []])
+            let archivedSnapshots = f.requests("session.get").count
+            f.client.resumeActiveHistory()
+            let start = try f.request("session.start")
+            let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+            var data: [String: Any] = ["sessionId": "managed:original", "source": "managed", "status": [
+                "sessionId": "managed:original", "source": "managed", "state": "running", "availability": "live", "canControl": true, "activity": "idle"
+            ]]
+            if operations {
+                data["operationId"] = params["operationId"]
+                data["recoveryState"] = "ready"
+                data["phase"] = "ready"
+            }
+            try f.respond(start, data: data)
+            try expect(f.client.isActiveBackground && f.client.usesSessionTimeline, "后台恢复必须进入原历史时间线")
+            try expect(f.requests("subscribe").count == 1 && f.requests("session.prompt").isEmpty && f.requests("ui.response").isEmpty, "后台订阅确认但不自动发送或审批")
+            let snapshot = try await f.nextSnapshot(after: archivedSnapshots)
+            let pending: [String: Any] = ["type": "ui_request", "sessionId": "managed:original", "requestId": "instance:request", "method": "editor", "expectsResponse": true, "payload": ["title": "输入验收", "prefill": "原文"]]
+            try f.respond(snapshot, data: ["activity": "busy", "availability": "live", "canControl": true, "messages": [], "pendingUi": [pending]])
+            for _ in 0..<200 where f.client.pendingApproval == nil { await Task.yield() }
+            guard let approval = f.client.pendingApproval else { throw Failure(message: "重连快照必须恢复真实待确认请求：请求 \(snapshot["sessionId"] ?? "?")，当前 \(f.client.activeSessionId ?? "?")，已加载 \(f.client.terminal.loaded)，请求数 \(f.requests("session.get").count)") }
+            try expect(approval.initialValue == "原文" && !f.client.canSendPrompt, "输入预填值正确，待确认不能发送")
+            f.client.respondToUiRequest(approval, choice: "用户回应")
+            let response = try f.request("ui.response")
+            let responseParams = (response["payload"] as? [String: Any])?["params"] as? [String: Any]
+            try expect(response["sessionId"] as? String == "managed:original" && responseParams?["requestId"] as? String == approval.id, "确认必须绑定实例请求和原会话")
+            try expect((responseParams?["response"] as? [String: Any])?["value"] as? String == "用户回应", "输入/编辑必须发送字符串，而非误当允许")
+            f.client.openSession(id: "managed:other", source: .managed)
+            f.client.respondToUiRequest(approval, approved: true)
+            try expect(f.requests("ui.response").count == 1, "旧弹层不能向新会话审批")
+            try f.respond(response, error: ["message": "旧确认错误"])
+            try expect(f.client.lastError != "旧确认错误", "旧审批回调不得污染新会话")
+            f.client.disconnect()
+            try expect(!f.client.supportsBackgroundHistoryResume, "切设备或断开时必须清空后台能力")
+        }
+    }
+
+    @MainActor
+    static func oldRelayModelRejectionDoesNotStrandInitialSend() throws {
+        for correlated in [false, true] {
+            let f = Fixture()
+            defer { f.client.disconnect() }
+            try enableModels(f)
+            f.client.openSession(id: "A")
+            let query = try f.request("model.list")
+            var rejection: [String: Any] = ["type": "error", "payload": ["code": "invalid_frame", "message": "request.payload.method is not a known method: \"model.list\""]]
+            if correlated { rejection["requestId"] = query["requestId"] }
+            try expect(!f.client.canSendPrompt && f.client.isLoadingActiveModels, "读取中应显示状态而不是无提示锁定")
+            try f.client.receiveTestFrame(rejection)
+            try expect(f.client.canSendPrompt && !f.client.supportsModelSelection && !f.client.isLoadingActiveModels, "旧 Relay 明确不支持时，未切模型会话可沿用当前模型发送")
+            try expect(f.client.lastNotice?.contains("Relay 版本过旧") == true && f.client.lastError == nil, "协议错误必须用可理解的升级提示")
+            let count = f.requests("model.list").count
+            f.client.refreshSessions()
+            try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["modelSelection": true]])
+            f.client.refreshActiveModels()
+            try expect(!f.client.supportsModelSelection && f.requests("model.list").count == count, "Agent 能力不能反复开启旧 Relay 不支持的接口")
+            f.client.expireRequestForTesting(query["requestId"] as! String)
+            try expect(f.client.lastError == nil, "已明确拒绝的查询不能随后制造超时错误")
+            f.client.reconnectForTesting()
+            try enableModels(f)
+            try f.respond(try f.request("model.list"), data: modelData(modelA))
+            try expect(f.client.supportsModelSelection && f.client.activeModel == modelA && f.client.canSendPrompt, "服务升级后重连必须重新启用真实模型读取")
+        }
+    }
+
+    @MainActor
+    static func modelReadFailureCanRetryWithoutUnlockingUnknownSwitch() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try enableModels(f)
+        f.client.openSession(id: "A")
+        try f.respond(try f.request("model.list"), error: ["code": "internal_error", "message": "暂时不可读取"])
+        try expect(f.client.activeModelLoadError != nil && !f.client.isLoadingActiveModels, "模型读取失败必须可显示和重试")
+        f.client.refreshActiveModels()
+        try f.respond(try f.request("model.list"), data: modelData(modelA))
+        try expect(f.client.canSendPrompt && f.client.activeModelLoadError == nil && f.client.lastError == nil, "重试成功必须解除查询锁和旧读取错误")
+        f.client.setActiveModel(modelB)
+        f.client.expireRequestForTesting(try f.request("session.set_model")["requestId"] as! String)
+        try f.client.receiveTestFrame(["type": "error", "payload": ["code": "invalid_frame", "message": "request.payload.method is not a known method: \"model.list\""]])
+        try expect(!f.client.canSendPrompt && f.client.lastNotice?.contains("无法确认模型切换结果") == true, "结果未知的切换不能借协议降级误解锁")
+        f.client.openSession(id: "B")
+        try expect(f.client.canSendPrompt, "A 的未确认切换不能阻塞未改模型的 B")
+        f.client.openSession(id: "A")
+        try expect(!f.client.canSendPrompt, "重进 A 仍须保留未知模型限制")
+        f.client.reconnectForTesting()
+        try enableModels(f)
+        try f.respond(try f.request("model.list"), data: ["models": []])
+        try expect(!f.client.canSendPrompt && f.client.activeModelLoadError != nil, "空模型响应不是未知切换的成功确认")
+        f.client.refreshActiveModels()
+        try f.respond(try f.request("model.list"), data: modelData(modelB))
+        try expect(f.client.canSendPrompt && f.client.activeModel == modelB, "读取实际模型后才解除未知切换限制")
+    }
+
+    @MainActor
+    static func relayMethodsConstrainAgentModelCapabilities() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.client.receiveTestFrame(["type": "hello_ack", "payload": ["agentConnected": true, "supportedMethods": ["session.list", "session.prompt", "session.get"]]])
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["modelSelection": true, "modelCatalog": true]])
+        f.client.openSession(id: "A")
+        f.client.loadModelCatalog(cwd: nil, mode: .terminal)
+        try expect(!f.client.supportsModelSelection && !f.client.supportsModelCatalog && f.requests("model.list").isEmpty && f.client.canSendPrompt, "模型能力必须同时由 Relay 和 Agent 支持")
+    }
+
+    @MainActor
+    static func historyModelSelectionIsLocalUntilResumeAndSurvivesReconnect() throws {
+        for operations in [false, true] {
+            let f = Fixture()
+            defer { f.client.disconnect() }
+            try f.connect()
+            let capabilities: [String: Any] = ["historyResume": true, "historyRecoveryOperations": operations,
+                                               "modelSelection": true, "modelCatalog": true]
+            try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": capabilities])
+            f.client.openSession(id: "history:choose", source: .terminal)
+            let catalog = try f.request("model.list")
+            let catalogParams = (catalog["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+            try expect(catalog["sessionId"] == nil && catalogParams["historySessionId"] as? String == "history:choose",
+                       "恢复前按历史项目查询模型，不能向历史 ID 发运行实例查询")
+            try f.respond(catalog, data: modelData(modelA))
+            try expect(f.client.canSelectHistoryModel && f.client.activeModels.count == 2, "只读历史也必须允许选择续接模型")
+            f.client.selectHistoryResumeModel(modelB)
+            try expect(f.client.historyResumeModel == modelB && f.requests("session.set_model").isEmpty, "恢复前只保存选择，不修改只读历史")
+            f.client.resumeActiveHistory()
+            let start = try f.request("session.start")
+            let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+            let model = params["model"] as? [String: String]
+            try expect(model?["provider"] == modelB.provider && model?["modelId"] == modelB.modelId && !f.client.canSelectHistoryModel,
+                       "首次恢复必须携带用户模型并冻结本次选择")
+            if operations {
+                f.client.expireRequestForTesting(start["requestId"] as! String)
+                f.client.selectHistoryResumeModel(modelA)
+                try expect(f.client.historyResumeModel == modelB, "结果未知时不能改写已启动恢复的模型")
+                f.client.openSession(id: "history:another", source: .terminal)
+                f.client.openSession(id: "history:choose", source: .terminal)
+                try expect(f.client.historyResumeModel == modelB && !f.client.canSelectHistoryModel,
+                           "离页再返回仍须显示原操作已绑定的模型，不能误显示沿用历史模型")
+                f.client.reconnectForTesting()
+                try f.connect()
+                try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": capabilities])
+                let query = try f.request("session.start")
+                let queryParams = (query["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+                try expect(queryParams["operationId"] as? String == params["operationId"] as? String &&
+                           queryParams["model"] == nil && queryParams["historySessionId"] == nil,
+                           "重连只查询原操作，不重复切换模型或重新启动")
+            }
+            try expect(f.requests("session.prompt").isEmpty, "选择模型和恢复不得自动发送草稿")
+        }
+    }
+
+    @MainActor
+    static func historyModelCatalogDiscardsStaleResults() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["historyResume": true, "modelCatalog": true]])
+        f.client.openSession(id: "history:A", source: .terminal)
+        let old = try f.request("model.list")
+        f.client.openSession(id: "history:B", source: .terminal)
+        try f.respond(try f.request("model.list"), data: ["models": [modelB.selection]])
+        try f.respond(old, data: ["models": [modelA.selection]])
+        try expect(f.client.activeModels.map(\.id) == [modelB.id], "旧历史的目录不能覆盖新历史，历史查询只需目录能力")
+        f.client.selectHistoryResumeModel(modelB)
+        f.client.openSession(id: "history:C", source: .terminal)
+        try expect(f.client.historyResumeModel == nil, "不同历史不能串用续接模型选择")
+    }
+
+    @MainActor
+    static func modelMenuRemainsAvailableDuringBackgroundRefresh() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try enableModels(f)
+        f.client.openSession(id: "A")
+        try f.respond(try f.request("model.list"), data: modelData(modelA))
+        f.client.refreshActiveModels()
+        try expect(f.client.isLoadingActiveModels && f.client.canSelectActiveModel, "已有模型列表时后台查询不能把菜单全部置灰")
+        try f.client.receiveTestFrame(["type": "session_event", "sessionId": "A", "payload": ["event": ["type": "agent_start"]]])
+        let count = f.requests("session.set_model").count
+        f.client.setActiveModel(modelB)
+        try expect(!f.client.canSelectActiveModel && f.requests("session.set_model").count == count, "真正运行中仍应保护主模型切换")
+        try f.client.receiveTestFrame(["type": "session_event", "sessionId": "A", "payload": ["event": ["type": "agent_settled"]]])
+        try expect(f.client.canSelectActiveModel, "任务完成后恢复可选，不等待背景目录查询")
+    }
+
+    @MainActor
+    static func sessionListRefreshWaitsForAllPages() throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        f.client.refreshSessions()
+        try expect(f.requests("session.list").count == 1, "慢请求未完成前不能不断发出新刷新使旧结果失效")
+        let capabilities: [String: Any] = ["ompArchiveRead": true]
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": capabilities])
+        try f.respond(try f.request("session.list"), data: ["sessions": [
+            ["sessionId": "terminal:restored", "source": "terminal", "activity": "idle", "startedAt": 1000],
+            ["sessionId": "terminal:gone", "source": "terminal", "activity": "idle"],
+        ], "capabilities": capabilities])
+        f.client.refreshSessions()
+        try f.respond(try f.request("session.list"), data: ["sessions": [["sessionId": "history:A", "availability": "archived"]],
+                                                               "capabilities": capabilities, "nextCursor": "older"])
+        let older = try f.request("session.list")
+        let count = f.requests("session.list").count
+        f.client.refreshSessions()
+        try expect(f.requests("session.list").count == count, "历史递归分页期间定时刷新不能重启分页链")
+        try expect(f.client.sessions.contains { $0.id == "terminal:restored" }, "续接实例不在第一页时必须保留，不能分页期间消失")
+        try f.respond(older, data: ["sessions": [
+            ["sessionId": "history:B", "availability": "archived"],
+            ["sessionId": "terminal:restored", "source": "terminal", "activity": "busy", "startedAt": 2000],
+        ]])
+        try expect(Set(f.client.sessions.map(\.id)) == ["history:A", "history:B", "terminal:restored"], "全部分页完成才移除确实消失的实例，保留续接会话")
+        try expect(f.client.sessions.first { $0.id == "terminal:restored" }?.activity == .busy, "后续页必须更新保留的实例，而不是忽略同 ID 的新状态")
+        f.client.refreshSessions()
+        try expect(f.requests("session.list").count == count + 1, "分页完成后应恢复刷新")
+    }
+
+    @MainActor
+    static func timelineCatchesUpWithoutSkippingAndPagesWhileLive() async throws {
+        let f = Fixture()
+        defer { f.client.disconnect() }
+        try f.connect()
+        try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": ["timelineV2": true, "timelineAnchors": true]])
+        f.client.openSession(id: "terminal:catchup", source: .terminal)
+        func page(_ range: ClosedRange<Int>, revision: String, more: Bool = false) -> [String: Any] {
+            ["viewVersion": 2, "branchId": "same", "revision": revision, "availability": "live", "activity": "busy", "canControl": true,
+             "items": range.map { ["id": "e\($0)", "kind": "message", "role": "assistant", "text": "\($0)"] },
+             "page": ["hasMoreBefore": range.lowerBound > 0, "before": "cursor-\(range.lowerBound)", "hasMoreAfter": more]]
+        }
+        try f.respond(try await f.nextSnapshot(), data: page(50...99, revision: "r1"))
+        for _ in 0..<200 where !f.client.terminal.loaded { await Task.yield() }
+        f.client.stopTerminalPolling()
+        let count = f.requests("session.get").count
+        f.client.startTerminalPolling()
+        let refresh = try await f.nextSnapshot(after: count)
+        let params = (refresh["payload"] as? [String: Any])?["params"] as? [String: Any]
+        try expect(params?["afterItemId"] as? String == "e50", "从已知窗口追赶，不能仅取最新 50 条")
+        try f.respond(refresh, data: page(50...99, revision: "r2", more: true))
+        let next = try await f.nextSnapshot(after: count + 1)
+        try expect(((next["payload"] as? [String: Any])?["params"] as? [String: Any])?["afterItemId"] as? String == "e99",
+                   "未追完应立即按最后收到的条目取下一页")
+        try f.respond(next, data: page(99...148, revision: "r3", more: true))
+        try f.respond(try await f.nextSnapshot(after: count + 2), data: page(148...180, revision: "r4"))
+        for _ in 0..<200 where f.client.terminal.items.count < 131 { await Task.yield() }
+        try expect(f.client.terminal.items.map(\.id) == (50...180).map { "e\($0)" }, "超过一页的新记录必须连续、完整且无重复")
+        f.client.loadEarlier()
+        let earlier = try await f.nextSnapshot(after: count + 3)
+        let earlierParams = (earlier["payload"] as? [String: Any])?["params"] as? [String: Any] ?? [:]
+        try expect(earlierParams["before"] == nil && earlierParams["beforeItemId"] as? String == "e50" &&
+                   earlierParams["branchId"] as? String == "same", "实时较早页按首条稳定 ID 与分支定位，不使用过期版本游标")
+        try f.respond(earlier, data: page(0...49, revision: "r5"))
+        for _ in 0..<200 where f.client.isLoadingEarlier { await Task.yield() }
+        try expect(f.client.terminal.items.map(\.id) == (0...180).map { "e\($0)" } && f.client.terminal.error == nil,
+                   "实时输出造成 revision 变化不能阻断同分支历史翻页")
+    }
+
+    @MainActor
+    static func historyPromptRestoresThenSendsOnce() async throws {
+        for operations in [false, true] {
+            for source in ["terminal", "managed"] {
+                let f = Fixture()
+                defer { f.client.disconnect() }
+                try f.connect()
+                try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": [
+                    "historyResume": true, "historyRecoveryOperations": operations, "modelSelection": true
+                ]])
+                f.client.openSession(id: "history:send", source: .terminal)
+                let archive = try await f.nextSnapshot()
+                try f.respond(archive, data: ["availability": "archived", "canControl": false, "activity": "unknown", "messages": []])
+                var draft = "只回复 ok"
+                try expect(f.client.canSubmitPrompt && !f.client.canSendPrompt, "历史允许提交消息但不获得实时控制权")
+                f.client.sendPrompt(draft) { result in
+                    if case .success = result { draft = "" }
+                }
+                f.client.sendPrompt("重复点击")
+                let start = try f.request("session.start")
+                try expect(f.requests("session.start").count == 1 && f.requests("session.prompt").isEmpty, "发送先恢复，重复提交不能启动两次")
+                let id = source == "managed" ? "managed:restored" : "terminal:restored"
+                var data: [String: Any] = ["sessionId": id, "source": source, "status": [
+                    "sessionId": id, "source": source, "activity": "idle", "availability": "live", "canControl": true
+                ]]
+                if operations {
+                    let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any]
+                    data["operationId"] = params?["operationId"]
+                    data["recoveryState"] = "ready"
+                }
+                let count = f.requests("session.get").count
+                try f.respond(start, data: data)
+                try expect(f.requests("session.prompt").isEmpty && !draft.isEmpty, "ready 还须等待快照与模型确认")
+                let snapshot = try await f.nextSnapshot(after: count)
+                try f.respond(snapshot, data: ["availability": "live", "activity": "idle", "canControl": true, "messages": []])
+                try expect(f.requests("session.prompt").isEmpty, "快照就绪但模型未确认不能发送")
+                try f.respond(try f.request("model.list"), data: modelData(modelA))
+                for _ in 0..<100 where f.requests("session.prompt").isEmpty {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let prompt = try f.request("session.prompt")
+                let params = (prompt["payload"] as? [String: Any])?["params"] as? [String: Any]
+                try expect(prompt["sessionId"] as? String == id && params?["message"] as? String == "只回复 ok", "只能向原历史恢复出的实例发出用户消息")
+                try expect(f.requests("session.prompt").count == 1 && !draft.isEmpty, "只发送一次，确认前保留草稿")
+                try f.respond(prompt, data: ["queued": true])
+                try expect(draft.isEmpty, "投递确认成功才清空草稿")
+                try expect(f.client.sessions.contains { $0.id == id && SessionFilter.history.matches($0) }, "续接后仍显示在会话记录中")
+            }
+        }
+    }
+
+    @MainActor
+    static func historyPromptFailuresAndLeavingPreserveDraft() async throws {
+        for scenario in ["failed", "leaving", "model", "reconnect", "snapshot-leaving"] {
+            let f = Fixture()
+            defer { f.client.disconnect() }
+            try f.connect()
+            try f.respond(try f.request("session.list"), data: ["sessions": [], "capabilities": [
+                "historyResume": true, "historyRecoveryOperations": true
+            ]])
+            f.client.openSession(id: "history:failure", source: .terminal)
+            var draft = "保留这条消息"
+            f.client.sendPrompt(draft) { result in
+                if case .success = result { draft = "" }
+            }
+            let start = try f.request("session.start")
+            let params = (start["payload"] as? [String: Any])?["params"] as? [String: Any]
+            let operationId = params?["operationId"] as! String
+            if scenario == "failed" {
+                try f.respond(start, data: ["operationId": operationId, "recoveryState": "failed", "canRetry": true])
+            } else if scenario == "leaving" {
+                f.client.openSession(id: "other")
+            } else if scenario == "reconnect" {
+                f.client.reconnectForTesting()
+            } else {
+                var response: [String: Any] = ["operationId": operationId, "recoveryState": "ready",
+                    "sessionId": "terminal:restored", "source": "terminal", "status": [
+                        "sessionId": "terminal:restored", "source": "terminal", "availability": "live", "canControl": true
+                    ]]
+                if scenario == "model" { response["modelSelection"] = ["applied": false] }
+                try f.respond(start, data: response)
+                if scenario == "snapshot-leaving" { f.client.openSession(id: "other") }
+            }
+            try await Task.sleep(for: .milliseconds(80))
+            try expect(draft == "保留这条消息" && f.requests("session.prompt").isEmpty, "恢复失败、选模失败、重连或离页均不得误发或清空草稿：\(scenario)")
+            try expect(!f.client.isPreparingHistoryPrompt, "失败或取消不能永久锁住输入")
         }
     }
 

@@ -42,6 +42,7 @@ export interface PiMessage {
   isError?: boolean;
   timestamp?: number;
   stopReason?: string;
+  errorMessage?: string;
 }
 
 export interface PiSessionEntry {
@@ -149,6 +150,7 @@ interface SessionMeta {
   persistedSessionFile?: string;
   processId?: number;
   instanceId: string;
+  subagentModelIsolation?: boolean;
   capabilities?: { timelineV2: boolean; toolDetails: boolean; modelSelection?: boolean };
 }
 
@@ -508,6 +510,7 @@ export default function piRemoteBridge(pi: PiApi): void {
       persistedSessionFile: ctx.sessionManager.getSessionFile(),
       processId: process.pid,
       instanceId: processInstanceId,
+      ...(process.env.PI_REMOTE_SUBAGENT_MODELS !== undefined ? { subagentModelIsolation: true } : {}),
       capabilities: { timelineV2: true, toolDetails: true, ...(supportsModels(ctx) ? { modelSelection: true } : {}) },
       ...(!launchSessionReplaced && launchId && /^[0-9a-f-]{36}$/.test(launchId) && sessionId === initialSessionId ? { launchId } : {}),
     };
@@ -894,6 +897,14 @@ export function projectTranscript(
         items.push({ id, kind: "unsupported", text: "附件或未知内容未载入" });
       }
     }
+    if (message.role === "assistant" && message.stopReason === "error") {
+      const id = `${entryId}:error`;
+      const text = `消息执行失败：${safeText(message.errorMessage || "模型服务未返回错误详情")}`;
+      const truncated = byteLength(text) > 4096;
+      items.push({ id, kind: "message", role: "assistant", text: truncateBytes(text, 4096), isError: true,
+        ...(truncated ? { truncated: true, detailId: id } : {}) });
+      if (truncated) details[id] = { result: text };
+    }
   }
   for (const [callId, callItems] of calls) {
     const resultItems = results.get(callId) ?? [];
@@ -950,7 +961,22 @@ export class TimelineViewService {
     return value;
   }
 
-  pageRange(context: TimelineContext, total: number, params: Record<string, unknown>): { start: number; end: number } {
+  pageRange(context: TimelineContext, total: number, params: Record<string, unknown>, itemIds?: readonly string[]): { start: number; end: number } {
+    const limit = typeof params.limit === "number" && Number.isFinite(params.limit)
+      ? Math.max(1, Math.min(50, Math.floor(params.limit))) : 50;
+    if (params.afterItemId !== undefined || params.beforeItemId !== undefined) {
+      const after = params.afterItemId !== undefined;
+      const anchor = after ? params.afterItemId : params.beforeItemId;
+      if (typeof anchor !== "string" || anchor.length > 512 || params.before != null ||
+          after && params.beforeItemId !== undefined) throw new TimelineRequestError("无效的时间线锚点");
+      const index = itemIds?.indexOf(anchor) ?? -1;
+      if (index < 0) {
+        if (after) return { start: Math.max(0, total - limit), end: total };
+        throw new TimelineRequestError("消息已不在当前分支，请刷新");
+      }
+      return after ? { start: index, end: Math.min(total, index + limit) } :
+        { start: Math.max(0, index - limit), end: index };
+    }
     let end = total;
     if (params.before != null) {
       const cursor = this.#decode(context, params.before);
@@ -958,8 +984,6 @@ export class TimelineViewService {
       end = Number(cursor.end);
     }
     if (!Number.isSafeInteger(end) || end < 0 || end > total) throw new TimelineRequestError("无效的时间线边界");
-    const limit = typeof params.limit === "number" && Number.isFinite(params.limit)
-      ? Math.max(1, Math.min(50, Math.floor(params.limit))) : 50;
     return { start: Math.max(0, end - limit), end };
   }
 
@@ -969,7 +993,8 @@ export class TimelineViewService {
     return reference.id;
   }
 
-  respond(context: TimelineContext, projection: ProjectedTranscript, params: Record<string, unknown>): Record<string, unknown> {
+  respond(context: TimelineContext, projection: ProjectedTranscript, params: Record<string, unknown>,
+    requestedRange?: { start: number; end: number }): Record<string, unknown> {
     if (params.view === "tool") {
       if (params.revision !== context.revision) throw new TimelineRequestError("详情已变化，请刷新");
       const reference = this.#decode(context, params.detailId);
@@ -1008,8 +1033,10 @@ export class TimelineViewService {
       return response;
     }
     if (params.view !== undefined && params.view !== "timeline") throw new TimelineRequestError("不支持的历史视图");
-    const range = this.pageRange(context, projection.total ?? projection.items.length, params);
-    const end = range.end;
+    if (params.branchId !== undefined && params.branchId !== context.branchId) throw new TimelineRequestError("当前分支已变化，请刷新");
+    const total = projection.total ?? projection.items.length;
+    const range = requestedRange ?? this.pageRange(context, total, params, projection.items.map(item => item.id));
+    let end = range.end;
     let start = range.start;
     const makePage = (): Record<string, unknown> => {
       const items = projection.items.slice(start - (projection.offset ?? 0), end - (projection.offset ?? 0)).map(item => ({
@@ -1018,10 +1045,14 @@ export class TimelineViewService {
       const messages = items.flatMap(item => item.kind === "message" ? [{ role: item.role, text: item.text }] : []);
       return { ...context, viewVersion: 2, items, messages, truncated: items.some(item => item.truncated),
         warnings: projection.warnings.slice(0, 20),
-        page: { hasMoreBefore: start > 0, before: start > 0 ? this.#token(context, { kind: "timeline", end: start }) : null } };
+        page: { hasMoreBefore: start > 0, before: start > 0 ? this.#token(context, { kind: "timeline", end: start }) : null,
+          ...(params.afterItemId !== undefined ? { hasMoreAfter: end < total } : {}) } };
     };
     let page = makePage();
-    while (byteLength(JSON.stringify(page)) > 256 * 1024 && start < end - 1) page = (start++, makePage());
+    while (byteLength(JSON.stringify(page)) > 256 * 1024 && start < end - 1) {
+      if (params.afterItemId !== undefined) end--; else start++;
+      page = makePage();
+    }
     if (byteLength(JSON.stringify(page)) > 256 * 1024) throw new TimelineRequestError("时间线元数据超过预算");
     return page;
   }

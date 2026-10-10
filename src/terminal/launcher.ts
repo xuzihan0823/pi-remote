@@ -25,6 +25,7 @@ export type TerminalOpenSpawn = (command: string, args: string[], options: Spawn
 
 export interface TerminalSessionLauncherOptions {
   piBin: string;
+  args?: string[];
   workspaceRoot: string;
   bridge: Pick<TerminalSessionBridge, "list" | "bridgeDir"> & Partial<Pick<TerminalSessionBridge, "instances">>;
   maxSessions?: number;
@@ -121,7 +122,7 @@ export class TerminalSessionLauncher {
       controller.signal.throwIfAborted();
       await chmod(launchDir, 0o700);
       const commandPath = join(launchDir, `${randomUUID()}.command`);
-      await writeFile(commandPath, terminalCommand(commandPath, launchDir, cwd, piBin, this.#options.bridge.bridgeDir, launchId, resume?.file, resume?.launch?.statusPath), { mode: 0o700, flag: "wx" });
+      await writeFile(commandPath, terminalCommand(commandPath, launchDir, cwd, piBin, this.#options.bridge.bridgeDir, launchId, resume?.file, resume?.launch?.statusPath, this.#options.args), { mode: 0o700, flag: "wx" });
       await chmod(commandPath, 0o700);
       controller.signal.throwIfAborted();
       if (resume) {
@@ -243,14 +244,14 @@ export function terminalEnvironment(): Record<string, string> {
   return environment;
 }
 
-function terminalCommand(commandPath: string, launchDir: string, cwd: string, piBin: string, bridgeDir: string, launchId: string, sessionFile?: string, statusPath?: string): string {
+function terminalCommand(commandPath: string, launchDir: string, cwd: string, piBin: string, bridgeDir: string, launchId: string, sessionFile?: string, statusPath?: string, runtimeArgs: string[] = []): string {
   const environment = {
     ...terminalEnvironment(), PI_REMOTE_BRIDGE_DIR: resolve(bridgeDir), [TERMINAL_LAUNCH_ID_ENV]: launchId,
     ...(statusPath ? { PI_REMOTE_LAUNCH_STATUS_PATH: statusPath } : {}),
   };
   const argv = Object.entries(environment).map(([key, value]) => shellquote(`${key}=${value}`));
   const sessionArgs = sessionFile ? ` '--session' ${shellquote(sessionFile)}` : "";
-  const command = `/usr/bin/env -i ${argv.join(" ")} /bin/sh -c 'export ${TERMINAL_LAUNCH_PID_ENV}=$$; exec "$@"' sh ${shellquote(piBin)} '-e' ${shellquote(EXTENSION_PATH)}${sessionArgs}`;
+  const command = `/usr/bin/env -i ${argv.join(" ")} /bin/sh -c 'export ${TERMINAL_LAUNCH_PID_ENV}=$$; exec "$@"' sh ${[piBin, ...runtimeArgs].map(shellquote).join(" ")} '-e' ${shellquote(EXTENSION_PATH)}${sessionArgs}`;
   const cleanup = [`/bin/rm -f -- ${shellquote(commandPath)}`, `/bin/rmdir -- ${shellquote(launchDir)}`, `cd -- ${shellquote(cwd)}`];
   if (!statusPath) return ["#!/bin/sh", "set -eu", "umask 077", ...cleanup, `exec ${command}`, ""].join("\n");
   const status = shellquote(statusPath);

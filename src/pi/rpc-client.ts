@@ -48,6 +48,9 @@ export interface RpcClientOptions {
   maxLineChars?: number;
   spawnFn?: RpcSpawnFn;
   logger?: (message: string) => void;
+  waitForReady?: boolean;
+  onFrame?: (frame: Record<string, unknown>) => void;
+  mode?: "rpc" | "rpc-ui";
 }
 
 export class RpcCommandError extends Error {
@@ -157,6 +160,10 @@ export class RpcClient {
   readonly #maxLineChars: number;
   readonly #spawnFn: RpcSpawnFn;
   readonly #logger: (message: string) => void;
+  readonly #waitForReady: boolean;
+  readonly #onFrame: (frame: Record<string, unknown>) => void;
+  readonly #ready = Promise.withResolvers<void>();
+  readonly #mode: "rpc" | "rpc-ui";
 
   #child: RpcChildProcess | null = null;
   #stdin: WritableLike | null = null;
@@ -183,6 +190,9 @@ export class RpcClient {
     this.#maxLineChars = options.maxLineChars ?? 16 * 1024 * 1024;
     this.#spawnFn = options.spawnFn ?? defaultSpawn;
     this.#logger = options.logger ?? (() => {});
+    this.#waitForReady = options.waitForReady ?? false;
+    this.#onFrame = options.onFrame ?? (() => {});
+    this.#mode = options.mode ?? "rpc";
   }
 
   get pid(): number | undefined {
@@ -209,7 +219,7 @@ export class RpcClient {
       throw new RpcProcessError(`pi RPC client for session "${this.sessionId}" already started`);
     }
 
-    const child = this.#spawnFn(this.#piBin, ["--mode", "rpc", ...this.#args], {
+    const child = this.#spawnFn(this.#piBin, ["--mode", this.#mode, ...this.#args], {
       cwd: this.#cwd,
       env: this.#env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -228,7 +238,13 @@ export class RpcClient {
     }
     this.#detachStdout = attachJsonlLineReader(child.stdout, (line) => this.#handleLine(line));
 
-    await new Promise((resolve) => setTimeout(resolve, this.#startupDelayMs));
+    if (this.#waitForReady) {
+      const timer = setTimeout(() => this.#ready.reject(new RpcTimeoutError("ready", this.#timeoutMs)), this.#timeoutMs);
+      try { await this.#ready.promise; }
+      finally { clearTimeout(timer); }
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, this.#startupDelayMs));
+    }
     if (this.#exitError) throw this.#exitError;
     if (child.exitCode !== null) {
       const error = this.#createExitError(child.exitCode, child.signalCode);
@@ -296,8 +312,6 @@ export class RpcClient {
     if (!child) return;
 
     this.#expectedExit = true;
-    this.#detachStdout?.();
-    this.#detachStdout = null;
 
     if (!this.#exited) {
       await new Promise<void>((resolve) => {
@@ -311,6 +325,8 @@ export class RpcClient {
         child.kill("SIGTERM");
       });
     }
+    this.#detachStdout?.();
+    this.#detachStdout = null;
 
     this.#child = null;
     this.#stdin = null;
@@ -354,6 +370,8 @@ export class RpcClient {
 
     const record = parsed as Record<string, unknown>;
     const type = record.type;
+    this.#onFrame(record);
+    if (type === "ready") this.#ready.resolve();
 
     if (type === "response") {
       this.#handleResponse(record as unknown as RpcResponsePayload);
@@ -367,7 +385,7 @@ export class RpcClient {
 
     const event = toGatewayEvent(record, this.sessionId);
     if (event) this.#emit(event);
-    if (type === "agent_end" && record.isTerminal === true) {
+    if (!this.#waitForReady && type === "agent_end" && record.isTerminal === true) {
       this.#emit({ type: "agent_settled", sessionId: this.sessionId });
     }
   }
@@ -415,6 +433,7 @@ export class RpcClient {
       `pi RPC process error for session "${this.sessionId}": ${error.message}${this.#stderr ? ` | stderr: ${this.#stderr}` : ""}`,
     );
     this.#exitError = processError;
+    if (this.#waitForReady) this.#ready.reject(processError);
     this.#emit({ type: "process_error", sessionId: this.sessionId, message: processError.message });
     this.#rejectAllPending(processError);
   }
@@ -423,6 +442,7 @@ export class RpcClient {
     if (this.#exited) return;
     this.#exited = true;
     const error = this.#createExitError(code, signal);
+    if (this.#waitForReady) this.#ready.reject(this.#createExitError(code, signal));
     if (!this.#expectedExit) {
       this.#exitError = error;
     }
@@ -471,6 +491,7 @@ function toGatewayEvent(raw: Record<string, unknown>, sessionId: SessionId): Gat
     case "agent_end":
       return { type: "agent_end", sessionId, willRetry: raw.willRetry === true };
     case "agent_settled":
+    case "session_settled":
       return { type: "agent_settled", sessionId };
     case "turn_start":
       return { type: "turn_start", sessionId };

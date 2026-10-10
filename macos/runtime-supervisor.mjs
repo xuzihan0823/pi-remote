@@ -76,7 +76,7 @@ function start() {
   const env = job.env && typeof job.env === "object" ? job.env : process.env;
   child = spawn(job.command, Array.isArray(job.args) ? job.args : [], {
     cwd: typeof job.cwd === "string" && job.cwd.length > 0 ? job.cwd : undefined,
-    env,
+    env: { ...env, PI_REMOTE_SUPERVISOR_PID: String(process.pid) },
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });

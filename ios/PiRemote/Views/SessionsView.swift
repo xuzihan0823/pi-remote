@@ -8,7 +8,7 @@ public struct SessionsView: View {
     public var onDeviceSwitched: () -> Void = {}
 
     @State private var searchText = ""
-    @State private var selectedFilter: SessionFilter = .all
+    @State private var selectedFilter: SessionFilter = .history
     @State private var showSettings = false
     @State private var collapsedProjects: Set<String> = []
     @State private var seenSessionIds: Set<String> = []
@@ -165,14 +165,6 @@ public struct SessionsView: View {
             }
 
             if !visibleSessions.isEmpty {
-                if selectedFilter == .history {
-                    Text("历史快照 · 只读")
-                        .font(DesignTokens.Fonts.notoRegular(12))
-                        .foregroundColor(DesignTokens.Colors.textSecondary)
-                        .padding(.horizontal, 24)
-                        .padding(.top, 8)
-                }
-
                 LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(projectGroups) { group in
                         projectSection(group)

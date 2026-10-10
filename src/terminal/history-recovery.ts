@@ -41,6 +41,8 @@ interface RecoveryRecord {
   updatedAt: number;
   createdAt: number;
   modelSelection?: RecoveryModelSelection;
+  source?: "terminal" | "managed";
+  rewriteGeneration?: number;
 }
 export interface RecoveryOptions {
   history: OmpHistoryIndex;
@@ -48,6 +50,7 @@ export interface RecoveryOptions {
   launcher: Pick<TerminalSessionLauncher, "resume">;
   directory?: string;
   workspaceRoot: string;
+  offlineSource?: "terminal" | "managed";
   ownerPids?: typeof sessionOwnerPids;
   processIdentity?: typeof processIdentity;
 }
@@ -106,6 +109,7 @@ export class HistoryRecoveryCoordinator {
         if (record.version !== 1 || `${record.operationId}.json` !== name || !Number.isSafeInteger(record.createdAt) || typeof record.target?.file !== "string" || typeof record.target.id !== "string" || typeof record.target.cwd !== "string") throw new Error("Invalid recovery record");
         if (!Array.isArray(record.requestIds) || record.requestIds.length > 256 || !record.requestIds.every(id => typeof id === "string" && /^[0-9a-f-]{36}$/.test(id))) throw new Error("Invalid recovery request IDs");
         if (!/^[0-9a-f-]{36}$/.test(record.launchId) || !["validating", "opening", "waiting_bridge", "verifying", "ready", "blocked", "failed", "outcome_unknown", "reconciling"].includes(record.phase) || !Number.isSafeInteger(record.updatedAt) || !/^\d+:\d+$/.test(record.fileIdentity ?? "")) throw new Error("Invalid recovery identity");
+        if (record.source !== undefined && !["terminal", "managed"].includes(record.source) || record.rewriteGeneration !== undefined && (!Number.isSafeInteger(record.rewriteGeneration) || record.rewriteGeneration < 0)) throw new Error("Invalid recovery source");
         if (record.modelSelection) {
           const model = record.modelSelection;
           if (!readModelSelection(model.requested) || !["pending", "applying", "applied", "failed", "unknown"].includes(model.state) || typeof model.applied !== "boolean") throw new Error("Invalid recovery model selection");
@@ -187,6 +191,7 @@ export class HistoryRecoveryCoordinator {
         }
       }
       const record: RecoveryRecord = { version: 1, operationId: id, requestIds: [id], target: { file: target.file, id: target.id, cwd: target.cwd }, phase: "validating", launchId: randomUUID(), createdAt: Math.max(Date.now(), (existing?.createdAt ?? 0) + 1), updatedAt: Date.now() };
+      record.source = this.#options.offlineSource ?? "terminal";
       if (model) record.modelSelection = { requested: { ...model }, state: "pending", applied: false, model: null };
       record.fileIdentity = `${fileInfo.dev}:${fileInfo.ino}`;
       this.#records.set(target.file, record);
@@ -231,16 +236,21 @@ export class HistoryRecoveryCoordinator {
   async #verify(record: RecoveryRecord, target: TerminalResumeTarget, candidate: TerminalSessionMeta): Promise<TerminalSessionMeta> {
     await target.verify();
     const fileInfo = await lstat(target.file);
-    if (record.fileIdentity !== `${fileInfo.dev}:${fileInfo.ino}`) throw new TerminalBridgeError("session_busy", "原历史文件已被替换");
+    const currentIdentity = `${fileInfo.dev}:${fileInfo.ino}`;
     const matches = (await this.#options.bridge.instances()).filter(meta => meta.persistedSessionId === target.id || meta.sessionId === `terminal:${target.id}` || meta.launchId === record.launchId);
     if (matches.length !== 1 || matches[0]!.instanceId !== candidate.instanceId) throw new TerminalBridgeError("session_busy", "历史存在多个或变化中的终端实例");
     const meta = await this.#options.bridge.get(candidate.sessionId);
     if (meta.runtime !== "omp" || meta.persistedSessionId !== target.id || !meta.persistedSessionFile || await realpath(meta.persistedSessionFile) !== target.file || await realpath(meta.cwd) !== target.cwd || !meta.instanceId || !meta.processId || meta.instanceId !== candidate.instanceId || (record.commandPath && meta.launchId !== record.launchId)) throw new TerminalBridgeError("session_busy", "终端恢复身份不匹配");
+    if (!record.commandPath && meta.launchId) record.launchId = meta.launchId;
+    await this.#adoptRewrite(record, meta, currentIdentity);
+    if (record.fileIdentity !== currentIdentity) throw new TerminalBridgeError("session_busy", "原历史文件已被替换");
     const identity = await (this.#options.processIdentity ?? processIdentity)(meta.processId);
     if (!identity || (record.instanceId && (record.instanceId !== meta.instanceId || record.processId !== meta.processId || record.processIdentity !== identity))) throw new TerminalBridgeError("session_busy", "原运行实例已变化");
     const owners = await (this.#options.ownerPids ?? sessionOwnerPids)(target);
     if (owners.some(pid => pid !== meta.processId)) throw new TerminalBridgeError("session_busy", "历史仍被其他进程占用");
     record.instanceId = meta.instanceId;
+    record.source = meta.source ?? "terminal";
+    record.rewriteGeneration = meta.rewriteGeneration ?? 0;
     record.processId = meta.processId;
     record.processIdentity = identity;
     record.phase = "ready";
@@ -248,6 +258,19 @@ export class HistoryRecoveryCoordinator {
     await this.#save(record);
     return meta;
   }
+
+  async #adoptRewrite(record: RecoveryRecord, meta: TerminalSessionMeta, identity: string): Promise<void> {
+    if (record.fileIdentity === identity) return;
+    if (meta.source !== "managed" || meta.fileIdentity !== identity || meta.launchId !== record.launchId ||
+      !meta.instanceId || record.instanceId && meta.instanceId !== record.instanceId || !meta.processId ||
+      record.processId && record.processId !== meta.processId || !Number.isSafeInteger(meta.rewriteGeneration) ||
+      meta.rewriteGeneration! <= (record.rewriteGeneration ?? 0)) return;
+    const start = await (this.#options.processIdentity ?? processIdentity)(meta.processId);
+    if (!start || record.processIdentity && record.processIdentity !== start) return;
+    record.fileIdentity = identity;
+    record.rewriteGeneration = meta.rewriteGeneration;
+  }
+
 
   #assertModel(expected: ModelSelection | undefined, requested: ModelSelection | undefined): void {
     if (expected?.provider !== requested?.provider || expected?.modelId !== requested?.modelId) {
@@ -318,19 +341,25 @@ export class HistoryRecoveryCoordinator {
     try {
       session = await this.#options.history.resumeStored(record.target, async target => {
         const fileInfo = await lstat(target.file);
-        if (record.fileIdentity !== `${fileInfo.dev}:${fileInfo.ino}`) throw new TerminalBridgeError("session_busy", "原历史文件已被替换");
+        const currentIdentity = `${fileInfo.dev}:${fileInfo.ino}`;
         const candidates = (await this.#options.bridge.instances()).filter(meta => meta.persistedSessionId === target.id || meta.sessionId === `terminal:${target.id}` || meta.launchId === record.launchId);
         if (candidates.length > 1) throw new TerminalBridgeError("session_busy", "多个终端正在使用此历史");
         if (candidates.length === 1) {
+          await this.#adoptRewrite(record, candidates[0]!, currentIdentity);
+          if (record.fileIdentity !== currentIdentity) throw new TerminalBridgeError("session_busy", "原历史文件已被替换");
           record.phase = "reconciling";
           return this.#verify(record, target, candidates[0]!);
         }
         const owners = await (this.#options.ownerPids ?? sessionOwnerPids)(target);
         if (owners.length) throw new TerminalBridgeError("session_busy", "历史仍有未桥接的运行进程");
+        const observedPid = record.wrapperPid ?? record.processId;
+        const observedIdentity = record.wrapperIdentity ?? record.processIdentity;
+        const workerDead = record.source === "managed" && observedPid && observedIdentity &&
+          observedIdentity !== await (this.#options.processIdentity ?? processIdentity)(observedPid);
         const status = await readRecoveryStatus(join(this.directory, `${record.operationId}.status`));
         const alreadyFailed = record.phase === "failed";
-        record.phase = !record.commandPath || /^exited \d+ \d+\s*$/.test(status) ? "failed" : "outcome_unknown";
-        if (!alreadyFailed || !record.errorCode) record.errorCode = /^exited \d+ \d+\s*$/.test(status) ? "omp_exited" : record.commandPath ? "launch_unconfirmed" : "not_running";
+        record.phase = !record.commandPath || workerDead || /^exited \d+ \d+\s*$/.test(status) ? "failed" : "outcome_unknown";
+        if (!alreadyFailed || !record.errorCode) record.errorCode = /^exited \d+ \d+\s*$/.test(status) || workerDead ? "omp_exited" : record.commandPath ? "launch_unconfirmed" : "not_running";
         return undefined;
       });
     } catch (error) {
@@ -358,11 +387,12 @@ export class HistoryRecoveryCoordinator {
       validation_failed: "历史文件、目录或恢复身份校验失败，请刷新列表或检查 Mac。",
       not_running: "原运行实例已退出，可以重新恢复。",
     };
-    const data: Record<string, unknown> = { operationId: record.operationId, recoveryState: state, phase: record.phase === "ready" && !meta ? "verifying" : record.phase, canRetry: record.phase === "failed", branchPolicy: "last_recorded_or_live", approvalLocation: "mac_terminal", ...(record.errorCode ? { errorCode: record.errorCode, message: errors[record.errorCode] ?? "恢复未完成，请检查 Mac 后重试。" } : {}) };
+    const source = meta?.source ?? record.source ?? "terminal";
+    const data: Record<string, unknown> = { operationId: record.operationId, recoveryState: state, phase: record.phase === "ready" && !meta ? "verifying" : record.phase, canRetry: record.phase === "failed", branchPolicy: "last_recorded_or_live", approvalLocation: source === "managed" ? "phone" : "mac_terminal", ...(record.errorCode ? { errorCode: record.errorCode, message: errors[record.errorCode] ?? "恢复未完成，请检查 Mac 后重试。" } : {}) };
     if (record.modelSelection) data.modelSelection = { ...record.modelSelection, requested: { ...record.modelSelection.requested } };
     if (meta && record.phase === "ready") {
-      const { persistedSessionFile: _file, processId: _pid, instanceId: _instance, launchId: _launch, ...status } = meta;
-      Object.assign(data, { sessionId: meta.sessionId, source: "terminal", status: { ...status, source: "terminal", state: "running", availability: "live", canControl: true } });
+      const { persistedSessionFile: _file, processId: _pid, instanceId: _instance, launchId: _launch, fileIdentity: _identity, rewriteGeneration: _generation, ...status } = meta;
+      Object.assign(data, { sessionId: meta.sessionId, source, status: { ...status, source, state: "running", availability: "live", canControl: true } });
     }
     return data;
   }
@@ -393,9 +423,11 @@ export class HistoryRecoveryCoordinator {
       return false;
     }
     let allowed = false;
+    const previousIdentity = record.fileIdentity;
     try {
       allowed = await this.#options.history.resumeStored(record.target, async target => {
         const fileInfo = await lstat(target.file);
+        await this.#adoptRewrite(record, meta, `${fileInfo.dev}:${fileInfo.ino}`);
         if (record.fileIdentity !== `${fileInfo.dev}:${fileInfo.ino}`) return false;
         const candidates = (await this.#options.bridge.instances()).filter(candidate => candidate.persistedSessionId === target.id || candidate.sessionId === meta.sessionId || candidate.launchId === record.launchId);
         if (candidates.length !== 1 || candidates[0]!.instanceId !== record.instanceId || !meta.persistedSessionFile || await realpath(meta.persistedSessionFile) !== target.file || await realpath(meta.cwd) !== target.cwd) return false;
@@ -412,6 +444,7 @@ export class HistoryRecoveryCoordinator {
       allowed = false;
     }
     if (!allowed) { record.phase = "blocked"; record.errorCode = "validation_failed"; await this.#save(record); }
+    else if (record.fileIdentity !== previousIdentity) await this.#save(record);
     return allowed && record.phase === "ready";
   }
 

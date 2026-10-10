@@ -1,6 +1,53 @@
 # pi-remote 开发进度
 
-更新时间：2026-10-08
+更新时间：2026-10-10
+
+## 2026-10-10：统一会话记录、直接发送续接与全端替换
+
+- [x] 会话记录统一包含在线、空闲与离线历史，在线条目补齐排序时间；续接后的在线实例继续保留在记录中，分页刷新不提前删除其他页的实例。
+- [x] 移除历史页“继续对话”按钮，直接使用输入框发送；恢复及模型确认完成后才投递，断线、切页、失败保留草稿，成功确认且草稿未改时才清空。
+- [x] 按用户授权重新构建并升级安装、启动实体 iPhone 17 客户端；Mac 助手原位替换并更新 pi/OMP 桥接扩展；东京 Relay 替换为 `session-records-20261009`，升级健康检查通过，原凭据和其他容器不变。
+- [x] 助手退出关闭了三个空闲后台实例；使用已安装包的正式恢复实现恢复至原历史，三个原 ID 均 ready，未发送提示词、未变更模型。76 条会话记录全部分页无重复且排序时间有效。
+- [ ] 助手公网连接尚未恢复；最新公网健康检查 `status=ok`、`agentConnected=false`，本机解析和 SSH 通道不稳定，完整手机至 Mac 在线验收未完成。
+- [ ] 扩展 UI 回归中的分页、分支回切和键盘阅读定位仍不稳定；相关试验性滚动修改已撤回。
+
+验证：TypeScript 类型检查及全量隔离后端回归 225 通过、6 预设跳过、0 失败；Mac SwiftPM、supervisor 生命周期、打包运行时、arm64 与签名校验通过；最终模拟器直接发送续接和恢复前选择模型两项通过。部署版本、备份与回退状态见 [东京部署说明](deploy/TOKYO.md)。以下章节保留先前交付时的历史状态。
+
+
+## 2026-10-09：实体手机模型拉取失败与发送锁定修复
+
+实体截图的 `request.payload.method is not a known method: "model.list"` 源于公网 Relay 仍运行 `terminal-bridge-20260918`；Mac Agent 已支持模型接口，旧 Relay 在转发前拒绝且未带 requestId，手机无法完成模型确认，导致发送被禁用。
+
+- [x] Relay 握手新增可转发方法列表，模型能力同时受 Agent 和 Relay 约束；请求解析失败保留 requestId，不再使客户端等待到超时。
+- [x] iOS 对旧 Relay 的明确模型方法拒绝作连接内能力降级，未切模型的会话可沿用当前模型发送；曾发生且结果未知的切换按会话保留门禁，必须读取实际模型后才解锁。换会话、重连、空模型返回均有针对性回归。
+- [x] 模型读取有加载、失败和重试入口；成功清除读取错误，自动刷新不重复替换尚在进行的查询。
+- [x] 用户明确授权“升级 Relay 并更新手机”；新镜像在 Mac 构建为 linux/amd64，部署前验证模型与发送协议。只重建 `pi-remote-relay`，保留 Token/.env、原网络和 Caddy，其他容器 ID 均未变化，健康检查为 healthy。
+- [x] 真实公网链路只读取得 29 个可用模型及当前模型，原会话空闲且可控制，后台 OMP PID/启动身份不变；未发送用户提示词、未切换用户会话模型。将真实模型/状态最小返回数据交给 iOS RelayClient 验证，发送门禁已满足。
+- [x] 修复版签名构建并升级安装到实体 iPhone 17，`devicectl` 确认前台启动成功，保留应用数据。产物 `/tmp/pi-remote-model-protocol-device-build/Build/Products/Debug-iphoneos/PiRemote.app`；安装/启动记录 `/tmp/pi-remote-model-protocol-device-install.json`、`/tmp/pi-remote-model-protocol-device-launch.json`。
+
+验证：TypeScript 类型检查、Swift SessionCreationTests（旧 Relay 有/无 requestId、降级不反复开启、重连恢复、读取重试、未知切换不能绕过、空响应保护）、Relay 专项及 Impeccable 定点检测通过；全量 `PI_STRICT_RUNTIME=1 npm test` 225 项，224 通过、1 项预设跳过、0 失败。
+
+服务器镜像 `pi-remote-relay:model-protocol-20261009`（同时标记 latest）；已验证最新项目备份 `/var/backups/pi-remote/20261009-before-model-protocol/project.tar.gz`，SHA-256 `0d31980d91953291cb83255dc7260b15006979045cd92c235e49a2867030b795`。仅在验证新备份后清理本项目上一份备份；回退旧镜像保留为 `pi-remote-relay:before-model-fix-20261009`。Mac 助手/OMP 未重启，实体用户发送尚未代为执行。
+
+
+## 2026-10-09：第三、四阶段——原历史后台续接与子 agent 模型隔离
+
+本轮完成第三、四阶段；第五阶段的设备添加/扫码收尾和实体双端联合验收不在此次完成范围内。没有控制用户真实工作会话、改写全局 OMP/角色配置或部署服务器。
+
+- [x] 离线恢复默认使用 `src/background/` 私有 socket 宿主，不调用 Terminal；在线旧终端只复用。沿用原恢复协调器，双客户端合并、结果未知只查询、持续权限门禁及 Agent 重启重连同一实例。
+- [x] 固定 OMP 18.6.3 的独立 `runtime/omp/`：首读/扩展初始化/首写前取得原生 lease，严格固定原文件、原 ID 和恢复分支，竞争/隐式分叉/删除/替换/权限失效明确失败；原子标题重写安全更新身份代次，崩溃释放原生锁后可显式恢复。
+- [x] 后台原历史使用 `managed:` ID 复用现有手机时间线，接通早期分页、大工具详情、实时输出、模型查询/切换、发送及停止。后台退出后读取原归档并提供显式恢复入口。
+- [x] 确认/选择/输入/编辑请求绑定运行实例和请求编号，断线后恢复同一待确认；旧请求/旧弹层/旧回调不能污染新会话。结构化 Ask 当前明确取消，自定义终端 UI 明确拒绝，不自动审批。
+- [x] 独立子模型策略保留 profile、agent/frontmatter、角色及项目覆盖。未指定、`@default`、混合继承和间接角色使用启动时独立默认；指定模型缺失明确失败，鉴权和重试回退禁止静默采用父会话当前模型。受控终端、RPC 与后台共用策略；全局旧终端只提示其隔离能力尚未启用，外部 Claude/Codex 路由不变。
+
+验证：`npm run typecheck` 与 `PI_STRICT_RUNTIME=1 npm test` 共 224 项，223 通过、1 项旧 live Pi 按预设跳过、0 失败；另用专用合成历史、真实 Relay 与后台 OMP，取得真实 `anyyu-codex/gpt-6-astra` 回复并成功停止，核实原文件/ID/旧记录/分支、分页、工具详情、唯一实例及无自动审批。实际 native 子会话在隔离流式 provider 持续运行，主模型 A→B 不替换运行中 child，后续 child 仍请求预定独立模型；RPC 和原生 PTY 终端两路径均通过，另验证角色、继承、档位、模型缺失与鉴权回退身份。
+
+iOS：Swift `SessionCreationTests`（新增后台归档续接、时间线、编辑预填、审批与连接代次保护）及 `TerminalCallbackGuardTests` 通过，Debug 模拟器构建通过；确认弹层深浅色实际截图检查通过，Impeccable 定点检测成功且无输出。Mac：arm64 release 打包/签名、SwiftPM、supervisor 取消/强退及 Pi/Claude 独立生命周期验证通过，包内含 Bun 和固定受控 OMP。
+
+最终 Mac 包已逐文件同步最后的权限和兼容性修正并重新签名；直接使用包内 Bun/OMP，原文件独占、竞争拒绝、合法原子重写、崩溃释放、权限失效和删除不生成替代历史的两项实际运行时验收通过。
+
+交付状态：Mac 产物 `macos/dist/Pi Remote.app`；iOS 模拟器产物 `/tmp/pi-remote-background-build/Build/Products/Debug-iphonesimulator/PiRemote.app`。2026-10-09 已按用户要求签名构建当前 iOS 源码并升级安装到实体 iPhone 17（iOS 27.0.1），`devicectl` 确认安装及前台启动成功，未卸载或清空应用数据；真机产物位于 `/tmp/pi-remote-background-device-build/Build/Products/Debug-iphoneos/PiRemote.app`，安装和启动记录为 `/tmp/pi-remote-background-device-install.json`、`/tmp/pi-remote-background-device-launch.json`。用户运行中的 Mac 助手未替换/重启，服务器未部署；实体键盘、长文本与新版后台双端联合体验仍需第五阶段验收。
+
 
 ## 2026-10-08：《Pi Remote 修复顺序》第一、二阶段
 

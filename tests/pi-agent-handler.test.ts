@@ -65,7 +65,7 @@ test("session.list reports the current process state", async () => {
   const { manager, handler } = createHarness();
   try {
     assert.deepEqual(await handler(requestFrame("r1", "session.list")), {
-      ok: true, data: { sessions: [], capabilities: { timelineV2: true, ompArchiveRead: false, historyPagination: true, toolDetails: true, historyResume: false, historyRecoveryOperations: false, projectSelection: true, modelSelection: true, modelCatalog: false } },
+      ok: true, data: { sessions: [], capabilities: { timelineV2: true, timelineAnchors: true, ompArchiveRead: false, historyPagination: true, toolDetails: true, historyResume: false, historyRecoveryOperations: false, projectSelection: true, modelSelection: true, modelCatalog: false } },
     });
 
     await handler(requestFrame("r2", "session.start", { params: { sessionId: "s1" } }));

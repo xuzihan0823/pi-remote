@@ -37,11 +37,25 @@ writeFileSync(archiveFile, [{ type: "title", title: "合成历史会话", v: 1 }
 let liveEntries = entries(90);
 let idle = true;
 let controlCalls = 0;
+const models = [
+  { provider: "synthetic", modelId: "a", name: "合成模型 A" }, { provider: "synthetic", modelId: "b", name: "合成模型 B" },
+  ...Array.from({ length: 30 }, (_, i) => ({ provider: "synthetic-extra", modelId: `extra-${i}`, name: `滚动验收模型 ${String(i + 1).padStart(2, "0")}` })),
+];
+let activeModel = models[0]!;
+let modelSwitchCalls = 0;
+const setModel = async (model: unknown): Promise<boolean> => {
+  const selected = models.find(value => value === model);
+  if (!selected) return false;
+  activeModel = selected;
+  modelSwitchCalls++;
+  return true;
+};
 const handlers = new Map<string, ((event: { type: string; message?: PiMessage }, ctx: typeof context) => unknown)[]>();
 const context = { hasUI: true, mode: "tui", cwd: workspace,
+  models: { list: () => models, current: () => activeModel },
   sessionManager: { getSessionId: () => "ui-live-fixture", getSessionFile: (): string | undefined => undefined, getSessionName: () => "合成实时会话", getBranch: () => liveEntries },
   ui: { notify: () => {} }, isIdle: () => idle, abort: () => { controlCalls++; } };
-bridgeExtension({ on: (event, handler) => { handlers.set(event, [...(handlers.get(event) ?? []), handler]); }, sendUserMessage: () => { controlCalls++; } });
+bridgeExtension({ on: (event, handler) => { handlers.set(event, [...(handlers.get(event) ?? []), handler]); }, sendUserMessage: () => { controlCalls++; }, setModel });
 for (const handler of handlers.get("session_start") ?? []) await handler({ type: "session_start" }, context);
 const bridge = new TerminalSessionBridge({ workspaceRoot: workspace, bridgeDir });
 const history = new OmpHistoryIndex({ workspaceRoot: workspace, roots: [archiveRoot] });
@@ -64,7 +78,7 @@ const launcher = {
         getBranch: () => archived.filter(entry => entry.id !== "sibling"),
       } };
       resumedContext = nextContext;
-      bridgeExtension({ on: (event, handler) => { resumedHandlers.set(event, [...(resumedHandlers.get(event) ?? []), handler]); }, sendUserMessage: () => { controlCalls++; } });
+      bridgeExtension({ on: (event, handler) => { resumedHandlers.set(event, [...(resumedHandlers.get(event) ?? []), handler]); }, sendUserMessage: () => { controlCalls++; }, setModel });
       for (const handler of resumedHandlers.get("session_start") ?? []) await handler({ type: "session_start" }, nextContext);
       await new Promise<void>(resolveTurn => setImmediate(resolveTurn));
     }
@@ -77,15 +91,22 @@ const relayLog: string[] = [];
 const { server } = await startTestServer({ relayPort: 18789, piWorkspaceRoot: workspace },
   { logger: message => { relayLog.push(message); if (relayLog.length > 100) relayLog.shift(); } });
 const client = new AgentClient({ url: "ws://127.0.0.1:18789/ws/agent", token: TEST_TOKEN, deviceId: "synthetic-ui-agent",
-  handler: createPiAgentHandler({ manager, workspaceRoot: workspace, terminalBridge: bridge, history, terminalLauncher: launcher, runtime: "omp" }) });
+  handler: createPiAgentHandler({ manager, workspaceRoot: workspace, terminalBridge: bridge, history, terminalLauncher: launcher, runtime: "omp", modelCatalog: async () => models }) });
 await client.connect();
 const controller = createServer(async (request, response) => {
   if (request.url === "/append" && request.method === "POST") {
     const previous = liveEntries.at(-1)?.id ?? null;
     liveEntries.push({ type: "message", id: `append-${liveEntries.length}`, parentId: previous,
       message: { role: "assistant", content: [{ type: "text", text: `新到达合成消息 ${liveEntries.length}，不应抢走旧消息阅读位置。` }] } });
+  } else if (request.url === "/long-reply" && request.method === "POST") {
+    liveEntries.push({ type: "message", id: "long-reply", parentId: liveEntries.at(-1)?.id ?? null,
+      message: { role: "assistant", content: [{ type: "text", text: "## 完整正文验收\n\n" + "这是用于完整正文阅读的合成段落。".repeat(180) + "\n\n**完整正文最后一行**" }] } });
+  } else if (request.url === "/failed-reply" && request.method === "POST") {
+    liveEntries.push({ type: "message", id: "failed-reply", parentId: liveEntries.at(-1)?.id ?? null,
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: "unknown certificate verification error" } });
   } else if (request.url === "/reset" && request.method === "POST") {
     liveEntries = entries(90); idle = true; controlCalls = 0;
+    activeModel = models[0]!; modelSwitchCalls = 0;
     if (resumedContext) {
       for (const handler of resumedHandlers.get("session_shutdown") ?? []) await handler({ type: "session_shutdown" }, resumedContext);
       resumedContext = undefined;
@@ -94,7 +115,7 @@ const controller = createServer(async (request, response) => {
     resumeCalls = 0;
   }
   response.setHeader("Content-Type", "application/json");
-  response.end(JSON.stringify({ ready: true, controlCalls, resumeCalls, liveMessages: liveEntries.length, relayLog }));
+  response.end(JSON.stringify({ ready: true, controlCalls, resumeCalls, modelSwitchCalls, activeModel, liveMessages: liveEntries.length, relayLog }));
 });
 await new Promise<void>((resolveListen, reject) => { controller.once("error", reject); controller.listen(18790, "127.0.0.1", resolveListen); });
 console.log("SYNTHETIC_HISTORY_UI_READY");

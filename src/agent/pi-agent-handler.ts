@@ -18,6 +18,7 @@ import type { HistoryRecoveryCoordinator } from "../terminal/history-recovery.ts
 import { browseProjectDirectory, existingProjects, resolveProjectDirectory } from "../projects.ts";
 import type { ModelCatalog } from "../pi/model-catalog.ts";
 import { resolveTerminalCwd } from "../terminal/launcher.ts";
+import { isBackgroundSessionId, type BackgroundHost } from "../background/host.ts";
 
 export interface PiAgentHandlerOptions {
   manager: PiProcessManager;
@@ -26,6 +27,7 @@ export interface PiAgentHandlerOptions {
   terminalLauncher?: Pick<TerminalSessionLauncher, "start"> & Partial<Pick<TerminalSessionLauncher, "resume">>;
   history?: OmpHistoryIndex;
   recovery?: HistoryRecoveryCoordinator;
+  backgroundHost?: BackgroundHost;
   runtime?: "omp" | "pi";
   modelCatalog?: ModelCatalog;
   emitSessionEvent?: (sessionId: string, event: GatewayEvent) => void;
@@ -49,6 +51,9 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
       if (!terminalBridge) throw new HandlerError("unknown_session", "终端连接不可用");
       return terminalBridge.getModel(id);
     }
+    if (options.backgroundHost && isBackgroundSessionId(id)) {
+      return options.backgroundHost.getModel(id);
+    }
     const state = await manager.send<{ model?: unknown }>(id, { type: "get_state" });
     return { sessionId: id, model: publicModel(state?.model) };
   };
@@ -63,6 +68,11 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
         if (await options.history?.hasConflict(meta)) throw new HandlerError("invalid_frame", "会话存在冲突副本，已禁止控制");
         if (meta.canControl === false || options.recovery && !await options.recovery.canControl(meta)) throw new HandlerError("session_busy", "会话尚未通过恢复验证，已禁止控制");
         return await terminalBridge.setModel(id, selection);
+      }
+      if (options.backgroundHost && isBackgroundSessionId(id)) {
+        const meta = await options.backgroundHost.get(id);
+        if (await options.history?.hasConflict(meta) || options.recovery && !await options.recovery.canControl(meta)) throw new HandlerError("session_busy", "会话尚未通过恢复验证或存在冲突");
+        return options.backgroundHost.setModel(id, selection);
       }
       const client = manager.get(id);
       if (!client) throw new HandlerError("unknown_session", "会话已关闭，请刷新列表");
@@ -108,6 +118,13 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
 
   const listSessions = async (): Promise<Record<string, unknown>[]> => {
     const sessions: Record<string, unknown>[] = manager.list().map(toManagedSessionEntry);
+    if (options.backgroundHost) {
+      await options.recovery?.reconcile();
+      for (const meta of await options.backgroundHost.list()) {
+        const { persistedSessionFile: _file, processId: _pid, instanceId: _instance, launchId: _launch, fileIdentity: _identity, rewriteGeneration: _generation, ...status } = meta;
+        sessions.push({ ...status, source: "managed", state: "running" });
+      }
+    }
     if (!terminalBridge) return sessions;
 
     let terminalSessions: TerminalSessionMeta[];
@@ -147,6 +164,10 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
         if (await options.history?.hasConflict(meta)) throw new HandlerError("invalid_frame", "会话存在冲突副本，已禁止控制");
         if (meta.canControl === false || options.recovery && !await options.recovery.canControl(meta)) throw new HandlerError("session_busy", "会话尚未通过恢复验证，已禁止控制");
       }
+      if (sessionId && options.backgroundHost && isBackgroundSessionId(sessionId) && ["session.prompt", "session.abort", "ui.response", "session.set_model"].includes(method)) {
+        const meta = await options.backgroundHost.get(sessionId);
+        if (await options.history?.hasConflict(meta) || options.recovery && !await options.recovery.canControl(meta)) throw new HandlerError("session_busy", "原会话尚未验证或存在冲突，已禁止控制");
+      }
       switch (method) {
         case "session.list": {
           if (params.projectView === "directory") {
@@ -172,9 +193,10 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
               if (!session.canControl) session.error = "会话存在冲突副本，已禁止控制";
             }
           }
-          const capabilities = { timelineV2: true, ompArchiveRead: Boolean(options.history), historyPagination: true, toolDetails: true,
-            historyResume: options.runtime === "omp" && Boolean(options.history && options.terminalLauncher?.resume),
+          const capabilities = { timelineV2: true, timelineAnchors: true, ompArchiveRead: Boolean(options.history), historyPagination: true, toolDetails: true,
+            historyResume: options.runtime === "omp" && Boolean(options.history && (options.backgroundHost || options.terminalLauncher?.resume)),
             historyRecoveryOperations: options.runtime === "omp" && Boolean(options.recovery), projectSelection: true,
+            ...(options.backgroundHost ? { backgroundHistoryResume: true } : {}),
             modelSelection: true, modelCatalog: Boolean(options.modelCatalog) };
           if (params.viewVersion !== 2 || params.includeArchived !== true || !options.history) {
             return { ok: true, data: { sessions: live, capabilities } };
@@ -186,6 +208,7 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
         case "model.list": {
           if (sessionId) {
             if (params.cwd !== undefined || params.historySessionId !== undefined || params.mode !== undefined) throw new HandlerError("invalid_frame", "会话模型列表不能同时指定新建参数");
+            if (options.backgroundHost && isBackgroundSessionId(sessionId)) return { ok: true, data: await options.backgroundHost.models(sessionId) };
             if (isTerminalSessionId(sessionId)) {
               if (!terminalBridge) throw new HandlerError("unknown_session", "终端连接不可用");
               return { ok: true, data: await terminalBridge.models(sessionId) };
@@ -238,6 +261,17 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
               return { ok: true, data: { ...data, canControl: false } };
             }
             return { ok: true, data };
+          }
+          if (options.backgroundHost && isBackgroundSessionId(sessionId)) {
+            try {
+              const data = await options.backgroundHost.view(sessionId, params);
+              const meta = await options.backgroundHost.get(sessionId);
+              const canControl = !(await options.history?.hasConflict(meta)) && (!options.recovery || await options.recovery.canControl(meta));
+              return { ok: true, data: { ...data, canControl } };
+            } catch (error) {
+              if (!(error instanceof TerminalBridgeError) || error.code !== "unknown_session" || !options.history) throw error;
+              return { ok: true, data: await options.history.archivedForPersistedId(sessionId.slice("managed:".length), params) };
+            }
           }
           return {
             ok: false,
@@ -300,6 +334,10 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
             await terminalBridge.prompt(sessionId, message);
             return { ok: true, data: { sessionId, queued: true } };
           }
+          if (options.backgroundHost && isBackgroundSessionId(sessionId)) {
+            await options.backgroundHost.prompt(sessionId, message);
+            return { ok: true, data: { sessionId, queued: true } };
+          }
           await manager.prompt(sessionId, message, Array.isArray(params.images) ? { images: params.images } : {});
           return { ok: true, data: { sessionId, queued: true } };
         }
@@ -308,6 +346,10 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
           if (!sessionId) throw new HandlerError("invalid_frame", "session.abort requires sessionId");
           if (terminalBridge && isTerminalSessionId(sessionId)) {
             await terminalBridge.abort(sessionId);
+            return { ok: true, data: { sessionId, aborted: true } };
+          }
+          if (options.backgroundHost && isBackgroundSessionId(sessionId)) {
+            await options.backgroundHost.abort(sessionId);
             return { ok: true, data: { sessionId, aborted: true } };
           }
           await manager.abort(sessionId);
@@ -326,6 +368,10 @@ export function createPiAgentHandler(options: PiAgentHandlerOptions): AgentReque
                 "extension UI prompts for terminal sessions must be answered in the Mac terminal",
               ),
             };
+          }
+          if (options.backgroundHost && isBackgroundSessionId(sessionId)) {
+            await options.backgroundHost.respondToUi(sessionId, requestId, asDialogResponse(params.response));
+            return { ok: true, data: { sessionId, requestId } };
           }
           const client = manager.get(sessionId);
           if (!client) throw new HandlerError("unknown_session", `No pi process for session "${sessionId}"`);

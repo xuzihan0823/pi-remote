@@ -14,6 +14,7 @@ struct SessionParsingTests {
         try resetIsolatesSwitchedSessions()
         try failedTerminalSnapshotIsOffline()
         try groupsSessionsByProject()
+        try historyIncludesRunningAndResumedSessions()
         print("PASS: session.list 字段解析、运行判定与终端快照行为全部通过")
     }
 
@@ -153,6 +154,15 @@ struct SessionParsingTests {
         try expect(groups.map(\.name) == ["beta", "alpha", SessionProjectGroup.ungroupedName], "项目按最近会话排序，未归属放最后")
         try expect(groups[1].sessions.map(\.id) == ["a2", "a1"], "项目内按时间倒序")
         try expect(Set(groups[2].sessions.map(\.id)) == ["t1", "n1"], "/tmp 与无项目会话归入未归属项目")
+    }
+
+    static func historyIncludesRunningAndResumedSessions() throws {
+        let archive = SessionItem(id: "history:old", title: "只回复 ok", state: .unknown, availability: "archived")
+        let live = SessionItem(id: "terminal:restored", title: archive.title, state: .running, source: .terminal, activity: .busy)
+        let idle = SessionItem(id: "managed:new", title: "刚开的对话", state: .running, activity: .idle)
+        try expect([archive, live, idle].allSatisfy(SessionFilter.history.matches), "记录必须同时显示离线、运行中与空闲会话，不能因续接而消失")
+        try expect(SessionFilter.running.matches(live) && !SessionFilter.running.matches(archive), "记录统一不改变进行中筛选")
+        try expect(SessionFilter.allCases.map(\.rawValue) == ["会话记录", "进行中", "待回应"], "记录是主列表，不再与只读历史重复分栏")
     }
 
     private static func require<T>(_ value: T?) throws -> T {

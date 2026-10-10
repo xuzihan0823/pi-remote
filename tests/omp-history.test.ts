@@ -278,6 +278,24 @@ test("tool projection pairs call IDs, not names/order, and refuses conflicting I
   const items = page.items as Record<string, unknown>[];
   assert.ok(items.every(item => item.arguments === undefined && item.result === undefined), "only previews and opaque detail references are transmitted");
 });
+test("failed assistant replies remain visible even with empty content, with bounded redacted error details", () => {
+  const entries = [
+    { type: "message", id: "empty-error", message: { role: "assistant", content: [], stopReason: "error", errorMessage: "unknown certificate verification error" } },
+    { type: "message", id: "partial-error", message: { role: "assistant", content: [{ type: "text", text: "partial reply" }], stopReason: "error", errorMessage: "api_key=synthetic-secret " + "中".repeat(3000) } },
+    { type: "message", id: "ok", message: { role: "assistant", content: [{ type: "text", text: "finished" }], stopReason: "stop" } },
+  ];
+  const projection = projectTranscript(entries);
+  const failed = projection.items.filter(item => item.isError);
+  assert.equal(failed.length, 2);
+  assert.equal(failed[0]?.text, "消息执行失败：unknown certificate verification error");
+  assert.ok(projection.items.some(item => item.text === "partial reply"));
+  assert.ok(projection.items.some(item => item.text === "finished" && !item.isError));
+  assert.equal(failed[1]?.truncated, true);
+  assert.ok(Buffer.byteLength(failed[1]!.text!) <= 4096);
+  assert.ok(!JSON.stringify(projection).includes("synthetic-secret"));
+  assert.ok(projection.details["partial-error:error"]?.result?.endsWith("中".repeat(3000)));
+});
+
 
 test("local history roots follow profile/agent precedence without creating absent roots", () => {
   const home = "/synthetic-home";
@@ -298,6 +316,10 @@ test("mixed live/archive lists use bounded keyset pages and trustworthy identity
     const first = await index.list({}, live);
     const firstSessions = first.sessions as Record<string, unknown>[];
     assert.equal(firstSessions.length, 30);
+    assert.ok(firstSessions.every(session => typeof session.startedAt === "number" && Number.isFinite(session.startedAt)),
+      "every live entry must publish the same timestamp used for list ordering");
+    const again = await index.list({}, live);
+    assert.deepEqual(again.sessions, first.sessions, "refresh must not move live entries by resetting their discovery time");
     const second = await index.list({ cursor: first.nextCursor }, live);
     const secondSessions = second.sessions as Record<string, unknown>[];
     assert.equal(secondSessions.length, 6);
@@ -305,6 +327,10 @@ test("mixed live/archive lists use bounded keyset pages and trustworthy identity
     const reliable = [{ sessionId: "terminal:fixture", runtime: "omp", persistedSessionId: "fixture", cwd: f.workspace }];
     const deduplicated = await index.list({}, reliable);
     assert.equal((deduplicated.sessions as unknown[]).length, 1);
+    assert.equal(typeof (deduplicated.sessions as Record<string, unknown>[])[0]!.startedAt, "number",
+      "the live replacement of a resumed archive must keep a sortable timestamp");
+    const dated = await index.list({}, [{ ...reliable[0], startedAt: 1234 }]);
+    assert.equal((dated.sessions as Record<string, unknown>[])[0]!.startedAt, 1234, "explicit session timestamps remain authoritative");
     const oldExtension = [{ sessionId: "terminal:fixture", cwd: f.workspace }];
     const unmerged = await index.list({}, oldExtension);
     assert.equal((unmerged.sessions as unknown[]).length, 2, "runtime-less old extensions must not be guessed");
@@ -418,4 +444,69 @@ test("history resume reauthorizes changed files and conflicting copies before ex
     } finally { conflict.close(); }
     assert.equal(called, false);
   } finally { f.cleanup(); }
+});
+
+test("cold history lists are complete and directory changes invalidate the scan without waiting for its interval", async () => {
+  const f = fixture();
+  const index = new OmpHistoryIndex({ workspaceRoot: f.workspace, roots: [f.root], scanIntervalMs: 60_000 });
+  try {
+    f.save([msg("a", null, "first")]);
+    const initial = await index.list({});
+    assert.equal((initial.sessions as unknown[]).length, 1, "first list must await the scan, not return a partial index");
+    assert.equal(initial.indexState, "ready");
+    const bucket = join(f.root, "new-project");
+    mkdirSync(bucket, { mode: 0o700 });
+    const added = join(bucket, "new.jsonl");
+    writeFileSync(added, readFileSync(f.file, "utf8").replace('"id":"fixture"', '"id":"second"'), { mode: 0o600 });
+    const deadline = Date.now() + 2_000;
+    let sessions: Record<string, unknown>[] = [];
+    while (Date.now() < deadline) {
+      sessions = (await index.list({})).sessions as Record<string, unknown>[];
+      if (sessions.length === 2) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(sessions.length, 2, "new bucket and history must be visible before the sixty-second fallback scan");
+    rmSync(added);
+    const removedDeadline = Date.now() + 2_000;
+    while (Date.now() < removedDeadline) {
+      sessions = (await index.list({})).sessions as Record<string, unknown>[];
+      if (sessions.length === 1) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(sessions.length, 1);
+  } finally { index.close(); f.cleanup(); }
+});
+
+test("anchored live pages catch up across more than fifty new items and survive revision changes", async () => {
+  const f = fixture();
+  const index = new OmpHistoryIndex({ workspaceRoot: f.workspace, roots: [f.root] });
+  try {
+    const entries = Array.from({ length: 181 }, (_, i) => msg(`e${i}`, i ? `e${i - 1}` : null, `message ${i}`));
+    f.save(entries.slice(0, 100));
+    const alias = await aliasOf(index);
+    const view = { context: { sessionId: "managed:fixture", branchId: "live", availability: "live" as const, canControl: true, activity: "busy" }, leaf: "e99" };
+    const first = await index.get(alias, { viewVersion: 2 }, view);
+    f.save(entries);
+    view.leaf = "e180";
+    const all = (first.items as { id: string }[]).map(item => item.id);
+    let anchor = all[0]!;
+    while (true) {
+      const page = await index.get(alias, { viewVersion: 2, afterItemId: anchor }, view);
+      const ids = (page.items as { id: string }[]).map(item => item.id);
+      const overlap = all.indexOf(ids[0]!);
+      all.splice(overlap, all.length - overlap, ...ids);
+      if (!(page.page as { hasMoreAfter: boolean }).hasMoreAfter) break;
+      anchor = ids.at(-1)!;
+    }
+    assert.deepEqual(all, entries.slice(50).map(entry => `${entry.id}:block-0`), "must not skip the middle of a long catch-up");
+    const earlier = await index.get(alias, { viewVersion: 2, beforeItemId: all[0], branchId: "live" }, view);
+    assert.deepEqual((earlier.items as { id: string }[]).map(item => item.id), entries.slice(0, 50).map(entry => `${entry.id}:block-0`));
+    await assert.rejects(index.get(alias, { viewVersion: 2, beforeItemId: all[0], branchId: "other" }, view), TimelineRequestError);
+    await assert.rejects(index.get(alias, { viewVersion: 2, beforeItemId: "missing" }, view), TimelineRequestError);
+    const service = new TimelineViewService();
+    const projection = projectTranscript(entries);
+    const page = service.respond({ ...view.context, revision: "changed" }, projection, { viewVersion: 2, afterItemId: "e99:block-0" });
+    assert.equal((page.items as { id: string }[])[0]?.id, "e99:block-0", "terminal and persisted history must share anchor semantics");
+    assert.equal((page.page as { hasMoreAfter: boolean }).hasMoreAfter, true);
+  } finally { index.close(); f.cleanup(); }
 });

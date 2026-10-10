@@ -1,0 +1,11 @@
+{
+  "name": "pi-remote-omp-runtime",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "postinstall": "bun apply-patches.ts"
+  },
+  "dependencies": {
+    "@oh-my-pi/pi-coding-agent": "18.6.3"
+  }
+}

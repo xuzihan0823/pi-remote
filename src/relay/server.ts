@@ -5,6 +5,7 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import type { Config } from "../config.ts";
 import {
   RELAY_PROTOCOL_VERSION,
+  RELAY_REQUEST_METHODS,
   relayError,
   relayErrorFrame,
   parseRelayFrame,
@@ -183,7 +184,8 @@ export class RelayServer {
 
     const result = parseRelayFrame(parsed);
     if (!result.ok) {
-      sendFrame(state.socket, relayErrorFrame(result.error, { deviceId: state.peer?.deviceId }));
+      const requestId = parsed && typeof parsed === "object" && "requestId" in parsed && typeof parsed.requestId === "string" && parsed.requestId.length <= 128 ? parsed.requestId : undefined;
+      sendFrame(state.socket, relayErrorFrame(result.error, { deviceId: state.peer?.deviceId, requestId }));
       return;
     }
     const frame = result.frame;
@@ -237,6 +239,7 @@ export class RelayServer {
       payload: {
         role: state.role,
         protocolVersion: RELAY_PROTOCOL_VERSION,
+        supportedMethods: [...RELAY_REQUEST_METHODS],
         agentConnected: this.#router.hasAgent(),
         iosClients: this.#router.iosClientCount(),
       },

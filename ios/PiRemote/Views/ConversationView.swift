@@ -69,7 +69,7 @@ public struct ConversationView: View {
                                 .disabled(client.isLoadingEarlier)
                                 .accessibilityIdentifier("load-earlier")
                             }
-                            if client.isActiveTerminal {
+                            if client.usesSessionTimeline {
                                 terminalContent
                             } else {
                                 managedContent
@@ -165,11 +165,7 @@ public struct ConversationView: View {
                     }
                 }
 
-                if client.isActiveArchive {
-                    historyResumeBar
-                } else {
-                    inputBar
-                }
+                inputBar
             }
         }
         .sheet(item: client.pendingApprovalBinding) { request in
@@ -202,7 +198,7 @@ public struct ConversationView: View {
         guard let session, client.isConnected else { return }
         if client.activeSessionId != session.id {
             client.openSession(session)
-        } else if client.isActiveTerminal && !client.isActiveArchive {
+        } else if client.usesSessionTimeline && !client.isActiveArchive {
             client.startTerminalPolling()
         }
     }
@@ -220,15 +216,18 @@ public struct ConversationView: View {
 
     @ViewBuilder
     private var terminalContent: some View {
+        if let session, client.isActiveTerminal, !client.isActiveArchive, !session.subagentModelIsolation {
+            noticeLine("旧终端尚未启用子 agent 模型隔离；需要隔离时，请通过 Mac 助手启动受控 OMP。", color: DesignTokens.Colors.warning)
+        }
         if let error = client.terminal.error {
             noticeLine(error, color: DesignTokens.Colors.warning)
         }
 
         if client.terminal.messages.isEmpty, client.terminal.items.isEmpty, client.terminal.error == nil {
             Text(client.isActiveArchive ? (client.terminal.loaded ? "尚无可显示的历史正文" : "正在读取历史会话…") :
-                 (terminalOffline ? "尚未连接终端" :
-                 (!client.terminal.loaded ? "正在读取终端会话…" :
-                  (client.terminal.isBusy ? "正在运行，等待终端输出…" : "会话已就绪，发送消息开始。"))))
+                 (terminalOffline ? "会话暂时离线" :
+                 (!client.terminal.loaded ? "正在读取会话…" :
+                  (client.terminal.isBusy ? "正在运行，等待输出…" : "会话已就绪，发送消息开始。"))))
                 .font(DesignTokens.Fonts.notoRegular(13))
                 .foregroundColor(DesignTokens.Colors.textSecondary)
         }
@@ -262,7 +261,7 @@ public struct ConversationView: View {
 
     private var historyControls: some View {
         HStack {
-            Label("最后记录分支 · 只读", systemImage: "clock")
+            Label("历史记录 · 最后记录分支", systemImage: "clock")
                 .font(.caption).foregroundColor(DesignTokens.Colors.textSecondary)
             Spacer()
             if client.branches.count > 1 {
@@ -482,42 +481,6 @@ public struct ConversationView: View {
         return rest == 0 ? "\(minutes) 分钟" : "\(minutes) 分 \(rest) 秒"
     }
 
-    private var historyResumeBar: some View {
-        VStack(spacing: 8) {
-            Text(client.supportsHistoryResume ? "离线时恢复最后记录分支；在线时连接当前分支。审批可能仍需在 Mac 终端完成。" : "请更新 Mac 助手并选择 OMP，以继续历史会话")
-                .font(.caption)
-                .foregroundColor(DesignTokens.Colors.textSecondary)
-                .multilineTextAlignment(.center)
-            if let message = client.historyRecoveryMessage {
-                Label(message, systemImage: "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundColor(DesignTokens.Colors.warning)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityIdentifier("history-recovery-message")
-            }
-            Button(action: { client.resumeActiveHistory() }) {
-                HStack(spacing: 8) {
-                    if client.isResumingHistory {
-                        ProgressView().tint(DesignTokens.Colors.textOnGreen)
-                    } else {
-                        Image(systemName: "play.fill")
-                    }
-                    Text(client.historyResumeButtonTitle)
-                }
-                .font(.body.weight(.semibold))
-                .foregroundColor(DesignTokens.Colors.textOnGreen)
-                .frame(maxWidth: .infinity, minHeight: 48)
-                .background(DesignTokens.Colors.darkButton)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            }
-            .disabled(!client.isConnected || !client.agentConnected || !client.supportsHistoryResume || client.isCreatingSession)
-            .opacity(client.isConnected && client.agentConnected && client.supportsHistoryResume ? 1 : 0.5)
-            .accessibilityIdentifier("resume-history")
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 12)
-    }
-
     private var inputBar: some View {
         VStack(spacing: 8) {
             if let reconnectSeconds = client.reconnectSeconds {
@@ -526,11 +489,49 @@ public struct ConversationView: View {
                     .foregroundColor(DesignTokens.Colors.warning)
             }
 
+            if client.isResumingHistory || client.isPreparingHistoryPrompt {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(client.isResumingHistory ? client.historyRecoveryStageTitle : "正在确认会话和模型…")
+                        .font(.caption)
+                }
+                .foregroundColor(DesignTokens.Colors.textSecondary)
+            }
+            if client.isActiveArchive {
+                Text(client.supportsHistoryResume ? "发送消息时自动续接原会话" : "请更新 Mac 助手并选择 OMP，以继续历史会话")
+                    .font(.caption)
+                    .foregroundColor(DesignTokens.Colors.textSecondary)
+            }
+            if let message = client.historyRecoveryMessage, client.isActiveArchive {
+                Label(message, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundColor(DesignTokens.Colors.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("history-recovery-message")
+            }
             if terminalOffline {
-                Text("终端离线，暂时无法继续操作")
+                Text("会话离线，暂时无法继续操作")
                     .font(DesignTokens.Fonts.notoRegular(11))
                     .foregroundColor(DesignTokens.Colors.warning)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if client.supportsModelSelection && client.isSessionRunning {
+                Text("当前任务运行中，完成后即可切换模型")
+                    .font(DesignTokens.Fonts.notoRegular(11))
+                    .foregroundColor(DesignTokens.Colors.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            if let error = client.activeModelLoadError {
+                HStack(alignment: .top) {
+                    Text(error)
+                        .font(DesignTokens.Fonts.notoRegular(11))
+                        .foregroundColor(DesignTokens.Colors.warning)
+                    Spacer(minLength: 8)
+                    Button("重试") { client.refreshActiveModels() }
+                        .font(DesignTokens.Fonts.notoBold(12))
+                        .disabled(client.isLoadingActiveModels || client.isSwitchingModel || !client.isConnected)
+                }
             }
 
             VStack(alignment: .leading, spacing: 6) {
@@ -538,24 +539,36 @@ public struct ConversationView: View {
                     .font(DesignTokens.Fonts.notoRegular(14))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .lineLimit(1...4)
-                    .disabled(!client.isConnected || terminalOffline || !client.activeCanControl)
+                    .disabled(client.isActiveArchive ? !client.isConnected : (!client.isConnected || terminalOffline || !client.activeCanControl))
+                    .accessibilityIdentifier("conversation-input")
                     .padding(.horizontal, 6)
                     .frame(minHeight: 32)
 
                 HStack(spacing: 10) {
                     Spacer(minLength: 0)
 
-                    if client.supportsModelSelection, !client.activeModels.isEmpty || client.activeModel != nil {
+                    if client.isActiveArchive && client.supportsModelCatalog {
+                        ModelMenu(
+                            models: client.activeModels,
+                            selected: client.historyResumeModel,
+                            isLoading: client.isLoadingActiveModels,
+                            defaultTitle: "沿用历史模型",
+                            onSelect: { client.selectHistoryResumeModel($0) }
+                        )
+                        .disabled(!client.canSelectHistoryModel)
+                        .accessibilityIdentifier("history-resume-model")
+                    }
+                    if !client.isActiveArchive && client.supportsModelSelection {
                         ModelMenu(
                             models: client.activeModels,
                             selected: client.activeModel,
-                            isLoading: client.isSwitchingModel,
-                            defaultTitle: "当前模型",
+                            isLoading: client.isSwitchingModel || client.isLoadingActiveModels,
+                            defaultTitle: client.activeModelLoadError == nil ? "当前模型" : "读取失败",
                             onSelect: { model in
                                 if let model { client.setActiveModel(model) }
                             }
                         )
-                        .disabled(!client.activeCanControl || client.isSessionRunning || client.isSwitchingModel || client.isSendingPrompt)
+                        .disabled(!client.canSelectActiveModel)
                     }
 
                     if client.isSessionRunning {
@@ -590,7 +603,7 @@ public struct ConversationView: View {
             HStack(spacing: 4) {
                 Image(systemName: "paperclip")
                     .font(.system(size: 10))
-                Text(client.isActiveTerminal ? "确认和选择请在 Mac 终端完成" : "在你的 Mac 上执行")
+                Text(client.isActiveTerminal && !client.isActiveArchive ? "确认和选择请在 Mac 终端完成" : "在你的 Mac 上执行")
                     .font(DesignTokens.Fonts.notoRegular(11))
             }
             .foregroundColor(DesignTokens.Colors.textSecondary)
@@ -600,20 +613,20 @@ public struct ConversationView: View {
     }
 
     private var placeholder: String {
-        if client.isActiveTerminal {
-            if terminalOffline { return "终端离线，无法发送" }
-            if client.terminal.isBusy { return "终端正在运行，请等待完成…" }
-            return client.terminal.loaded ? "继续输入…" : "正在读取终端状态…"
+        if client.isActiveArchive { return "继续输入…" }
+        if client.usesSessionTimeline {
+            if terminalOffline { return "会话离线，无法发送" }
+            if client.terminal.isBusy { return "正在运行，请等待完成…" }
+            return client.terminal.loaded ? "继续输入…" : "正在读取会话状态…"
         }
         return client.sessionSettled ? "描述你想完成的工作…" : "补充要求，或开始下一步…"
     }
-
     private var terminalOffline: Bool {
-        client.isActiveTerminal && (!client.isConnected || !client.agentConnected || client.terminal.isOffline)
+        !client.isActiveArchive && client.usesSessionTimeline && (!client.isConnected || !client.agentConnected || client.terminal.isOffline)
     }
 
     private var canSend: Bool {
-        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && client.canSendPrompt
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && client.canSubmitPrompt
     }
 
     private func send() {
@@ -653,6 +666,7 @@ private struct ConversationScrollMetrics: Equatable {
 struct ApprovalSheet: View {
     @Bindable var client: RelayClient
     let request: ApprovalRequest
+    @State private var responseText = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -688,6 +702,14 @@ struct ApprovalSheet: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         .textSelection(.enabled)
                 }
+                if request.method == "input" || request.method == "editor" {
+                    TextField("输入回应", text: $responseText, axis: .vertical)
+                        .lineLimit(request.method == "editor" ? 4...8 : 1...3)
+                        .padding(12)
+                        .background(DesignTokens.Colors.glassLight)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                        .autocorrectionDisabled()
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 20)
@@ -698,7 +720,11 @@ struct ApprovalSheet: View {
             VStack(spacing: 10) {
                 if request.options.isEmpty {
                     Button {
-                        client.respondToUiRequest(request, approved: true)
+                        if request.method == "input" || request.method == "editor" {
+                            client.respondToUiRequest(request, choice: responseText)
+                        } else {
+                            client.respondToUiRequest(request, approved: true)
+                        }
                     } label: {
                         Text(request.method == "confirm" ? "允许这一次" : "确认")
                             .font(DesignTokens.Fonts.notoBold(15))
@@ -710,7 +736,7 @@ struct ApprovalSheet: View {
                     }
 
                     Button {
-                        client.respondToUiRequest(request, approved: false)
+                        client.cancelUiRequest(request)
                     } label: {
                         Text(request.method == "confirm" ? "不允许" : "取消")
                             .font(DesignTokens.Fonts.notoBold(15))
@@ -749,6 +775,7 @@ struct ApprovalSheet: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(DesignTokens.Colors.background)
+        .onAppear { responseText = request.initialValue }
     }
 }
 

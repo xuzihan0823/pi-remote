@@ -86,6 +86,7 @@ export interface RelayHelloAckFrame {
     protocolVersion: number;
     agentConnected: boolean;
     iosClients: number;
+    supportedMethods?: string[];
   };
 }
 
@@ -266,6 +267,7 @@ function parseHelloAck(record: Record<string, unknown>): RelayParseResult {
         protocolVersion: typeof payload?.protocolVersion === "number" ? payload.protocolVersion : RELAY_PROTOCOL_VERSION,
         agentConnected: payload?.agentConnected === true,
         iosClients: typeof payload?.iosClients === "number" ? payload.iosClients : 0,
+        ...(Array.isArray(payload?.supportedMethods) && payload.supportedMethods.every(method => typeof method === "string") ? { supportedMethods: payload.supportedMethods as string[] } : {}),
       },
     },
   };
@@ -400,6 +402,8 @@ export interface SessionGetParams {
   view?: "timeline" | "branches" | "tool";
   limit?: number;
   before?: string | null;
+  afterItemId?: string;
+  beforeItemId?: string;
   branchId?: string;
   revision?: string;
   detailId?: string;

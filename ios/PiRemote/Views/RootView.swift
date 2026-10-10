@@ -100,7 +100,7 @@ public struct RootView: View {
                     if route == .conversation {
                         ConversationView(
                             client: relayClient,
-                            session: relayClient.sessions.first { $0.id == selectedSessionId },
+                            session: relayClient.sessions.first { $0.id == (relayClient.activeSessionId ?? selectedSessionId) },
                             onSidebarTapped: { setSidebar(true) }
                         )
                     } else {

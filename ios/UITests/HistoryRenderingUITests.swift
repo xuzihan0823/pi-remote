@@ -50,8 +50,8 @@ final class HistoryRenderingUITests: XCTestCase {
     func testArchiveMarkdownToolDetailsAndPaginationAnchor() async throws {
         XCTAssertTrue(app.staticTexts["合成历史会话"].waitForExistence(timeout: 15))
         app.staticTexts["合成历史会话"].tap()
-        XCTAssertTrue(app.buttons["resume-history"].waitForExistence(timeout: 10))
-        XCTAssertFalse(app.textFields.firstMatch.exists, "历史页面不能显示可执行输入框")
+        XCTAssertFalse(app.buttons["resume-history"].exists)
+        XCTAssertTrue(app.textFields["conversation-input"].waitForExistence(timeout: 10), "历史页面可直接输入，浏览时不启动恢复")
         let scroll = app.scrollViews.firstMatch
         let tableCell = app.staticTexts["a|b"]
         XCTAssertTrue(tableCell.waitForExistence(timeout: 10), "转义管道表格须显示为单元格文字")
@@ -87,23 +87,119 @@ final class HistoryRenderingUITests: XCTestCase {
         XCTAssertEqual(state["controlCalls"] as? Int, 0, "历史浏览不能执行或停止工具")
     }
 
+    func testExpandedLongReplyKeepsFullMarkdownInConversation() async throws {
+        app.staticTexts["合成实时会话"].tap()
+        XCTAssertTrue(app.textFields["继续输入…"].waitForExistence(timeout: 10))
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:18790/long-reply")!)
+        request.httpMethod = "POST"
+        _ = try await URLSession.shared.data(for: request)
+        let expand = app.buttons["展开完整正文"]
+        XCTAssertTrue(expand.waitForExistence(timeout: 10))
+        for _ in 0..<5 where !expand.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        expand.tap()
+        XCTAssertTrue(app.staticTexts["完整正文最后一行"].waitForExistence(timeout: 10),
+                      "必须读取超过 4KB 的尾部，并以 Markdown 正文显示，而不是横向纯文本详情")
+        XCTAssertTrue(app.buttons["收起完整正文"].exists)
+        attachScreenshot("long-reply-full-markdown")
+    }
+
+    func testHistoryModelCanBeSelectedBeforeResume() async throws {
+        app.staticTexts["合成历史会话"].tap()
+        let menu = app.buttons["history-resume-model"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+        XCTAssertTrue(menu.isEnabled, "只读历史不能禁用恢复前的模型选择")
+        menu.tap()
+        let selected = app.buttons["合成模型 B"]
+        XCTAssertTrue(selected.waitForExistence(timeout: 10))
+        XCTAssertTrue(selected.isEnabled, "候选模型必须可选，不能全部置灰")
+        selected.tap()
+        XCTAssertTrue(menu.label.contains("合成模型 B"))
+        attachScreenshot("history-model-selected-before-resume")
+        let (beforeData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:18790/state")!)
+        let before = try JSONSerialization.jsonObject(with: beforeData) as! [String: Any]
+        XCTAssertEqual(before["modelSwitchCalls"] as? Int, 0, "选择时不应修改只读历史")
+        XCTAssertFalse(app.buttons["resume-history"].exists)
+        let input = app.textFields["conversation-input"]
+        input.tap()
+        input.typeText("只回复 ok")
+        app.buttons["发送消息"].tap()
+        let sent = NSPredicate { _, _ in input.exists && input.value as? String == "继续输入…" }
+        await fulfillment(of: [expectation(for: sent, evaluatedWith: nil)], timeout: 15)
+        let (afterData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:18790/state")!)
+        let after = try JSONSerialization.jsonObject(with: afterData) as! [String: Any]
+        XCTAssertEqual(after["resumeCalls"] as? Int, 1)
+        XCTAssertEqual(after["modelSwitchCalls"] as? Int, 1)
+        XCTAssertEqual((after["activeModel"] as? [String: Any])?["modelId"] as? String, "b")
+        XCTAssertEqual(after["controlCalls"] as? Int, 1, "用户点击发送后只投递一次消息")
+        attachScreenshot("history-model-confirmed-after-resume")
+    }
+    func testModelListScrollsBothWaysAndSearchesWithoutSwitching() async throws {
+        app.staticTexts["合成历史会话"].tap()
+        let menu = app.buttons["history-resume-model"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+        menu.tap()
+        let list = app.collectionViews["model-selection-list"]
+        XCTAssertTrue(list.waitForExistence(timeout: 10))
+        let last = app.buttons["滚动验收模型 30"]
+        for _ in 0..<12 {
+            if last.exists && last.isHittable { break }
+            list.swipeUp()
+        }
+        XCTAssertTrue(last.isHittable, "向上滑必须能到达列表末尾")
+        let first = app.buttons["合成模型 A"]
+        for _ in 0..<12 {
+            if first.exists && first.isHittable { break }
+            list.swipeDown()
+        }
+        XCTAssertTrue(first.isHittable, "向下滑必须能返回列表开头")
+        let search = app.searchFields.firstMatch
+        search.tap()
+        search.typeText("滚动验收模型 30")
+        XCTAssertTrue(last.waitForExistence(timeout: 5))
+        last.tap()
+        XCTAssertTrue(menu.label.contains("滚动验收模型 30"))
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:18790/state")!)
+        let state = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        XCTAssertEqual(state["modelSwitchCalls"] as? Int, 0)
+        XCTAssertEqual(state["controlCalls"] as? Int, 0)
+        attachScreenshot("model-list-scrolled-and-searched")
+    }
+    func testEmptyFailedReplyShowsTheRecordedReason() async throws {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:18790/failed-reply")!)
+        request.httpMethod = "POST"
+        _ = try await URLSession.shared.data(for: request)
+        app.staticTexts["合成实时会话"].tap()
+        XCTAssertTrue(app.staticTexts["消息执行失败：unknown certificate verification error"].waitForExistence(timeout: 10))
+        attachScreenshot("failed-reply-recorded-reason")
+    }
+
+
+
     func testHistoryResumeTurnsSnapshotIntoControllableTerminal() async throws {
         app.staticTexts["合成历史会话"].tap()
-        let resume = app.buttons["resume-history"]
-        XCTAssertTrue(resume.waitForExistence(timeout: 10))
-        XCTAssertTrue(resume.isEnabled)
-        XCTAssertFalse(app.textFields.firstMatch.exists)
-        attachScreenshot("history-ready-to-resume")
-        resume.tap()
-        let input = app.textFields["继续输入…"]
-        XCTAssertTrue(input.waitForExistence(timeout: 15), "恢复成功后必须出现可交互输入框")
-        XCTAssertTrue(input.isEnabled)
-        XCTAssertFalse(resume.exists, "不得仍停留在只读历史页")
+        XCTAssertFalse(app.buttons["resume-history"].exists, "历史页不再有独立续接按钮")
+        let input = app.textFields["conversation-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        XCTAssertTrue(input.isEnabled, "历史打开后直接输入")
+        attachScreenshot("history-ready-to-send")
+        let (beforeData, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:18790/state")!)
+        let before = try JSONSerialization.jsonObject(with: beforeData) as! [String: Any]
+        XCTAssertEqual(before["resumeCalls"] as? Int, 0, "只浏览历史不启动进程")
+        input.tap()
+        input.typeText("只回复 ok")
+        app.buttons["发送消息"].tap()
+        let sent = NSPredicate { _, _ in input.exists && input.value as? String == "继续输入…" }
+        await fulfillment(of: [expectation(for: sent, evaluatedWith: nil)], timeout: 15)
         XCTAssertTrue(app.staticTexts["最后一条合成消息"].exists, "恢复后保留原历史正文")
         let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:18790/state")!)
         let state = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         XCTAssertEqual(state["resumeCalls"] as? Int, 1)
-        XCTAssertEqual(state["controlCalls"] as? Int, 0, "恢复本身不得自动发送或停止任务")
+        XCTAssertEqual(state["controlCalls"] as? Int, 1, "一次发送对应一次续接和一次投递")
+        app.buttons["open-sidebar"].tap()
+        let resumedRow = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "合成历史会话")).firstMatch
+        XCTAssertTrue(resumedRow.waitForExistence(timeout: 10), "续接后仍能在会话记录找到原对话")
+        resumedRow.tap()
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
         attachScreenshot("history-resumed-input")
     }
 
@@ -198,25 +294,26 @@ final class OfflineHistoryRecoveryUITests: XCTestCase {
         let history = app.staticTexts["离线续接真实验收"]
         XCTAssertTrue(history.waitForExistence(timeout: 20), "必须先启动真实离线 UI 验收服务")
         history.tap()
-        let resume = app.buttons["resume-history"]
-        XCTAssertTrue(resume.waitForExistence(timeout: 10))
-        XCTAssertFalse(app.textFields["继续输入…"].exists)
+        XCTAssertFalse(app.buttons["resume-history"].exists)
+        let input = app.textFields["conversation-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        XCTAssertTrue(input.isEnabled)
         let before = try await state()
         XCTAssertEqual(before["instanceCount"] as? Int, 0, "原 OMP 必须已真实退出，不能预先启动 PTY 后复用")
         XCTAssertEqual(before["launchCount"] as? Int, 0)
-        resume.tap()
-        let input = app.textFields["继续输入…"]
-        XCTAssertTrue(input.waitForExistence(timeout: 40), "真实 open/脚本/OMP/桥接就绪后才允许输入")
-        XCTAssertTrue(input.isEnabled)
+        input.tap()
+        input.typeText("这是 Pi Remote 专用续接验收。不要调用工具，只回复 OFFLINE_RESUME_OK。")
+        app.buttons["发送消息"].tap()
+        let answer = app.staticTexts["OFFLINE_RESUME_OK"]
+        XCTAssertTrue(answer.waitForExistence(timeout: 90), "发送自动恢复原会话并读取真实 OMP 回复")
         XCTAssertTrue(app.staticTexts["最后记录分支"].exists)
         XCTAssertFalse(app.staticTexts["非恢复目标分支"].exists)
         let restored = try await state()
         XCTAssertEqual(restored["launchCount"] as? Int, 1)
-        XCTAssertEqual(restored["promptCount"] as? Int, 0)
+        XCTAssertEqual(restored["promptCount"] as? Int, 1)
         XCTAssertEqual(restored["abortCount"] as? Int, 0)
         XCTAssertEqual(restored["approvalCount"] as? Int, 0)
         XCTAssertEqual(restored["originalEntriesPreserved"] as? Bool, true)
-        XCTAssertEqual(restored["noNewUserMessages"] as? Bool, true, "OMP 可标记上次未完成回合，恢复器不得投递新提示词")
         XCTAssertEqual(restored["uniqueExactInstance"] as? Bool, true)
         attach(app, name: "real-offline-restored")
         let tool = app.buttons["tool-tool-call:block-0"]
@@ -245,11 +342,6 @@ final class OfflineHistoryRecoveryUITests: XCTestCase {
         }
         XCTAssertTrue(app.staticTexts["离线验收合成记录 0"].waitForExistence(timeout: 10), "恢复后仍能分页查看早期原记录")
         if app.buttons["back-to-bottom"].exists { app.buttons["back-to-bottom"].tap() }
-        input.tap()
-        input.typeText("这是 Pi Remote 专用续接验收。不要调用工具，只回复 OFFLINE_RESUME_OK。")
-        app.buttons["发送消息"].tap()
-        let answer = app.staticTexts["OFFLINE_RESUME_OK"]
-        XCTAssertTrue(answer.waitForExistence(timeout: 90), "必须读取真实 OMP 输出，而非模拟回复")
         let send = app.buttons["发送消息"]
         XCTAssertTrue(send.waitForExistence(timeout: 30))
         input.tap()

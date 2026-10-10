@@ -13,6 +13,7 @@ RUNTIME="$CONTENTS/Resources/runtime"
 SERVER_BUNDLE="$CONTENTS/Resources/server-bundle"
 
 NODE_SRC="/usr/local/bin/node"
+BUN_SRC="$HOME/.bun/bin/bun"
 CLOUDFLARED_SRC="/opt/homebrew/bin/cloudflared"
 ICON_SRC="$REPO_ROOT/assets/branding/pi-remote-app-icon.png"
 
@@ -22,8 +23,9 @@ for command in swift sips iconutil codesign plutil lipo xattr; do
 	command -v "$command" >/dev/null 2>&1 || fail "缺少命令：$command"
 done
 
-for file in "$NODE_SRC" "$CLOUDFLARED_SRC" "$ICON_SRC" "$REPO_ROOT/package.json" \
-	"$REPO_ROOT/node_modules/ws/package.json" "$SCRIPT_DIR/runtime-supervisor.mjs"; do
+for file in "$NODE_SRC" "$BUN_SRC" "$CLOUDFLARED_SRC" "$ICON_SRC" "$REPO_ROOT/package.json" \
+	"$REPO_ROOT/node_modules/ws/package.json" "$SCRIPT_DIR/runtime-supervisor.mjs" \
+	"$REPO_ROOT/runtime/omp/node_modules/@oh-my-pi/pi-coding-agent/package.json"; do
 	[[ -e "$file" ]] || fail "缺少文件：$file"
 done
 [[ -d "$REPO_ROOT/src" ]] || fail "缺少目录：$REPO_ROOT/src"
@@ -33,7 +35,7 @@ if [[ "$(uname -m)" != "arm64" ]]; then
 fi
 
 echo "==> 核对运行时依赖架构"
-for tool in "$NODE_SRC" "$CLOUDFLARED_SRC"; do
+for tool in "$NODE_SRC" "$BUN_SRC" "$CLOUDFLARED_SRC"; do
 	archs="$(lipo -archs "$tool" 2>/dev/null || true)"
 	[[ "$archs" == *arm64* ]] || fail "$tool 不含 arm64 架构（检测到：${archs:-未知}）"
 	echo "    $tool → $archs"
@@ -75,14 +77,17 @@ SPEC
 iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 
-echo "==> 复制运行时（node、cloudflared、src、ws）"
+echo "==> 复制运行时（node、bun、受控 OMP、cloudflared、src、ws）"
 cp -L "$NODE_SRC" "$RUNTIME/node"
+cp -L "$BUN_SRC" "$RUNTIME/bun"
 cp -L "$CLOUDFLARED_SRC" "$RUNTIME/cloudflared"
-chmod 755 "$RUNTIME/node" "$RUNTIME/cloudflared"
+chmod 755 "$RUNTIME/node" "$RUNTIME/bun" "$RUNTIME/cloudflared"
 cp "$SCRIPT_DIR/runtime-supervisor.mjs" "$RUNTIME/runtime-supervisor.mjs"
 cp "$REPO_ROOT/package.json" "$RUNTIME/package.json"
 cp -R "$REPO_ROOT/src" "$RUNTIME/src"
 cp -R "$REPO_ROOT/node_modules/ws" "$RUNTIME/node_modules/ws"
+mkdir -p "$RUNTIME/runtime"
+cp -R "$REPO_ROOT/runtime/omp" "$RUNTIME/runtime/omp"
 
 echo "==> 复制独立 Claude 后端运行时"
 "$NODE_SRC" "$REPO_ROOT/backend/claude/scripts/package-runtime.mjs" "$RUNTIME/claude"
@@ -104,7 +109,7 @@ echo "==> ad-hoc 签名"
 if ! xattr -cr "$APP_DIR"; then
 	echo "警告：清理扩展属性失败，继续签名" >&2
 fi
-for tool in "$RUNTIME/node" "$RUNTIME/cloudflared"; do
+for tool in "$RUNTIME/node" "$RUNTIME/bun" "$RUNTIME/cloudflared"; do
 	if ! codesign --verify "$tool" >/dev/null 2>&1; then
 		codesign --force --sign - "$tool"
 	fi

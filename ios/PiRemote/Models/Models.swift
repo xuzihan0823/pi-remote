@@ -158,6 +158,7 @@ public struct SessionItem: Identifiable, Equatable {
     public var canControl: Bool
     public var runtime: String?
     public var project: String?
+    public var subagentModelIsolation: Bool
 
     public init(
         id: String,
@@ -172,7 +173,8 @@ public struct SessionItem: Identifiable, Equatable {
         availability: String = "live",
         canControl: Bool = true,
         runtime: String? = nil,
-        project: String? = nil
+        project: String? = nil,
+        subagentModelIsolation: Bool = false
     ) {
         self.id = id
         self.title = title
@@ -187,6 +189,7 @@ public struct SessionItem: Identifiable, Equatable {
         self.canControl = canControl && availability == "live"
         self.runtime = runtime
         self.project = project
+        self.subagentModelIsolation = subagentModelIsolation
     }
 
     public var isTerminal: Bool { source == .terminal }
@@ -201,7 +204,7 @@ public struct SessionItem: Identifiable, Equatable {
     }
 
     public var subtitle: String {
-        if isArchived { return error ?? "历史快照 · 只读 · 运行状态未知" }
+        if isArchived { return error ?? "历史会话 · 离线记录" }
         if hasPendingApproval { return "等待你确认" }
         switch activity {
         case .busy:
@@ -229,28 +232,25 @@ public struct SessionItem: Identifiable, Equatable {
 }
 
 public enum SessionFilter: String, CaseIterable, Identifiable {
-    case all = "全部"
+    case history = "会话记录"
     case running = "进行中"
     case waiting = "待回应"
-    case history = "历史"
 
     public var id: String { rawValue }
 
     public func matches(_ session: SessionItem) -> Bool {
         switch self {
-        case .all:
+        case .history:
             return true
         case .running:
             return session.isActive
         case .waiting:
             return session.hasPendingApproval
-        case .history:
-            return session.isArchived
         }
     }
 
     public func label(count: Int) -> String {
-        guard self != .all, count > 0 else { return rawValue }
+        guard self != .history, count > 0 else { return rawValue }
         return "\(rawValue) \(count)"
     }
 }
@@ -303,7 +303,8 @@ public extension SessionItem {
             availability: remote["availability"] as? String ?? "live",
             canControl: remote["canControl"] as? Bool ?? !(id.hasPrefix("history:")),
             runtime: remote["runtime"] as? String,
-            project: remote["project"] as? String
+            project: remote["project"] as? String,
+            subagentModelIsolation: remote["subagentModelIsolation"] as? Bool ?? false
         )
     }
 }
@@ -349,11 +350,12 @@ public struct TerminalSessionState: Equatable {
         self = TerminalSessionState()
     }
 
-    public mutating func apply(_ data: [String: Any], prepend: Bool = false) {
+    public mutating func apply(_ data: [String: Any], prepend: Bool = false, allowLiveRevisionChange: Bool = false) {
         let incomingBranch = data["branchId"] as? String
         let incomingRevision = data["revision"] as? String
         let changedBranch = incomingBranch != branchId
-        if prepend && (incomingBranch != branchId || incomingRevision != revision) {
+        if prepend && (incomingBranch != branchId ||
+            (incomingRevision != revision && !(allowLiveRevisionChange && availability == "live" && data["availability"] as? String == "live"))) {
             error = "历史已变化，请刷新后继续阅读"
             return
         }
@@ -386,7 +388,8 @@ public struct TerminalSessionState: Equatable {
             branchId = incomingBranch
             revision = incomingRevision
             let page = data["page"] as? [String: Any] ?? [:]
-            if prepend || !loaded || changedBranch || (!hasLoadedEarlier && availability == "live") {
+            if prepend || !loaded || changedBranch ||
+                (!hasLoadedEarlier && availability == "live" && items.first?.id == incoming.first?.id) {
                 before = page["before"] as? String
                 hasMoreBefore = page["hasMoreBefore"] as? Bool ?? false
             }
@@ -429,6 +432,7 @@ public struct ApprovalRequest: Identifiable, Equatable {
     public var message: String
     public var command: String?
     public var options: [String]
+    public var initialValue: String
 
     public init(
         id: String,
@@ -436,7 +440,8 @@ public struct ApprovalRequest: Identifiable, Equatable {
         title: String,
         message: String,
         command: String? = nil,
-        options: [String] = []
+        options: [String] = [],
+        initialValue: String = ""
     ) {
         self.id = id
         self.method = method
@@ -444,6 +449,7 @@ public struct ApprovalRequest: Identifiable, Equatable {
         self.message = message
         self.command = command
         self.options = options
+        self.initialValue = initialValue
     }
 }
 

@@ -9,13 +9,44 @@ struct TimelineItemView: View {
         if item.kind == "message" {
             VStack(alignment: item.role == "user" ? .trailing : .leading, spacing: 8) {
                 if item.role == "user" {
-                    UserMessageBubble(text: item.text ?? "")
+                    UserMessageBubble(text: messageText)
+                } else if item.isError {
+                    Label {
+                        Text(verbatim: messageText).textSelection(.enabled)
+                    } icon: {
+                        Image(systemName: "exclamationmark.circle")
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(DesignTokens.Colors.warning)
                 } else {
-                    MarkdownMessageView(text: item.text ?? "", messageID: item.id)
+                    MarkdownMessageView(text: messageText, messageID: item.id)
                 }
-                if item.truncated { detailsDisclosure(label: "正文已截断，展开已记录内容") }
+                if item.truncated {
+                    Button(expanded ? "收起完整正文" : "展开完整正文") {
+                        expanded.toggle()
+                        if expanded { loadDetails() }
+                    }
+                    .font(.caption).frame(minHeight: 44).tint(DesignTokens.Colors.accentGreen)
+                    if expanded {
+                        if let page = client.toolDetails["\(item.id):result"] {
+                            if let error = page.error {
+                                Text(error).font(.caption).foregroundColor(DesignTokens.Colors.warning)
+                                Button("重试读取正文") { loadDetails() }.frame(minHeight: 44)
+                            } else if page.nextCursor != nil {
+                                Button("加载更多正文") { client.loadToolDetail(item, field: "result", more: true) }
+                                    .frame(minHeight: 44).disabled(client.loadingDetails.contains("\(item.id):result"))
+                            }
+                        }
+                        if client.loadingDetails.contains("\(item.id):result") {
+                            ProgressView().accessibilityLabel("正在读取完整正文")
+                        }
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: item.role == "user" ? .trailing : .leading)
+            .task(id: item.detailId) {
+                if expanded && item.truncated { loadDetails() }
+            }
         } else if item.kind == "toolCall" || item.kind == "toolResult" {
             VStack(alignment: .leading, spacing: 8) {
                 Button {
@@ -57,6 +88,13 @@ struct TimelineItemView: View {
         } else {
             Text(item.text ?? "内容未载入").font(.caption).foregroundColor(DesignTokens.Colors.textSecondary)
         }
+    }
+
+    private var messageText: String {
+        if expanded, let page = client.toolDetails["\(item.id):result"], page.recorded, page.error == nil {
+            return page.text
+        }
+        return item.text ?? ""
     }
 
     private var icon: String {

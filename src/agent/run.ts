@@ -1,13 +1,15 @@
+import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { describeConfig, loadConfig } from "../config.ts";
 import { PiProcessManager } from "../pi/process-manager.ts";
 import { TerminalSessionBridge } from "../terminal/bridge-client.ts";
-import { TerminalSessionLauncher } from "../terminal/launcher.ts";
+import { resolveTerminalExecutable, TerminalSessionLauncher } from "../terminal/launcher.ts";
 import { AgentClient } from "./agent-client.ts";
 import { createPiAgentHandler } from "./pi-agent-handler.ts";
 import { defaultOmpHistoryRoots, OmpHistoryIndex } from "../history/history-index.ts";
 import { HistoryRecoveryCoordinator } from "../terminal/history-recovery.ts";
 import { createModelCatalog } from "../pi/model-catalog.ts";
+import { BackgroundHost, CONTROLLED_RUNTIME, isBackgroundSessionId } from "../background/host.ts";
 
 export interface AgentRuntimeOptions {
   client: AgentClient;
@@ -107,9 +109,14 @@ export async function main(): Promise<void> {
   const config = loadConfig();
   const logger = (message: string): void => console.log(`[pi-agent] ${message}`);
   logger(describeConfig(config));
+  const controlledBin = config.piRuntime === "omp" ? await resolveTerminalExecutable("bun") : undefined;
 
   const manager = new PiProcessManager({
-    piBin: config.piBin,
+    piBin: controlledBin ?? config.piBin,
+    ...(controlledBin ? {
+      spawnFn: (bin, args, options) => spawn(bin, [CONTROLLED_RUNTIME, ...args], options),
+      waitForReady: true, mode: "rpc-ui" as const,
+    } : {}),
     maxSessions: config.maxSessions,
   });
 
@@ -119,7 +126,8 @@ export async function main(): Promise<void> {
   });
   logger(`terminal bridge directories: ${terminalBridge.bridgeDirs.join(", ")}`);
   const terminalLauncher = new TerminalSessionLauncher({
-    piBin: config.piBin,
+    piBin: controlledBin ?? config.piBin,
+    ...(controlledBin ? { args: [CONTROLLED_RUNTIME] } : {}),
     workspaceRoot: config.piWorkspaceRoot,
     bridge: terminalBridge,
     maxSessions: config.maxSessions,
@@ -128,8 +136,24 @@ export async function main(): Promise<void> {
 
   let client: AgentClient | undefined;
   const history = new OmpHistoryIndex({ workspaceRoot: config.piWorkspaceRoot, roots: config.ompHistoryRoots ?? defaultOmpHistoryRoots() });
-  const recovery = config.piRuntime === "omp" ? new HistoryRecoveryCoordinator({ history, bridge: terminalBridge, launcher: terminalLauncher, workspaceRoot: config.piWorkspaceRoot }) : undefined;
-  if (recovery) terminalBridge.setControlGuard(meta => recovery.canControl(meta));
+  const backgroundHost = config.piRuntime === "omp" ? new BackgroundHost({
+    workspaceRoot: config.piWorkspaceRoot, terminalBridge, maxSessions: config.maxSessions,
+    managedSessionCount: () => manager.list().filter(session => session.state === "running").length,
+    emit: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
+  }) : undefined;
+  const recoveryBridge = backgroundHost ? {
+    instances: async () => [...await terminalBridge.instances(), ...await backgroundHost.instances()],
+    get: (id: string) => isBackgroundSessionId(id) ? backgroundHost.get(id) : terminalBridge.get(id),
+    setModel: (id: string, model: Parameters<TerminalSessionBridge["setModel"]>[1]) => isBackgroundSessionId(id) ? backgroundHost.setModel(id, model) : terminalBridge.setModel(id, model),
+  } : terminalBridge;
+  const recovery = config.piRuntime === "omp" ? new HistoryRecoveryCoordinator({
+    history, bridge: recoveryBridge, launcher: backgroundHost ?? terminalLauncher,
+    workspaceRoot: config.piWorkspaceRoot, offlineSource: backgroundHost ? "managed" : "terminal",
+  }) : undefined;
+  if (recovery) {
+    terminalBridge.setControlGuard(meta => recovery.canControl(meta));
+    backgroundHost?.setControlGuard(meta => recovery.canControl(meta));
+  }
   const handler = createPiAgentHandler({
     manager,
     workspaceRoot: config.piWorkspaceRoot,
@@ -139,6 +163,7 @@ export async function main(): Promise<void> {
     terminalLauncher,
     history,
     recovery,
+    backgroundHost,
     emitSessionEvent: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
     logger,
   });
@@ -158,6 +183,9 @@ export async function main(): Promise<void> {
     shuttingDown = true;
     logger(`received ${signal}, shutting down`);
     terminalLauncher.close();
+    try { await backgroundHost?.shutdownAll(); }
+    catch (error) { logger(`background shutdown unconfirmed: ${error instanceof Error ? error.message : String(error)}`); }
+    backgroundHost?.close();
     recovery?.close();
     try {
       await runtime.stop();

@@ -12,6 +12,7 @@ public struct TimelineItem: Identifiable, Equatable {
     public let detailId: String?
     public let truncated: Bool
     public let sourceTruncated: Bool
+    public let isError: Bool
 
     public init?(remote: [String: Any]) {
         guard let id = remote["id"] as? String, let kind = remote["kind"] as? String else { return nil }
@@ -26,6 +27,7 @@ public struct TimelineItem: Identifiable, Equatable {
         detailId = remote["detailId"] as? String
         truncated = remote["truncated"] as? Bool ?? false
         sourceTruncated = remote["sourceTruncated"] as? Bool ?? false
+        isError = remote["isError"] as? Bool ?? false
     }
 
     public var statusLabel: String {

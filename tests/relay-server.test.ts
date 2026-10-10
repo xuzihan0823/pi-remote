@@ -69,6 +69,8 @@ test("a client must send hello before other frames", async () => {
     assert.equal(ack.type, "hello_ack");
     assert.equal(ack.payload.role, "ios");
     assert.equal(ack.deviceId, "iphone-1");
+    assert.ok(ack.payload.supportedMethods?.includes("model.list"));
+    assert.ok(ack.payload.supportedMethods?.includes("session.set_model"));
     ws.close();
   } finally {
     await server.stop();
@@ -243,4 +245,20 @@ test("frames are only forwarded to clients subscribed to the session", async () 
   } finally {
     await server.stop();
   }
+});
+
+test("an unknown method rejection preserves its request ID instead of stranding the client callback", async () => {
+  const { server, port } = await startTestServer();
+  try {
+    const ws = await openSocket(port, "/ws/ios");
+    const queue = new FrameQueue(ws);
+    send(ws, helloFrame("iphone-compatibility", "ios"));
+    await queue.next();
+    send(ws, { version: 1, type: "request", requestId: "unknown-model-method", payload: { method: "model.unknown" } });
+    const failure = await queue.next();
+    assert.equal(failure.type, "error");
+    assert.equal(failure.requestId, "unknown-model-method");
+    assert.equal(failure.payload.code, "invalid_frame");
+    ws.close();
+  } finally { await server.stop(); }
 });
