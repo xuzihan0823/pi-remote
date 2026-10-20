@@ -936,7 +936,14 @@ export interface TimelineContext {
   replacements?: Record<string, string>;
 }
 
-export class TimelineRequestError extends Error {}
+export class TimelineRequestError extends Error {
+  readonly code: "invalid_frame" | "refresh_required" | "result_too_large";
+
+  constructor(message: string, code: "invalid_frame" | "refresh_required" | "result_too_large" = "invalid_frame") {
+    super(message);
+    this.code = code;
+  }
+}
 
 export class TimelineViewService {
   readonly #secret = randomBytes(32);

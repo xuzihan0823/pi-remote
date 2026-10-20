@@ -163,10 +163,10 @@ struct ConfigPane: View {
 
     @ViewBuilder
     private var workspaceField: some View {
-        Label("会话范围：本机全部目录", systemImage: "laptopcomputer")
+        Label("会话范围：仅 Pi Desktop", systemImage: "laptopcomputer")
             .font(Theme.Font.caption)
             .foregroundColor(Theme.textSecondary)
-        InputField(label: "默认项目目录", help: "会话范围为本机全部目录；此目录只用于新建会话和项目选择的起始位置。", error: model.fieldErrors[.workspace]) {
+        InputField(label: "默认项目目录", help: "仅管理 Pi Desktop 会话；新建时从桌面端已有项目中选择。请先启用 Pi Desktop 本机控制接口。", error: model.fieldErrors[.workspace]) {
             HStack(spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: "folder")
@@ -205,21 +205,10 @@ struct ConfigPane: View {
 
             if showAdvanced {
                 VStack(alignment: .leading, spacing: 16) {
-                    InputField(label: "运行时", help: "共享会话和后台会话使用的程序，支持 pi 与 omp。") {
-                        SegmentedChoice(
-                            options: [(AgentRuntime.pi, "pi"), (AgentRuntime.omp, "omp")],
-                            selection: Binding(get: { model.runtime }, set: { model.setRuntime($0) }),
-                            compact: true,
-                            accessibilityName: "运行时"
-                        )
-                    }
-                    InputField(label: "\(model.runtime.rawValue) 可执行文件", help: "PI_BIN · 通常无需修改", error: model.fieldErrors[.piBin]) {
-                        TextField(model.runtime.defaultBinaryPath, text: $model.piBinPath)
-                            .focused($focus, equals: .piBin)
-                            .fieldBox(focused: focus == .piBin, invalid: model.fieldErrors[.piBin] != nil)
-                            .help(model.piBinPath)
-                            .onChange(of: model.piBinPath) { _ in model.clearFieldError(.piBin) }
-                    }
+                    Text("会话由 Pi Desktop 执行，暂不接入 OMP 或 Pi CLI。模型及权限沿用桌面端设置。")
+                        .font(Theme.Font.caption)
+                        .foregroundColor(Theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     if model.mode == .server && model.serverSource == .deploy {
                         InputField(label: "SSH 端口", error: model.fieldErrors[.deployPort]) {
                             TextField("22", value: $model.deployTarget.port, format: .number.grouping(.never))

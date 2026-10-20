@@ -11,6 +11,7 @@ import {
   MAX_AGENT_DEVICE_ID_LENGTH,
   describeConfig,
   loadConfig,
+  loadDesktopAgentConfig,
 } from "../src/config.ts";
 
 const TOKEN = "a".repeat(32);
@@ -20,6 +21,13 @@ test("loadConfig requires a relay token", () => {
   assert.throws(() => loadConfig({}), ConfigError);
   assert.throws(() => loadConfig({ RELAY_TOKEN: "   " }), ConfigError);
   assert.throws(() => loadConfig({ RELAY_TOKEN: "too-short" }), ConfigError);
+});
+
+test("Desktop production config ignores legacy runtime, binary and history scanning overrides", () => {
+  const config = loadDesktopAgentConfig({ ...BASE, PI_RUNTIME: "omp", PI_BIN: "", OMP_HISTORY_ROOTS: "not-json" });
+  assert.equal(config.piRuntime, "pi");
+  assert.equal(config.piBin, "pi-desktop");
+  assert.deepEqual(config.ompHistoryRoots, []);
 });
 
 test("loadConfig applies documented defaults", () => {

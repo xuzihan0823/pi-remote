@@ -1,0 +1,20 @@
+# HISTORICAL PROPOSAL — corresponding source and regression tests are now updated; do not apply again.
+--- a/ios/PiRemote/Services/RelayClient.swift
++++ b/ios/PiRemote/Services/RelayClient.swift
+@@ -1779,13 +1779,13 @@
+                     self.refreshDesktopControls()
+                 }
+             case .failure(let error):
++                self.desktopControlsConfirmed = false
+                 if Self.isControlTransportFailure(error) {
+-                    self.desktopControlsConfirmed = false
+-                    self.desktopInteractionError = "控制请求未送达，请刷新控制状态后重试。\(error.localizedDescription)"
+-                    self.refreshDesktopControls()
++                    self.desktopInteractionError = "无法确认处理结果，请刷新控制状态后核对。"
+                 } else {
+                     self.desktopInteractionError = error.localizedDescription
+                 }
++                self.refreshDesktopControls()
+             }
+         }
+     }

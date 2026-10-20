@@ -149,7 +149,7 @@ public struct SessionsView: View {
             .padding(.horizontal, 20)
 
             if client.isConnected {
-                if !client.supportsArchive {
+                if !client.supportsArchive && !client.isDesktopScope {
                     noticeRow(text: "历史和工具详情需升级 Mac 助手；当前仍可读取旧快照。", color: DesignTokens.Colors.textSecondary)
                 } else if client.historyIndexState == "building" {
                     noticeRow(text: "正在索引历史，已找到的会话会先显示。", color: DesignTokens.Colors.textSecondary)

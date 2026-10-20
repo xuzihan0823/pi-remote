@@ -93,6 +93,18 @@ test("a relay link that stalls without closing is terminated and reconnected", a
   }
 });
 
+test("Desktop runtime shutdown only disconnects its own client and runs local cleanup", async () => {
+  resetFakeSockets();
+  const client = new AgentClient({ url: "ws://relay.test/ws/agent", token: "t".repeat(32), deviceId: "desktop-agent", WebSocketImpl: fakeWebSocketImpl });
+  let cleanups = 0;
+  const runtime = new AgentRuntime({ client, cleanup: () => { cleanups++; } });
+  await runtime.start();
+  await runtime.stop();
+  await runtime.stop();
+  assert.equal(client.state, "closed");
+  assert.equal(cleanups, 1);
+});
+
 test("computeBackoffDelay grows exponentially and respects the cap", () => {
   assert.equal(computeBackoffDelay(0, 100, 5_000), 100);
   assert.equal(computeBackoffDelay(1, 100, 5_000), 200);

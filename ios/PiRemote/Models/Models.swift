@@ -132,6 +132,7 @@ public enum SessionSource: String, Equatable {
 public enum SessionStartMode: String {
     case terminal
     case rpc
+    case desktop
 }
 
 public enum SessionActivity: String, Equatable {
@@ -193,7 +194,17 @@ public struct SessionItem: Identifiable, Equatable {
     }
 
     public var isTerminal: Bool { source == .terminal }
+    public var isDesktopSession: Bool { source == .managed && runtime == "pi-desktop" && Self.isDesktopSessionId(id) }
     public var isArchived: Bool { availability == "archived" || id.hasPrefix("history:") }
+
+    public static func isDesktopSessionId(_ id: String) -> Bool {
+        let prefix = "managed:desktop:"
+        guard id.hasPrefix(prefix) else { return false }
+        let nativeId = id.dropFirst(prefix.count).utf8
+        return (1...128).contains(nativeId.count) && nativeId.allSatisfy {
+            (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 || $0 == 95
+        }
+    }
 
     /// 进行中只认「activity=busy」或明确等待回应；state=running 仅表示进程存活，idle 不算运行。
     public var isActive: Bool { !isArchived && (activity == .busy || hasPendingApproval) }
@@ -295,7 +306,7 @@ public extension SessionItem {
             title: localTitle ?? remoteTitle ?? "会话 \(id.prefix(8))",
             state: SessionProcessState(remoteValue: remote["state"] as? String),
             startedAt: startedAt,
-            hasPendingApproval: hasPendingApproval,
+            hasPendingApproval: hasPendingApproval || (remote["hasPendingApproval"] as? Bool ?? false),
             error: remote["error"] as? String,
             source: SessionSource(remoteValue: remote["source"] as? String),
             activity: SessionActivity(remoteValue: remote["activity"] as? String),
@@ -327,6 +338,7 @@ public struct TerminalSessionState: Equatable {
     public private(set) var messages: [TerminalMessage] = []
     public private(set) var truncated = false
     public private(set) var error: String?
+    public private(set) var errorCode: String?
     public private(set) var loaded = false
     public private(set) var items: [TimelineItem] = []
     public private(set) var revision: String?
@@ -343,8 +355,13 @@ public struct TerminalSessionState: Equatable {
 
     public var isBusy: Bool { activity == .busy }
 
+    /// 内容超限或需要重建时，会话仍在，只是本次读取失败。
+    public var isReadError: Bool { errorCode == "result_too_large" || errorCode == "refresh_required" }
+
     /// 离线：读取失败，或已取到快照但 activity 仍为 unknown。
-    public var isOffline: Bool { error != nil || (loaded && activity == .unknown && availability != "archived") }
+    public var isOffline: Bool {
+        !isReadError && (error != nil || (loaded && activity == .unknown && availability != "archived"))
+    }
 
     public mutating func reset() {
         self = TerminalSessionState()
@@ -357,6 +374,7 @@ public struct TerminalSessionState: Equatable {
         if prepend && (incomingBranch != branchId ||
             (incomingRevision != revision && !(allowLiveRevisionChange && availability == "live" && data["availability"] as? String == "live"))) {
             error = "历史已变化，请刷新后继续阅读"
+            errorCode = nil
             return
         }
         activity = SessionActivity(remoteValue: data["activity"] as? String)
@@ -402,12 +420,18 @@ public struct TerminalSessionState: Equatable {
             }
         }
         error = nil
+        errorCode = nil
         loaded = true
     }
 
-    public mutating func fail(_ message: String) {
+    public mutating func replace(with state: TerminalSessionState) {
+        self = state
+    }
+
+    public mutating func fail(_ message: String, code: String? = nil) {
         activity = .unknown
         error = message
+        errorCode = code
     }
 }
 

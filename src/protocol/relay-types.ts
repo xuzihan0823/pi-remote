@@ -1,4 +1,4 @@
-import type { UiDialogResponse } from "./types.ts";
+import type { DesktopUiResponse, UiDialogResponse } from "./types.ts";
 import type { ModelSelection } from "../terminal/extension.ts";
 
 export const RELAY_PROTOCOL_VERSION = 1;
@@ -56,6 +56,8 @@ export type RelayErrorCode =
   | "timeout"
   | "agent_disconnected"
   | "not_implemented"
+  | "result_too_large"
+  | "refresh_required"
   | "internal_error";
 
 export interface RelayErrorInfo {
@@ -384,8 +386,8 @@ export interface SubscribeParams {
 }
 
 export interface SessionStartParams {
-  /** Omitted mode retains the original managed RPC behavior. */
-  mode?: "terminal" | "rpc";
+  /** Legacy handlers default to RPC; the Desktop agent requires desktop. */
+  mode?: "terminal" | "rpc" | "desktop";
   sessionId?: string;
   cwd?: string;
   args?: string[];
@@ -399,7 +401,7 @@ export interface SessionSetModelParams { model: ModelSelection }
 export interface SessionGetParams {
   sessionId?: string;
   viewVersion?: 2;
-  view?: "timeline" | "branches" | "tool";
+  view?: "timeline" | "branches" | "tool" | "controls";
   limit?: number;
   before?: string | null;
   afterItemId?: string;
@@ -429,5 +431,5 @@ export interface SessionAbortParams {
 
 export interface UiResponseParams {
   requestId: string;
-  response: UiDialogResponse;
+  response: UiDialogResponse | DesktopUiResponse;
 }

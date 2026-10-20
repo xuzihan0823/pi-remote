@@ -1,0 +1,29 @@
+{
+  "name": "@pi-remote/cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone CLI launcher for Pi Remote and Claude Remote",
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "bin": { "pi-remote": "dist/cli.js" },
+  "files": ["dist/", "README.md"],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "verify:package": "node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.212",
+    "qrcode": "^1.5.4",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.9.0"
+  }
+}

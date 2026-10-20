@@ -1,4 +1,5 @@
 import { WebSocket } from "ws";
+import { proxyAgentFor } from "./proxy.ts";
 import {
   RELAY_PROTOCOL_VERSION,
   relayError,
@@ -104,7 +105,8 @@ export class AgentClient {
     url.searchParams.set("token", this.#options.token);
 
     this.#setState("connecting");
-    const socket = new Impl(url.toString());
+    const proxyAgent = proxyAgentFor(url);
+    const socket = proxyAgent ? new Impl(url.toString(), { agent: proxyAgent }) : new Impl(url.toString());
     this.#socket = socket;
 
     socket.on("message", (data) => {

@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import PiRemoteCore
 import SwiftUI
+import SystemConfiguration
 
 enum ConnectionPhase: Equatable {
     case idle
@@ -321,10 +322,6 @@ final class AppModel: ObservableObject {
         guard workspace.hasPrefix("/"), workspace != "/",
               FileManager.default.fileExists(atPath: workspace, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw FieldError(field: .workspace, message: "找不到这个文件夹，请重新选择")
-        }
-        guard let resolved = ExecutableResolver.resolve(piBinPath.trimmingCharacters(in: .whitespacesAndNewlines), searchPath: effectiveSearchPath()),
-              FileManager.default.isExecutableFile(atPath: resolved) else {
-            throw FieldError(field: .piBin, message: "找不到 \(runtime.rawValue)，请检查可执行文件路径")
         }
     }
 
@@ -972,18 +969,13 @@ final class AppModel: ObservableObject {
             mode: mode,
             serverURL: serverURL,
             workspacePath: workspacePath,
-            piBinPath: piBinPath,
+            piBinPath: "pi-desktop",
             deviceId: config.deviceId,
             runtime: runtime,
             serverSource: serverSource,
             deployTarget: deployTarget
         )
         candidate = try candidate.validated()
-        guard let resolvedPiBin = ExecutableResolver.resolve(candidate.piBinPath, searchPath: effectiveSearchPath()) else {
-            throw FieldError(field: .piBin, message: "找不到可执行的 PI_BIN：\(candidate.piBinPath)（可在 PATH 中查找，或填写绝对路径）")
-        }
-        candidate.piBinPath = resolvedPiBin
-        piBinPath = resolvedPiBin
         return candidate
     }
 
@@ -1041,9 +1033,6 @@ final class AppModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: config.workspacePath, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw ValidationError("工作区目录不存在：\(config.workspacePath)")
         }
-        guard FileManager.default.isExecutableFile(atPath: config.piBinPath) else {
-            throw ValidationError("PI_BIN 不可执行：\(config.piBinPath)")
-        }
     }
 
     private func baseEnvironment(runtime: RuntimePaths) -> [String: String] {
@@ -1052,6 +1041,35 @@ final class AppModel: ObservableObject {
             bundledNodeDirectory: runtime.nodeDirectory,
             original: environment["PATH"]
         )
+        for (key, value) in systemProxyEnvironment() {
+            environment[key] = value
+        }
+        return environment
+    }
+
+    /// The Relay may only be reachable through the user's macOS proxy (common for overseas hosts).
+    /// Node's WebSocket client does not read system proxy settings, so pass them explicitly.
+    private func systemProxyEnvironment() -> [String: String] {
+        guard let proxies = SCDynamicStoreCopyProxies(nil) as? [String: Any] else { return [:] }
+        func endpoint(_ enable: String, _ host: String, _ port: String) -> String? {
+            guard proxies[enable] as? Bool == true,
+                  let name = proxies[host] as? String, !name.isEmpty,
+                  let value = proxies[port] as? Int, (1...65535).contains(value) else { return nil }
+            return "http://\(name):\(value)"
+        }
+        var environment: [String: String] = [:]
+        if let https = endpoint(kSCPropNetProxiesHTTPSEnable as String, kSCPropNetProxiesHTTPSProxy as String, kSCPropNetProxiesHTTPSPort as String) {
+            environment["HTTPS_PROXY"] = https
+            environment["https_proxy"] = https
+        }
+        if let http = endpoint(kSCPropNetProxiesHTTPEnable as String, kSCPropNetProxiesHTTPProxy as String, kSCPropNetProxiesHTTPPort as String) {
+            environment["HTTP_PROXY"] = http
+            environment["http_proxy"] = http
+        }
+        if !environment.isEmpty {
+            environment["NO_PROXY"] = "localhost,127.0.0.1,::1"
+            environment["no_proxy"] = "localhost,127.0.0.1,::1"
+        }
         return environment
     }
 

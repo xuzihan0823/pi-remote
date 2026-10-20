@@ -42,7 +42,19 @@ public final class RelayClient {
     public private(set) var activeSessionSource: SessionSource = .managed
     public private(set) var supportsTimeline = false
     public private(set) var supportsTimelineAnchors = false
+    public private(set) var isDesktopScope = false
+    public private(set) var hasLoadedSessionCapabilities = false
+    public private(set) var supportsSessionCreation = false
+    public private(set) var supportsProjectSelection = false
+    public private(set) var canBrowseProjectDirectories = true
+    public private(set) var supportsRemoteApprovals = true
     private var timelineCatchupAnchor: String?
+    private var desktopNeedsFullSnapshot = false
+    private var desktopReplaceTimeline = false
+    private var terminalReadRetryDelay: Duration?
+    private var desktopSnapshotRequestOrdinal = 0
+    private var desktopPromptAcceptedAfterRequest: Int?
+    private var desktopAbortInProgress = false
     public static let historyCacheReset = Notification.Name("PiRemoteHistoryCacheReset")
     public private(set) var supportsArchive = false
     public private(set) var supportsHistoryResume = false
@@ -50,10 +62,26 @@ public final class RelayClient {
     public private(set) var isResumingHistory = false
     public private(set) var supportsHistoryRecoveryOperations = false
     public private(set) var supportsModelSelection = false
+    public private(set) var supportsModelSelectionOnCreate = false
     public private(set) var supportsModelCatalog = false
+    public private(set) var supportsSessionControls = false
+    public private(set) var desktopControls: DesktopControlsSnapshot?
+    public private(set) var desktopControlsError: String?
+    public private(set) var desktopControlsConfirmed = false
+    public private(set) var isSubmittingDesktopInteraction = false
+    public private(set) var desktopInteractionError: String?
+    public var pendingDesktopInteractions: [DesktopInteraction] {
+        desktopControls?.pendingInteractions ?? []
+    }
+    public var canRespondDesktopInteraction: Bool {
+        guard isConnected, agentConnected, desktopControlsConfirmed,
+              let controls = desktopControls, controls.sessionId == activeSessionId else { return false }
+        return controls.canControl && controls.interactionsSupported && !isSubmittingDesktopInteraction
+    }
     /// 新建会话前按项目读取的模型目录
     public private(set) var catalogModels: [RemoteModel] = []
     public private(set) var isLoadingModels = false
+    public private(set) var catalogModelLoadError: String?
     /// 当前会话的模型与可选列表
     public private(set) var activeModel: RemoteModel?
     public private(set) var activeModels: [RemoteModel] = []
@@ -61,6 +89,7 @@ public final class RelayClient {
     public private(set) var isSendingPrompt = false
     private var modelRequestOrdinal = 0
     private var modelSwitchId: UUID?
+    private var modelConfirmationGeneration = 0
     private var modelStateUnconfirmed = false
     public private(set) var isLoadingActiveModels = false
     public private(set) var activeModelLoadError: String?
@@ -99,8 +128,8 @@ public final class RelayClient {
     public private(set) var toolDetails: [String: ToolDetailPage] = [:]
     public private(set) var loadingDetails: Set<String> = []
     public var isActiveArchive: Bool {
-        activeSessionId?.hasPrefix("history:") == true ||
-            sessions.first { $0.id == activeSessionId }?.isArchived == true
+        !isActiveDesktop && (activeSessionId?.hasPrefix("history:") == true ||
+            sessions.first { $0.id == activeSessionId }?.isArchived == true)
     }
     public var activeCanControl: Bool {
         !isActiveArchive && (sessions.first { $0.id == activeSessionId }?.canControl ?? true) &&
@@ -110,12 +139,21 @@ public final class RelayClient {
     public var config: ConnectionConfig { connectionConfig }
     public var isConnected: Bool { state == .connected }
     public var isActiveTerminal: Bool { activeSessionSource == .terminal }
-    public var isActiveBackground: Bool { activeSessionSource == .managed && activeSessionId?.hasPrefix("managed:") == true }
-    public var usesSessionTimeline: Bool { isActiveTerminal || isActiveBackground }
+    public var isActiveDesktop: Bool {
+        activeSessionId.map(SessionItem.isDesktopSessionId) == true
+    }
+    public var isActiveBackground: Bool {
+        activeSessionSource == .managed && activeSessionId?.hasPrefix("managed:") == true && !isActiveDesktop
+    }
+    public var usesSessionTimeline: Bool { isActiveTerminal || isActiveBackground || isActiveDesktop }
     public var isCreatingSession: Bool { sessionCreationId != nil }
     public var canSendPrompt: Bool {
         isConnected && agentConnected && activeSessionId != nil && activeCanControl &&
+            (!(isDesktopScope || isActiveDesktop) || (isDesktopScope && hasLoadedSessionCapabilities && supportsSessionCreation)) &&
             !isSwitchingModel && !modelStateUnconfirmed && !isSendingPrompt &&
+            (!isActiveDesktop || desktopPromptAcceptedAfterRequest == nil) &&
+            (!isActiveDesktop || !supportsSessionControls ||
+                (desktopControlsConfirmed && pendingDesktopInteractions.isEmpty)) &&
             (!usesSessionTimeline || (terminal.activity == .idle && !terminal.isOffline))
     }
     public var isPreparingHistoryPrompt: Bool { historyPromptId != nil }
@@ -127,7 +165,7 @@ public final class RelayClient {
         }
         return canSendPrompt
     }
-    public var canAbortSession: Bool { isConnected && agentConnected && activeCanControl && isSessionRunning }
+    public var canAbortSession: Bool { isConnected && agentConnected && activeCanControl && isSessionRunning && !desktopAbortInProgress }
 
     /// 当前会话的项目目录：terminal 来自 session.list 的 cwd，managed 来自本机 session.start 指定的 cwd。
     public var activeProject: String? {
@@ -198,6 +236,10 @@ public final class RelayClient {
     private var sessionsRefreshTask: Task<Void, Never>?
     private var terminalPollTask: Task<Void, Never>?
     private var terminalGeneration = 0
+    private var desktopControlsPollTask: Task<Void, Never>?
+    private var desktopControlsRequestOrdinal = 0
+    private var desktopControlsInFlightOrdinal: Int?
+    private var submittingDesktopInteractionId: String?
     private var sessionCreationId: UUID?
     private struct HistoryRecoveryOperation {
         var id: String
@@ -219,6 +261,7 @@ public final class RelayClient {
     private static let maxReconnectDelay = 30.0
     private static let sessionsRefreshInterval: Duration = .seconds(2)
     private static let terminalPollInterval: Duration = .milliseconds(500)
+    private static let desktopControlsPollInterval: Duration = .seconds(1)
 
     private init() {
         let configuration = URLSessionConfiguration.default
@@ -260,18 +303,35 @@ public final class RelayClient {
         sessions = []
         activeSessionId = nil
         activeSessionSource = .managed
+        supportsTimeline = false
+        supportsTimelineAnchors = false
+        isDesktopScope = false
+        hasLoadedSessionCapabilities = false
+        supportsSessionCreation = false
+        supportsProjectSelection = false
+        canBrowseProjectDirectories = true
+        supportsRemoteApprovals = true
+        desktopNeedsFullSnapshot = false
+        desktopReplaceTimeline = false
+        terminalReadRetryDelay = nil
+        desktopSnapshotRequestOrdinal = 0
+        desktopPromptAcceptedAfterRequest = nil
+        desktopAbortInProgress = false
         sessionTitles.removeAll()
         sessionProjects.removeAll()
         terminal.reset()
-        supportsTimeline = false
-        supportsTimelineAnchors = false
         supportsArchive = false
         supportsHistoryResume = false
         supportsBackgroundHistoryResume = false
         supportsHistoryRecoveryOperations = false
         supportsModelSelection = false
+        supportsModelSelectionOnCreate = false
         supportsModelCatalog = false
+        supportsSessionControls = false
+        stopDesktopControlsPolling(clearSnapshot: true)
         catalogModels = []
+        catalogModelLoadError = nil
+        isLoadingModels = false
         activeModel = nil
         activeModels = []
         sessionsCursor = nil
@@ -294,10 +354,21 @@ public final class RelayClient {
         selectedBranchId = nil
         supportsTimeline = false
         supportsTimelineAnchors = false
+        isDesktopScope = false
+        hasLoadedSessionCapabilities = false
+        supportsSessionCreation = false
+        supportsProjectSelection = false
+        canBrowseProjectDirectories = true
+        supportsRemoteApprovals = true
         supportsArchive = false
         supportsHistoryResume = false
         supportsBackgroundHistoryResume = false
         supportsHistoryRecoveryOperations = false
+        supportsModelSelectionOnCreate = false
+        supportsSessionControls = false
+        stopDesktopControlsPolling(clearSnapshot: true)
+        catalogModelLoadError = nil
+        isLoadingModels = false
         branchStates = [:]
         cancelSessionCreation()
         historyPageVisible = wasHistoryVisible
@@ -461,6 +532,10 @@ public final class RelayClient {
         return NSError(domain: "RelayClient", code: -1, userInfo: info)
     }
 
+    private static func relayCode(from error: Error) -> String? {
+        (error as NSError).userInfo["relayCode"] as? String
+    }
+
     // MARK: - Session commands
 
     public func refreshSessions() {
@@ -469,7 +544,8 @@ public final class RelayClient {
         sessionsRequestOrdinal += 1
         let ordinal = sessionsRequestOrdinal
         let epoch = connectionEpoch
-        let params: [String: Any] = supportsArchive ? ["viewVersion": 2, "includeArchived": true, "limit": 30] : [:]
+        let params: [String: Any] = supportsArchive ? ["viewVersion": 2, "includeArchived": true, "limit": 30] :
+            (isDesktopScope ? ["limit": 30] : [:])
         sendRequest(method: "session.list", params: params) { [weak self] result in
             guard let self, self.connectionEpoch == epoch, self.sessionsRequestOrdinal == ordinal else { return }
             switch result {
@@ -478,6 +554,13 @@ public final class RelayClient {
                 let hadArchive = self.supportsArchive
                 let hadModelSelection = self.supportsModelSelection
                 let hadModelCatalog = self.supportsModelCatalog
+                self.isDesktopScope = capabilities["sessionScope"] as? String == "pi-desktop"
+                self.hasLoadedSessionCapabilities = true
+                self.supportsSessionCreation = capabilities["sessionCreation"] as? Bool == true &&
+                    (!self.isDesktopScope || capabilities["desktopSessions"] as? Bool == true)
+                self.supportsProjectSelection = capabilities["projectSelection"] as? Bool ?? false
+                self.canBrowseProjectDirectories = capabilities["projectDirectoryBrowsing"] as? Bool ?? !self.isDesktopScope
+                self.supportsRemoteApprovals = capabilities["remoteApprovals"] as? Bool ?? !self.isDesktopScope
                 self.supportsTimeline = capabilities["timelineV2"] as? Bool ?? false
                 self.supportsTimelineAnchors = capabilities["timelineAnchors"] as? Bool ?? false
                 self.supportsArchive = capabilities["ompArchiveRead"] as? Bool ?? false
@@ -487,6 +570,15 @@ public final class RelayClient {
                 let relayAllowsModels = !self.modelProtocolUnsupported && (self.relaySupportedMethods.map { ["model.list", "session.get_model", "session.set_model"].allSatisfy($0.contains) } ?? true)
                 self.supportsModelSelection = capabilities["modelSelection"] as? Bool == true && relayAllowsModels
                 self.supportsModelCatalog = capabilities["modelCatalog"] as? Bool == true && relayAllowsModels
+                let selectionOnCreate = capabilities["modelSelectionOnCreate"] as? Bool
+                    ?? (!self.isDesktopScope && self.supportsModelSelection)
+                self.supportsModelSelectionOnCreate = selectionOnCreate && relayAllowsModels
+                self.supportsSessionControls = capabilities["sessionControls"] as? Bool == true
+                if !self.supportsSessionControls {
+                    self.stopDesktopControlsPolling(clearSnapshot: self.isActiveDesktop)
+                } else if self.isActiveDesktop {
+                    self.startDesktopControlsPolling()
+                }
                 if !self.supportsModelSelection { self.modelStateUnconfirmed = self.activeSessionId.map(self.unconfirmedModelSessions.contains) ?? false }
                 if !self.isLoadingActiveModels &&
                     ((self.supportsModelSelection && !self.isActiveArchive && (!hadModelSelection || self.modelStateUnconfirmed)) ||
@@ -499,20 +591,23 @@ public final class RelayClient {
                 self.sessionsRefreshIds = Set(incoming.map(\.id))
                 if params["includeArchived"] as? Bool == true {
                     let ids = Set(incoming.map(\.id))
-                    let hasMore = data["nextCursor"] as? String != nil
-                    let older = hasMore ? self.sessions.filter { !ids.contains($0.id) } : []
+                    let older = data["nextCursor"] as? String != nil ? self.sessions.filter { !ids.contains($0.id) } : []
                     self.sessions = incoming + older
                     self.sessionsCursor = data["nextCursor"] as? String
                     self.historyIndexState = data["indexState"] as? String ?? "ready"
                     self.historyWarnings = data["warnings"] as? [String] ?? []
                 } else {
                     self.sessions = incoming
+                    self.sessionsCursor = self.isDesktopScope ? data["nextCursor"] as? String : nil
                 }
+                if self.isDesktopScope { self.sessions.removeAll { !$0.isDesktopSession } }
                 self.sessions.sort { ($0.startedAt ?? .distantPast) > ($1.startedAt ?? .distantPast) }
                 if self.supportsArchive && !hadArchive {
                     self.sessionsRefreshInProgress = false
                     self.refreshSessions()
-                } else { self.loadRemainingSessions() }
+                } else {
+                    self.loadRemainingSessions()
+                }
                 if self.isActiveArchive && self.supportsArchive && !hadArchive { self.refreshHistory() }
                 if self.supportsHistoryRecoveryOperations, self.historyPageVisible, self.isActiveArchive,
                    let id = self.activeSessionId, self.historyRecoveryOperations[id] != nil,
@@ -527,17 +622,24 @@ public final class RelayClient {
     }
 
     private func loadRemainingSessions() {
-        guard isConnected, supportsArchive, let cursor = sessionsCursor else {
+        guard isConnected, (supportsArchive || isDesktopScope), let cursor = sessionsCursor else {
             sessionsRefreshInProgress = false
             return
         }
         let epoch = connectionEpoch
         let ordinal = sessionsRequestOrdinal
-        sendRequest(method: "session.list", params: ["viewVersion": 2, "includeArchived": true, "limit": 30, "cursor": cursor]) { [weak self] result in
+        var params: [String: Any] = ["limit": 30, "cursor": cursor]
+        if supportsArchive {
+            params["viewVersion"] = 2
+            params["includeArchived"] = true
+        }
+        sendRequest(method: "session.list", params: params) { [weak self] result in
             guard let self, self.connectionEpoch == epoch, self.sessionsRequestOrdinal == ordinal, self.sessionsCursor == cursor else { return }
             switch result {
             case .success(let data):
-                let incoming = (data["sessions"] as? [[String: Any]] ?? []).compactMap { self.makeSession(from: $0) }
+                let incoming = (data["sessions"] as? [[String: Any]] ?? [])
+                    .compactMap { self.makeSession(from: $0) }
+                    .filter { !self.isDesktopScope || $0.isDesktopSession }
                 let ids = Set(incoming.map(\.id))
                 self.sessionsRefreshIds.formUnion(ids)
                 self.sessions.removeAll { ids.contains($0.id) }
@@ -576,9 +678,11 @@ public final class RelayClient {
         if let title { sessionTitles[id] = title }
         if activeSessionId != id || activeSessionSource != source {
             invalidateActiveModelRequests()
-            modelStateUnconfirmed = !id.hasPrefix("history:") && (supportsModelSelection || unconfirmedModelSessions.contains(id))
+            modelStateUnconfirmed = !id.hasPrefix("history:") && !SessionItem.isDesktopSessionId(id) &&
+                (supportsModelSelection || unconfirmedModelSessions.contains(id))
             cancelSessionCreation()
             stopTerminalPolling()
+            stopDesktopControlsPolling(clearSnapshot: true)
             resetSessionState()
             terminal.reset()
             selectedBranchId = nil
@@ -610,6 +714,11 @@ public final class RelayClient {
             stopTerminalPolling()
             sendRequest(method: "subscribe", sessionId: id) { _ in }
         }
+        if isActiveDesktop {
+            startDesktopControlsPolling()
+        } else {
+            stopDesktopControlsPolling()
+        }
         refreshActiveModels()
     }
 
@@ -636,20 +745,30 @@ public final class RelayClient {
         onStarted: ((String) -> Void)? = nil
     ) {
         guard !isCreatingSession else { return }
+        let desktop = isDesktopScope || mode == .desktop
+        guard !desktop || (isDesktopScope && hasLoadedSessionCapabilities && supportsSessionCreation) else {
+            lastError = "请先刷新 Pi Desktop 会话能力，再新建会话。"
+            return
+        }
         guard isConnected, agentConnected else {
             lastError = "请先连接 Mac，再新建会话。"
             return
         }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        if model != nil, !supportsModelSelectionOnCreate {
+            lastError = "当前 Mac 不支持在新建会话时指定模型，请升级 Mac 助手，或先创建会话后再选择模型。"
+            return
+        }
         lastError = nil
         let creationId = UUID()
         let epoch = connectionEpoch
         sessionCreationId = creationId
-        var params: [String: Any] = ["mode": mode.rawValue]
+        let effectiveMode: SessionStartMode = desktop ? .desktop : mode
+        var params: [String: Any] = ["mode": effectiveMode.rawValue]
         if let cwd = cwd?.trimmingCharacters(in: .whitespacesAndNewlines), !cwd.isEmpty {
             params["cwd"] = cwd
         }
-        if let model, supportsModelSelection {
+        if let model {
             params["model"] = model.selection
         }
         sendRequest(method: "session.start", params: params) { [weak self] result in
@@ -664,8 +783,9 @@ public final class RelayClient {
                 let hasTerminalId = sessionId.hasPrefix("terminal:") && sessionId.count > "terminal:".count &&
                     sessionId.rangeOfCharacter(from: .whitespacesAndNewlines) == nil
                 let source = SessionSource(rawValue: data["source"] as? String ?? (hasTerminalId ? "terminal" : "managed"))
-                guard let source, source == (mode == .terminal ? .terminal : .managed),
-                      hasTerminalId == (source == .terminal) else {
+                guard let source, source == (effectiveMode == .terminal ? .terminal : .managed),
+                      hasTerminalId == (source == .terminal),
+                      !desktop || (SessionItem.isDesktopSessionId(sessionId) && data["source"] as? String == "managed") else {
                     self.lastError = "Mac 返回的会话类型不匹配，请升级 Mac 助手后重试。"
                     return
                 }
@@ -673,8 +793,23 @@ public final class RelayClient {
                     self.sessionProjects[sessionId] = cwd
                 }
                 self.openSession(id: sessionId, title: prompt, source: source)
-                // 模型没切成功就不发第一条消息，避免用错模型执行；草稿交给会话页保留
-                if let selection = data["modelSelection"] as? [String: Any], selection["applied"] as? Bool != true {
+                if desktop {
+                    self.pendingDraft = prompt
+                    if let status = data["status"] as? [String: Any],
+                       status["sessionId"] as? String == sessionId, status["runtime"] as? String == "pi-desktop",
+                       status["canControl"] as? Bool == true, status["activity"] as? String == "idle" {
+                        if let model, !Self.creationModelConfirmed(data, requested: model) {
+                            self.lastError = "会话已创建，但模型尚未确认生效；草稿已保留，请确认模型后发送。"
+                        } else {
+                            self.sendPrompt(prompt, to: sessionId, source: source) { [weak self] result in
+                                guard let self else { return }
+                                if case .success = result, self.pendingDraft == prompt { self.pendingDraft = nil }
+                            }
+                        }
+                    } else {
+                        self.lastError = "会话已创建，草稿已保留；请刷新并确认 Desktop 状态后发送。"
+                    }
+                } else if let selection = data["modelSelection"] as? [String: Any], selection["applied"] as? Bool != true {
                     let message = (selection["error"] as? [String: Any])?["message"] as? String
                     self.pendingDraft = prompt
                     self.lastError = "会话已创建，但模型切换失败：\(message ?? "请重新选择模型")"
@@ -693,26 +828,29 @@ public final class RelayClient {
 
     /// 新建前读取模型目录；cwd 为空时使用 Mac 的默认工作区。
     public func loadModelCatalog(cwd: String?, mode: SessionStartMode) {
-        guard isConnected, agentConnected, supportsModelCatalog else {
-            catalogModels = []
-            return
-        }
+        guard isConnected, agentConnected, supportsModelCatalog else { return }
         catalogRequestOrdinal += 1
         let ordinal = catalogRequestOrdinal
         let epoch = connectionEpoch
         var params: [String: Any] = ["mode": mode.rawValue]
         if let cwd, !cwd.isEmpty { params["cwd"] = cwd }
         isLoadingModels = true
+        catalogModelLoadError = nil
         sendRequest(method: "model.list", params: params) { [weak self] result in
             guard let self, self.connectionEpoch == epoch, self.catalogRequestOrdinal == ordinal else { return }
             self.isLoadingModels = false
             switch result {
             case .success(let data):
                 self.catalogModels = RemoteModel.list(data["models"])
+                self.catalogModelLoadError = nil
             case .failure(let error):
-                self.catalogModels = []
-                if Self.isModelProtocolRejection(error) { self.disableUnsupportedModelProtocol() }
-                else { self.lastError = error.localizedDescription }
+                if Self.isModelProtocolRejection(error) {
+                    self.disableUnsupportedModelProtocol()
+                } else {
+                    let message = "模型目录读取失败，请重试。\(error.localizedDescription)"
+                    self.catalogModelLoadError = message
+                    self.lastError = message
+                }
             }
         }
     }
@@ -792,6 +930,7 @@ public final class RelayClient {
             case .success(let data):
                 if let confirmed = RemoteModel(remote: data["model"]), confirmed.id == model.id {
                     self.activeModel = confirmed
+                    self.modelConfirmationGeneration += 1
                     self.modelStateUnconfirmed = false
                     self.unconfirmedModelSessions.remove(sessionId)
                     self.lastError = nil
@@ -808,6 +947,19 @@ public final class RelayClient {
         }
     }
 
+    private static func creationModelConfirmed(_ data: [String: Any], requested: RemoteModel) -> Bool {
+        guard let selection = data["modelSelection"] as? [String: Any],
+              selection["applied"] as? Bool == true else { return false }
+        let confirmedValue: Any?
+        if let raw = selection["model"], !(raw is NSNull) {
+            confirmedValue = raw
+        } else {
+            confirmedValue = data["model"]
+        }
+        guard let confirmed = RemoteModel(remote: confirmedValue) else { return false }
+        return confirmed.id == requested.id
+    }
+
     private static func isModelProtocolRejection(_ error: Error) -> Bool {
         let failure = error as NSError
         return failure.userInfo["relayCode"] as? String == "invalid_frame" &&
@@ -817,12 +969,14 @@ public final class RelayClient {
     private func disableUnsupportedModelProtocol() {
         modelProtocolUnsupported = true
         supportsModelSelection = false
+        supportsModelSelectionOnCreate = false
         supportsModelCatalog = false
         isLoadingActiveModels = false
         isLoadingModels = false
         activeModels = []
         catalogModels = []
         activeModelLoadError = nil
+        catalogModelLoadError = nil
         modelStateUnconfirmed = activeSessionId.map(unconfirmedModelSessions.contains) ?? false
         lastError = nil
         lastNotice = modelStateUnconfirmed
@@ -1070,6 +1224,7 @@ public final class RelayClient {
             self.isSendingPrompt = false
             switch result {
             case .success:
+                if self.isActiveDesktop { self.desktopPromptAcceptedAfterRequest = self.desktopSnapshotRequestOrdinal }
                 if usesTimeline {
                     Task { await self.refreshTerminalNow(sessionId: sessionId, generation: generation) }
                 }
@@ -1090,10 +1245,13 @@ public final class RelayClient {
 
     public func abortActiveSession() {
         guard let sessionId = activeSessionId, canAbortSession else { return }
-        if isActiveTerminal {
+        if isActiveTerminal || isActiveDesktop {
+            guard !desktopAbortInProgress else { return }
+            if isActiveDesktop { desktopAbortInProgress = true }
             let generation = terminalGeneration
             sendRequest(method: "session.abort", sessionId: sessionId) { [weak self] result in
                 guard let self, !self.isStaleTerminalCompletion(sessionId: sessionId, generation: generation) else { return }
+                self.desktopAbortInProgress = false
                 switch result {
                 case .success:
                     Task { await self.refreshTerminalNow(sessionId: sessionId, generation: generation) }
@@ -1268,10 +1426,17 @@ public final class RelayClient {
 
     private func makeSession(from dict: [String: Any]) -> SessionItem? {
         guard let id = dict["sessionId"] as? String else { return nil }
+        let pendingStateKnown = dict["pendingStateKnown"] as? Bool
+        let remotePending = dict["hasPendingApproval"] as? Bool
+        let previousPending = sessions.first(where: { $0.id == id })?.hasPendingApproval ?? false
+        let preserveUnknown = pendingStateKnown == false || (pendingStateKnown == nil && remotePending == nil)
+        let controlsPending = desktopControlsConfirmed && desktopControls?.sessionId == id &&
+            !pendingDesktopInteractions.isEmpty
         return SessionItem(
             remote: dict,
             localTitle: sessionTitles[id],
-            hasPendingApproval: pendingApproval != nil && activeSessionId == id
+            hasPendingApproval: (pendingApproval != nil && activeSessionId == id) ||
+                controlsPending || (preserveUnknown && previousPending)
         )
     }
 
@@ -1486,20 +1651,203 @@ public final class RelayClient {
                 guard self?.isConnected == true, self?.usesSessionTimeline == true else { return }
                 await self?.refreshTerminalSnapshot(generation: generation)
                 if self?.timelineCatchupAnchor != nil { continue }
-                try? await Task.sleep(for: self?.terminal.isBusy == true ? Self.terminalPollInterval : .seconds(2))
+                let delay = self?.terminalReadRetryDelay ?? (self?.terminal.isBusy == true ? Self.terminalPollInterval : .seconds(2))
+                try? await Task.sleep(for: delay)
             }
         }
+        startDesktopControlsPolling()
     }
 
     public func stopTerminalPolling() {
         terminalGeneration += 1
+        stopDesktopControlsPolling()
         timelineCatchupAnchor = nil
+        desktopNeedsFullSnapshot = false
+        desktopReplaceTimeline = false
+        terminalReadRetryDelay = nil
+        desktopPromptAcceptedAfterRequest = nil
+        desktopAbortInProgress = false
         if usesSessionTimeline {
             promptOperationId = nil
             isSendingPrompt = false
         }
         terminalPollTask?.cancel()
         terminalPollTask = nil
+    }
+
+    // MARK: - Desktop controls
+
+    public func refreshDesktopControls() {
+        guard isConnected, agentConnected, isActiveDesktop, supportsSessionControls,
+              let sessionId = activeSessionId,
+              desktopControlsInFlightOrdinal == nil else { return }
+        desktopControlsRequestOrdinal += 1
+        let ordinal = desktopControlsRequestOrdinal
+        let epoch = connectionEpoch
+        let generation = terminalGeneration
+        let modelOrdinal = modelRequestOrdinal
+        let modelGeneration = modelConfirmationGeneration
+        desktopControlsInFlightOrdinal = ordinal
+        desktopControlsError = nil
+        sendRequest(method: "session.get", sessionId: sessionId, params: ["view": "controls"]) { [weak self] result in
+            guard let self else { return }
+            if self.desktopControlsInFlightOrdinal == ordinal { self.desktopControlsInFlightOrdinal = nil }
+            guard self.connectionEpoch == epoch, self.terminalGeneration == generation,
+                  self.activeSessionId == sessionId, self.desktopControlsRequestOrdinal == ordinal else { return }
+            switch result {
+            case .success(let data):
+                guard let snapshot = DesktopControlsSnapshot(remote: data), snapshot.sessionId == sessionId else {
+                    self.desktopControlsConfirmed = false
+                    self.desktopControlsError = "Pi Desktop 返回的控制状态不完整，请刷新后重试。"
+                    return
+                }
+                self.desktopControls = snapshot
+                self.desktopControlsConfirmed = true
+                self.desktopControlsError = nil
+                self.applyDesktopControlsPendingToSessions()
+                if let submittingId = self.submittingDesktopInteractionId,
+                   !snapshot.pendingInteractions.contains(where: { $0.id == submittingId }) {
+                    self.desktopInteractionError = "该请求可能已处理或已失效，请刷新确认。"
+                }
+                if let model = snapshot.model, !self.isSwitchingModel,
+                   self.modelRequestOrdinal == modelOrdinal,
+                   self.modelConfirmationGeneration == modelGeneration {
+                    self.activeModel = model
+                }
+            case .failure(let error):
+                self.desktopControlsConfirmed = false
+                self.desktopControlsError = "控制状态读取失败，请重试。\(error.localizedDescription)"
+            }
+        }
+    }
+
+    public func respondToDesktopPermission(_ interaction: DesktopInteraction, allow: Bool) {
+        guard case .permission = interaction.kind else { return }
+        submitDesktopInteraction(interaction, response: [
+            "kind": "permission",
+            "decision": allow ? "allow-once" : "deny",
+        ])
+    }
+
+    public func respondToDesktopQuestion(_ interaction: DesktopInteraction, answers: [[String]?]) {
+        guard case .question(let request) = interaction.kind else { return }
+        guard answers.count == request.questions.count else {
+            desktopInteractionError = "回答数量与题目数量不一致，请重新填写。"
+            return
+        }
+        let encodedAnswers: [Any] = answers.map { answer in
+            if let answer { return answer }
+            return NSNull()
+        }
+        submitDesktopInteraction(interaction, response: ["kind": "question", "answers": encodedAnswers])
+    }
+
+    private func submitDesktopInteraction(_ interaction: DesktopInteraction, response: [String: Any]) {
+        guard !isSubmittingDesktopInteraction,
+              let sessionId = activeSessionId,
+              sessionId == interaction.sessionId,
+              let snapshot = desktopControls,
+              snapshot.sessionId == sessionId,
+              snapshot.pendingInteractions.contains(interaction),
+              canRespondDesktopInteraction else { return }
+        isSubmittingDesktopInteraction = true
+        submittingDesktopInteractionId = interaction.id
+        desktopInteractionError = nil
+        let epoch = connectionEpoch
+        let generation = terminalGeneration
+        sendRequest(
+            method: "ui.response",
+            sessionId: sessionId,
+            params: ["requestId": interaction.requestId, "response": response]
+        ) { [weak self] result in
+            guard let self, self.connectionEpoch == epoch,
+                  self.terminalGeneration == generation,
+                  self.activeSessionId == sessionId else { return }
+            self.isSubmittingDesktopInteraction = false
+            self.submittingDesktopInteractionId = nil
+            switch result {
+            case .success(let data):
+                if data["acknowledged"] as? Bool == true {
+                    self.desktopInteractionError = nil
+                    self.removePendingDesktopInteraction(interaction)
+                    self.applyDesktopControlsPendingToSessions()
+                    self.desktopControlsRequestOrdinal += 1
+                    self.refreshDesktopControls()
+                } else {
+                    self.desktopInteractionError = "Mac 尚未确认处理结果，请刷新控制状态后重试。"
+                    self.desktopControlsConfirmed = false
+                    self.refreshDesktopControls()
+                }
+            case .failure(let error):
+                self.desktopControlsConfirmed = false
+                if Self.isControlTransportFailure(error) {
+                    self.desktopInteractionError = "无法确认处理结果，请刷新控制状态后核对。"
+                } else {
+                    self.desktopInteractionError = error.localizedDescription
+                }
+                self.refreshDesktopControls()
+            }
+        }
+    }
+
+    private func applyDesktopControlsPendingToSessions() {
+        guard let sessionId = activeSessionId else { return }
+        let hasPending = !pendingDesktopInteractions.isEmpty ||
+            (pendingApproval != nil && activeSessionId == sessionId)
+        guard let index = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        sessions[index].hasPendingApproval = hasPending
+    }
+
+    private func removePendingDesktopInteraction(_ interaction: DesktopInteraction) {
+        guard let snapshot = desktopControls else { return }
+        let pending = snapshot.pendingInteractions.filter { $0.id != interaction.id }
+        guard pending.count != snapshot.pendingInteractions.count else { return }
+        desktopControls = DesktopControlsSnapshot(
+            sessionId: snapshot.sessionId,
+            permission: snapshot.permission,
+            model: snapshot.model,
+            pendingInteractions: pending,
+            interactionsSupported: snapshot.interactionsSupported,
+            canControl: snapshot.canControl,
+            activity: snapshot.activity
+        )
+    }
+
+    private func startDesktopControlsPolling() {
+        guard isConnected, agentConnected, isActiveDesktop, supportsSessionControls,
+              let sessionId = activeSessionId, desktopControlsPollTask == nil else { return }
+        desktopControlsConfirmed = false
+        desktopControlsError = nil
+        let epoch = connectionEpoch
+        desktopControlsPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.isConnected, self.agentConnected, self.supportsSessionControls,
+                      self.isActiveDesktop, self.activeSessionId == sessionId,
+                      self.connectionEpoch == epoch else { return }
+                self.refreshDesktopControls()
+                try? await Task.sleep(for: Self.desktopControlsPollInterval)
+            }
+        }
+    }
+
+    private func stopDesktopControlsPolling(clearSnapshot: Bool = false) {
+        desktopControlsPollTask?.cancel()
+        desktopControlsPollTask = nil
+        desktopControlsRequestOrdinal += 1
+        desktopControlsInFlightOrdinal = nil
+        desktopControlsConfirmed = false
+        isSubmittingDesktopInteraction = false
+        submittingDesktopInteractionId = nil
+        if clearSnapshot {
+            desktopControls = nil
+            desktopControlsError = nil
+            desktopInteractionError = nil
+        }
+    }
+
+    private static func isControlTransportFailure(_ error: Error) -> Bool {
+        let message = error.localizedDescription
+        return message.contains("超时") || message == "连接已断开"
     }
 
     /// 过期回调判定：请求发出时记录的会话与轮询代次，必须与回调到达时一致。
@@ -1532,14 +1880,21 @@ public final class RelayClient {
         guard generation == terminalGeneration, let sessionId = activeSessionId, usesSessionTimeline else { return }
         var params: [String: Any] = supportsTimeline ? ["viewVersion": 2, "view": "timeline", "limit": 50] : [:]
         if let selectedBranchId { params["branchId"] = selectedBranchId }
-        if supportsTimelineAnchors, !isActiveArchive,
+        if supportsTimelineAnchors, !isActiveArchive, !desktopNeedsFullSnapshot,
            let anchor = timelineCatchupAnchor ?? terminal.items.filter({ !$0.id.hasPrefix("stream:") }).suffix(50).first?.id {
             params["afterItemId"] = anchor
         }
+        desktopSnapshotRequestOrdinal += 1
+        let snapshotOrdinal = desktopSnapshotRequestOrdinal
         let result = await performRequest(method: "session.get", sessionId: sessionId, params: params)
         guard generation == terminalGeneration, activeSessionId == sessionId else { return }
         switch result {
         case .success(let data):
+            let isFullSnapshot = params["afterItemId"] == nil
+            if isFullSnapshot { desktopNeedsFullSnapshot = false }
+            if let accepted = desktopPromptAcceptedAfterRequest, snapshotOrdinal > accepted {
+                desktopPromptAcceptedAfterRequest = nil
+            }
             if isActiveBackground, data["availability"] as? String == "archived",
                let historyId = data["historySessionId"] as? String, historyId.hasPrefix("history:") {
                 openSession(id: historyId, title: sessions.first { $0.id == sessionId }?.title, source: .terminal)
@@ -1554,11 +1909,20 @@ public final class RelayClient {
             }
             let previousItems = terminal.items
             let previousBranch = terminal.branchId
-            if let branch = data["branchId"] as? String, let cached = branchStates[branch],
+            let replacing = desktopReplaceTimeline && isFullSnapshot
+            if !replacing, let branch = data["branchId"] as? String, let cached = branchStates[branch],
                cached.revision == data["revision"] as? String {
                 terminal = cached
             }
-            terminal.apply(data)
+            if replacing {
+                var fresh = TerminalSessionState()
+                fresh.apply(data)
+                terminal.replace(with: fresh)
+            } else {
+                terminal.apply(data)
+            }
+            if replacing { desktopReplaceTimeline = false }
+            terminalReadRetryDelay = nil
             let page = data["page"] as? [String: Any]
             let incoming = (data["items"] as? [[String: Any]] ?? []).compactMap(TimelineItem.init(remote:))
             let nextAnchor = incoming.last?.id
@@ -1577,8 +1941,35 @@ public final class RelayClient {
             syncActiveTerminalActivity()
         case .failure(let error):
             timelineCatchupAnchor = nil
-            terminal.fail(error.localizedDescription)
+            let code = Self.relayCode(from: error)
+            let message = error.localizedDescription
+            if code == "result_too_large" || (isActiveDesktop && message.contains("MCP_RESULT_LIMIT")) {
+                desktopNeedsFullSnapshot = true
+                desktopReplaceTimeline = true
+                terminalReadRetryDelay = .seconds(15)
+                terminal.fail(message, code: "result_too_large")
+            } else if code == "refresh_required" ||
+                        (isActiveDesktop && (message.contains("refresh-required") || message.contains("请刷新"))) {
+                desktopNeedsFullSnapshot = true
+                desktopReplaceTimeline = true
+                terminalReadRetryDelay = nil
+                terminal.fail(message, code: "refresh_required")
+            } else {
+                terminalReadRetryDelay = nil
+                terminal.fail(message)
+            }
         }
+    }
+
+    /// 读取失败但会话仍在线时，允许用户跳过轮询节奏立即重试。
+    public func retryActiveSessionRead() {
+        guard isConnected, usesSessionTimeline, !isActiveArchive, activeSessionId != nil, terminal.isReadError else { return }
+        timelineCatchupAnchor = nil
+        desktopNeedsFullSnapshot = true
+        desktopReplaceTimeline = true
+        terminalReadRetryDelay = nil
+        let generation = terminalGeneration
+        Task { await refreshTerminalSnapshot(generation: generation) }
     }
 
     public func refreshHistory() {
@@ -1614,6 +2005,10 @@ public final class RelayClient {
                 terminal.apply(data, prepend: true, allowLiveRevisionChange: params["beforeItemId"] != nil)
                 onLoaded(terminal.error == nil && terminal.items.count > previousCount)
             case .failure(let error):
+                if Self.relayCode(from: error) == "refresh_required" {
+                    desktopNeedsFullSnapshot = true
+                    desktopReplaceTimeline = true
+                }
                 lastNotice = error.localizedDescription
                 onLoaded(false)
             }
@@ -1671,6 +2066,10 @@ public final class RelayClient {
                 if more { page.text = (self.toolDetails[key]?.text ?? "") + page.text }
                 self.toolDetails[key] = page
             case .failure(let error):
+                if Self.relayCode(from: error) == "refresh_required" {
+                    self.desktopNeedsFullSnapshot = true
+                    self.desktopReplaceTimeline = true
+                }
                 var page = self.toolDetails[key] ?? ToolDetailPage(remote: [:])
                 page.error = error.localizedDescription
                 self.toolDetails[key] = page

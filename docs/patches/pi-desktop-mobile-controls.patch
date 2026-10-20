@@ -1,0 +1,1661 @@
+diff --git a/apps/desktop/electron/main/ipc/agent-ipc.ts b/apps/desktop/electron/main/ipc/agent-ipc.ts
+index 18ffd87..82058f9 100644
+--- a/apps/desktop/electron/main/ipc/agent-ipc.ts
++++ b/apps/desktop/electron/main/ipc/agent-ipc.ts
+@@ -56,6 +56,41 @@ function rejectNativeAgentOperation(sessionId: string): void {
+   }
+ }
+ 
++const MAX_PENDING_INTERACTIVE_SESSION_ID = 256;
++
++function sessionNotFound(): Error {
++  return Object.assign(new Error("Session not found"), { errorCode: ErrorCodes.NOT_FOUND });
++}
++
++/**
++ * Only a local desktop session may expose its pending cards. Native Pi
++ * sessions answer empty before this check; a remote or unknown id must not
++ * read this desktop's host queue.
++ */
++async function assertLocalPendingInteractiveSession(host: HostProcess, sessionId: string): Promise<void> {
++  const listed = await host.call<{ sessions?: Array<Record<string, unknown>> }>("session.list");
++  const requested = Array.isArray(listed?.sessions)
++    ? listed.sessions.find((entry) => entry !== null && typeof entry === "object" && entry.id === sessionId)
++    : undefined;
++  if (!requested) throw sessionNotFound();
++  if (
++    (requested.source !== undefined && requested.source !== "desktop") ||
++    requested.remoteHostKey !== undefined
++  ) {
++    throw sessionNotFound();
++  }
++}
++
++function pendingRequestsForSession(
++  requests: PendingInteractiveRequests,
++  sessionId: string,
++): PendingInteractiveRequests {
++  return {
++    asks: requests.asks.filter((entry) => entry.sessionId === sessionId),
++    permissions: requests.permissions.filter((entry) => entry.sessionId === sessionId),
++  };
++}
++
+ function parseVoiceOrigin(value: unknown): VoiceOrigin | undefined {
+   if (value === undefined) return undefined;
+   if (!value || typeof value !== "object" || Array.isArray(value)) {
+@@ -792,14 +827,23 @@ export function registerAgentIpc({
+    * requests. Native Pi sessions own their own input path and answer empty.
+    */
+   handle(IPC.invoke.pendingInteractive, async (input: { sessionId?: string } = {}) => {
+-    const sessionId = String(input.sessionId ?? "").trim();
++    const sessionId = String(input?.sessionId ?? "").trim();
+     if (!sessionId) {
+       throw Object.assign(new Error("sessionId required"), { errorCode: ErrorCodes.INVALID_ARGUMENT });
+     }
+     const empty: PendingInteractiveRequests = { asks: [], permissions: [] };
+     if (sessionId.startsWith("native-pi:")) return empty;
++    if (sessionId.length > MAX_PENDING_INTERACTIVE_SESSION_ID) {
++      throw Object.assign(
++        new Error(`sessionId must be a non-empty string of at most ${MAX_PENDING_INTERACTIVE_SESSION_ID} characters`),
++        { errorCode: ErrorCodes.INVALID_ARGUMENT },
++      );
++    }
++    if (!host) throw new Error("host unavailable");
++    await assertLocalPendingInteractiveSession(host, sessionId);
+     const bridge = getAgentHostBridge();
+-    return bridge ? bridge.pendingInteractiveRequests(sessionId) : empty;
++    if (!bridge) return empty;
++    return pendingRequestsForSession(await bridge.pendingInteractiveRequests(sessionId), sessionId);
+   });
+ 
+   handle(IPC.invoke.plansPending, async (input: { sessionId?: string } = {}) => {
+diff --git a/apps/desktop/electron/main/ipc/session-ipc.ts b/apps/desktop/electron/main/ipc/session-ipc.ts
+index f62be5b..0dc91c7 100644
+--- a/apps/desktop/electron/main/ipc/session-ipc.ts
++++ b/apps/desktop/electron/main/ipc/session-ipc.ts
+@@ -634,6 +634,110 @@ export function registerSessionIpc({
+       return { ...result, session };
+     },
+   );
++  handle(
++    IPC.invoke.sessionSetModel,
++    async (id: string, config: unknown) => {
++      if (!host) throw new Error("host unavailable");
++      const invalid = (message: string) =>
++        Object.assign(new Error(message), {
++          errorCode: ErrorCodes.INVALID_ARGUMENT,
++        });
++      const sessionId = typeof id === "string" ? id.trim() : "";
++      rejectNativeMutation(sessionId, "model configuration");
++      if (!sessionId || Buffer.byteLength(sessionId, "utf8") > 256) {
++        throw invalid("id must be a non-empty string of at most 256 bytes");
++      }
++      if (!config || typeof config !== "object" || Array.isArray(config)) {
++        throw invalid("config must contain exactly providerId and modelId");
++      }
++      const rawConfig = config as Record<string, unknown>;
++      if (
++        Object.keys(rawConfig).length !== 2 ||
++        !Object.prototype.hasOwnProperty.call(rawConfig, "providerId") ||
++        !Object.prototype.hasOwnProperty.call(rawConfig, "modelId")
++      ) {
++        throw invalid("config must contain exactly providerId and modelId");
++      }
++      const boundedText = (value: unknown, field: string, maxBytes: number): string => {
++        if (typeof value !== "string" || !value.trim()) {
++          throw invalid(`${field} must be a non-empty string`);
++        }
++        const trimmed = value.trim();
++        if (Buffer.byteLength(trimmed, "utf8") > maxBytes) {
++          throw invalid(`${field} must not exceed ${maxBytes} bytes`);
++        }
++        return trimmed;
++      };
++      const providerId = boundedText(rawConfig.providerId, "providerId", 128);
++      const modelId = boundedText(rawConfig.modelId, "modelId", 256);
++      if (
++        (getActiveRemoteHostsBoot()?.sessionSummaries() ?? []).some(
++          (session) => session.id === sessionId,
++        )
++      ) {
++        throw invalid("Remote sessions use the Host model configuration");
++      }
++      const { sessions } = await host.call<{ sessions: RuntimeSession[] }>(
++        "session.list",
++      );
++      const existing = sessions.find((session) => session.id === sessionId);
++      if (!existing) {
++        throw Object.assign(new Error("Session not found"), {
++          errorCode: ErrorCodes.NOT_FOUND,
++        });
++      }
++      if (
++        (existing.source !== undefined && existing.source !== "desktop") ||
++        existing.remoteHostKey !== undefined
++      ) {
++        throw invalid(
++          "Session model configuration is only available for desktop sessions",
++        );
++      }
++      const { providers, defaults } = await sessionCapabilityContext();
++      const provider = Array.isArray(providers)
++        ? providers.find(
++            (item) => item?.id === providerId && item.enabled !== false,
++          )
++        : undefined;
++      if (!provider) {
++        throw invalid("providerId must name an enabled provider");
++      }
++      const configured =
++        (Array.isArray(provider.models) &&
++          provider.models.some((model) => model?.id === modelId)) ||
++        provider.defaultModelId === modelId;
++      if (!configured) {
++        const cached = await host.call<{
++          models?: Array<{ modelId?: unknown }>;
++        }>("providers.listModels", { providerId });
++        if (
++          !Array.isArray(cached.models) ||
++          !cached.models.some((model) => model?.modelId === modelId)
++        ) {
++          throw invalid("providerId and modelId must name a configured or cached model");
++        }
++      }
++      const result = await host.call<{ session?: RuntimeSession | null }>(
++        "session.setModel",
++        { id: sessionId, providerId, modelId },
++      );
++      if (!result.session) return result;
++      const session = enrichSession(result.session, providers, defaults);
++      const modelKey =
++        session.providerId && session.modelId
++          ? `${session.providerId}/${session.modelId}`
++          : null;
++      plugins.broadcastEvent("session:modelChanged", [
++        {
++          sessionId,
++          modelKey,
++          thinkingLevel: session.thinkingLevel,
++        },
++      ]);
++      return { ...result, session };
++    },
++  );
+ 
+   handle(IPC.invoke.sessionImportScan, async () => {
+     const { sessions, truncated } = await scanAllSources();
+diff --git a/apps/desktop/electron/main/mcp-control.ts b/apps/desktop/electron/main/mcp-control.ts
+index 8bfc20a..64657e8 100644
+--- a/apps/desktop/electron/main/mcp-control.ts
++++ b/apps/desktop/electron/main/mcp-control.ts
+@@ -204,6 +204,7 @@ const CONTROL_OPERATION_SPECS: OperationSpec[] = [
+   spec("agentAbort", "agent/abort", "Abort an active Agent turn.", "write", ["request"]),
+   spec("agentStop", "agent/stop", "Request a graceful Agent stop.", "write", ["request"]),
+   spec("agentGetStatus", "agent/getStatus", "Read Agent runtime status.", "read", ["sessionId"]),
++  spec("pendingInteractive", "agent/pendingInteractive", "Read pending interactive questions and permission requests for a session.", "read", ["input"]),
+   spec("sessionList", "session/list", "List durable sessions.", "read", []),
+   spec("sessionCreate", "session/create", "Create a durable session.", "write", ["input"]),
+   spec("sessionFork", "session/fork", "Fork a session.", "write", ["input"]),
+@@ -212,6 +213,7 @@ const CONTROL_OPERATION_SPECS: OperationSpec[] = [
+   spec("sessionDelete", "session/delete", "Delete a session.", "dangerous", ["id"]),
+   spec("sessionRename", "session/rename", "Rename a session.", "write", ["id", "title"]),
+   spec("sessionConfigure", "session/configure", "Configure a session for its next turn, including permission mode.", "dangerous", ["id", "config"]),
++  spec("sessionSetModel", "session/setModel", "Set a session's provider and model for its next turn.", "dangerous", ["id", "config"]),
+   spec("sessionMoveProject", "session/moveProject", "Move an idle session to another project.", "write", ["input"]),
+   spec("sessionListRevisions", "session/listRevisions", "List transcript revisions.", "read", ["input"]),
+   spec("sessionGetScratchPath", "session/getScratchPath", "Return a session scratch path.", "read", ["input"]),
+@@ -361,6 +363,18 @@ const CORE_TOOL_SPECS = [
+       return [id, config];
+     },
+   ),
++  coreTool(
++    "pi_session_set_model",
++    "Set a session's provider and model. Set confirm=true to acknowledge the model change.",
++    objectSchema({
++      id: stringSchema("Session id."),
++      providerId: stringSchema("Provider id."),
++      modelId: stringSchema("Model id."),
++      confirm: booleanSchema("Required acknowledgement."),
++    }, ["id", "providerId", "modelId", "confirm"]),
++    "session/setModel",
++    (input) => [input.id, { providerId: input.providerId, modelId: input.modelId }],
++  ),
+   coreTool(
+     "pi_agent_prompt",
+     "Send a prompt to a session's Agent. Returns when the turn is accepted, not when it finishes.",
+@@ -380,6 +394,13 @@ const CORE_TOOL_SPECS = [
+     "agent/getStatus",
+     (input) => [input.sessionId],
+   ),
++  coreTool(
++    "pi_agent_pending_interactive",
++    "Read pending interactive questions and permission requests for a session.",
++    objectSchema({ sessionId: stringSchema("Target session id.") }, ["sessionId"]),
++    "agent/pendingInteractive",
++    (input) => [{ sessionId: input.sessionId }],
++  ),
+   coreTool(
+     "pi_agent_stop",
+     "Request a graceful stop at the next Agent turn boundary.",
+diff --git a/apps/desktop/test/mcp-control.test.mjs b/apps/desktop/test/mcp-control.test.mjs
+index 921bbac..d5f6330 100644
+--- a/apps/desktop/test/mcp-control.test.mjs
++++ b/apps/desktop/test/mcp-control.test.mjs
+@@ -74,8 +74,10 @@ const fixtureChannels = {
+   sessionCreate: "pi-desktop/session/create",
+   sessionDelete: "pi-desktop/session/delete",
+   sessionConfigure: "pi-desktop/session/configure",
++  sessionSetModel: "pi-desktop/session/setModel",
+   plansResolve: "pi-desktop/plans/resolve",
+   agentPrompt: "pi-desktop/agent/prompt",
++  pendingInteractive: "pi-desktop/agent/pendingInteractive",
+ };
+ 
+ test("local MCP control server authenticates, discovers, and invokes desktop operations", async (t) => {
+@@ -132,6 +134,12 @@ test("local MCP control server authenticates, discovers, and invokes desktop ope
+         if (args[0]?.id === largeSession.session.id) return largeSession;
+         if (args[0]?.id === smallSession.session.id) return smallSession;
+       }
++      if (channel === "pi-desktop/agent/pendingInteractive") {
++        if (args[0]?.sessionId === "large-pending") {
++          return { asks: [{ content: "x".repeat(600_000) }], permissions: [] };
++        }
++        return { asks: [], permissions: [] };
++      }
+       return { ok: true };
+     },
+     onOperationComplete: (operation, result, args) => {
+@@ -209,6 +217,8 @@ test("local MCP control server authenticates, discovers, and invokes desktop ope
+   assert.ok(toolNames.includes("pi_project_open"));
+   assert.ok(toolNames.includes("pi_plans_resolve"));
+   assert.ok(toolNames.includes("pi_session_configure"));
++  assert.ok(toolNames.includes("pi_session_set_model"));
++  assert.ok(toolNames.includes("pi_agent_pending_interactive"));
+ 
+   const opened = await post(
+     info.url,
+@@ -380,6 +390,118 @@ test("local MCP control server authenticates, discovers, and invokes desktop ope
+     args: ["session-1", { mode: "agent", permissionMode: "auto" }],
+   });
+ 
++  const pending = await post(
++    info.url,
++    info.token,
++    {
++      jsonrpc: "2.0",
++      id: 30,
++      method: "tools/call",
++      params: { name: "pi_agent_pending_interactive", arguments: { sessionId: "session-1" } },
++    },
++    { "Mcp-Session-Id": sessionId },
++  );
++  assert.deepEqual(pending.body.result.structuredContent, { asks: [], permissions: [] });
++  assert.deepEqual(calls.at(-1), {
++    channel: "pi-desktop/agent/pendingInteractive",
++    args: [{ sessionId: "session-1" }],
++  });
++
++  const callCountBeforeMissingPending = calls.length;
++  const missingPendingSession = await post(
++    info.url,
++    info.token,
++    {
++      jsonrpc: "2.0",
++      id: 31,
++      method: "tools/call",
++      params: { name: "pi_agent_pending_interactive", arguments: {} },
++    },
++    { "Mcp-Session-Id": sessionId },
++  );
++  assert.equal(missingPendingSession.body.result.isError, true);
++  assert.equal(missingPendingSession.body.result.structuredContent.error.code, "INVALID_PARAMS");
++  assert.equal(calls.length, callCountBeforeMissingPending);
++
++  const largePending = await post(
++    info.url,
++    info.token,
++    {
++      jsonrpc: "2.0",
++      id: 32,
++      method: "tools/call",
++      params: { name: "pi_agent_pending_interactive", arguments: { sessionId: "large-pending" } },
++    },
++    { "Mcp-Session-Id": sessionId },
++  );
++  assert.equal(largePending.body.result.structuredContent.truncated, true);
++  assert.equal(largePending.body.result.structuredContent.reason, "MCP_RESULT_LIMIT");
++
++  const callCountBeforeUnconfirmedModel = calls.length;
++  const unconfirmedModel = await post(
++    info.url,
++    info.token,
++    {
++      jsonrpc: "2.0",
++      id: 33,
++      method: "tools/call",
++      params: {
++        name: "pi_session_set_model",
++        arguments: { id: "session-1", providerId: "provider-1", modelId: "model-1" },
++      },
++    },
++    { "Mcp-Session-Id": sessionId },
++  );
++  assert.equal(unconfirmedModel.body.result.isError, true);
++  assert.equal(calls.length, callCountBeforeUnconfirmedModel);
++
++  const setModel = await post(
++    info.url,
++    info.token,
++    {
++      jsonrpc: "2.0",
++      id: 34,
++      method: "tools/call",
++      params: {
++        name: "pi_session_set_model",
++        arguments: {
++          id: "session-1",
++          providerId: "provider-1",
++          modelId: "model-1",
++          mode: "plan",
++          permissionMode: "auto",
++          thinkingLevel: "high",
++          confirm: true,
++        },
++      },
++    },
++    { "Mcp-Session-Id": sessionId },
++  );
++  assert.equal(setModel.body.result.isError, undefined);
++  assert.deepEqual(calls.at(-1), {
++    channel: "pi-desktop/session/setModel",
++    args: ["session-1", { providerId: "provider-1", modelId: "model-1" }],
++  });
++
++  const callCountBeforeIncompleteModel = calls.length;
++  const incompleteModel = await post(
++    info.url,
++    info.token,
++    {
++      jsonrpc: "2.0",
++      id: 35,
++      method: "tools/call",
++      params: {
++        name: "pi_session_set_model",
++        arguments: { id: "session-1", modelId: "model-1", confirm: true },
++      },
++    },
++    { "Mcp-Session-Id": sessionId },
++  );
++  assert.equal(incompleteModel.body.result.isError, true);
++  assert.equal(incompleteModel.body.result.structuredContent.error.code, "INVALID_PARAMS");
++  assert.equal(calls.length, callCountBeforeIncompleteModel);
++
+   const described = await post(
+     info.url,
+     info.token,
+@@ -779,6 +901,19 @@ test("renderer refresh events fire only for mutating control operations", () =>
+   );
+ });
+ 
++test("session control operations expose reviewed read and model-change metadata", () => {
++  const operations = createMcpControlOperations({
++    pendingInteractive: "pi-desktop/agent/pendingInteractive",
++    sessionSetModel: "pi-desktop/session/setModel",
++  });
++  const pending = operations.find((operation) => operation.id === "agent/pendingInteractive");
++  assert.equal(pending.risk, "read");
++  assert.deepEqual(pending.argumentShape, ["input"]);
++  const setModel = operations.find((operation) => operation.id === "session/setModel");
++  assert.equal(setModel.risk, "dangerous");
++  assert.deepEqual(setModel.argumentShape, ["id", "config"]);
++});
++
+ test("the reviewed catalog never includes picker or secret-write channels", () => {
+   const operations = createMcpControlOperations({
+     appGetVersion: "pi-desktop/app/getVersion",
+diff --git a/crates/host-core/src/rpc/mod.rs b/crates/host-core/src/rpc/mod.rs
+index 4f86af6..464529b 100644
+--- a/crates/host-core/src/rpc/mod.rs
++++ b/crates/host-core/src/rpc/mod.rs
+@@ -777,6 +777,39 @@ fn permission_parent_param(params: &Value) -> Result<Option<String>, JsonRpcErro
+     Ok(Some(parent_id.to_string()))
+ }
+ 
++/// Require a non-empty, bounded string without rewriting the caller's value.
++fn required_bounded_string(
++    params: &Value,
++    name: &str,
++    max_bytes: usize,
++) -> Result<String, JsonRpcError> {
++    let Some(value) = params.get(name) else {
++        return Err(rpc_err(1002, format!("{name} required"), "INVALID_PARAMS"));
++    };
++    let Some(value) = value.as_str() else {
++        return Err(rpc_err(
++            1002,
++            format!("{name} must be a string"),
++            "INVALID_PARAMS",
++        ));
++    };
++    if value.trim().is_empty() {
++        return Err(rpc_err(
++            1002,
++            format!("{name} must not be empty"),
++            "INVALID_PARAMS",
++        ));
++    }
++    if value.len() > max_bytes {
++        return Err(rpc_err(
++            1002,
++            format!("{name} must not exceed {max_bytes} bytes"),
++            "INVALID_PARAMS",
++        ));
++    }
++    Ok(value.to_string())
++}
++
+ /// Drop the per-session files and caches that live outside SQLite. Shared by
+ /// `session.delete` and `projects.remove` so removing a project cleans up
+ /// exactly the same side data as deleting one session.
+@@ -2808,6 +2841,57 @@ async fn handle_request(
+             )?;
+             Ok(json!({ "session": session }))
+         }
++        "session.setModel" => {
++            let Some(object) = params.as_object() else {
++                return Err(rpc_err(
++                    1002,
++                    "session.setModel params must be an object",
++                    "INVALID_PARAMS",
++                ));
++            };
++            if let Some(field) = object
++                .keys()
++                .find(|field| !matches!(field.as_str(), "id" | "providerId" | "modelId"))
++            {
++                return Err(rpc_err(
++                    1002,
++                    format!("{field} is not accepted by session.setModel"),
++                    "INVALID_PARAMS",
++                ));
++            }
++            let id = required_bounded_string(&params, "id", 256)?;
++            let provider_id = required_bounded_string(&params, "providerId", 128)?;
++            let model_id = required_bounded_string(&params, "modelId", 256)?;
++            let st = state.lock().await;
++            let mode = sessions::session_summary(&st.db, &id)
++                .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?
++                .ok_or_else(|| rpc_err(1007, "session not found", "NOT_FOUND"))?
++                .mode;
++            let session = sessions::configure_session_with_thinking(
++                &st.db,
++                &id,
++                &mode,
++                Some(&provider_id),
++                Some(&model_id),
++                None,
++                None,
++            )
++            .map_err(|e| {
++                let message = e.to_string();
++                if message.starts_with("PLAN_") {
++                    plan_rpc_err(message)
++                } else {
++                    rpc_err(1002, message, "INVALID_PARAMS")
++                }
++            })?
++            .ok_or_else(|| rpc_err(1007, "session not found", "NOT_FOUND"))?;
++            let session = remote_tools::decorate_session(
++                &st.db,
++                serde_json::to_value(session)
++                    .map_err(|e| rpc_err(1000, e.to_string(), "INTERNAL"))?,
++            )?;
++            Ok(json!({ "session": session }))
++        }
+         "session.delete" => {
+             let id = params
+                 .get("id")
+@@ -10296,6 +10380,312 @@ mod tests {
+         let st = state.lock().await;
+         assert_eq!(st.plugins.locale(), "en-US");
+     }
++
++    #[tokio::test]
++    async fn session_set_model_updates_only_provider_and_model() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let mut app_state = AppState::open(data_dir.path()).unwrap();
++        app_state.handshook = true;
++        let session = sessions::create_session_with_options(
++            &app_state.db,
++            sessions::SessionCreateOptions {
++                title: Some("Model".into()),
++                mode: Some("plan".into()),
++                provider_id: Some("old-provider".into()),
++                model_id: Some("old-model".into()),
++                project_path: None,
++                thinking_level: Some("high".into()),
++                permission_mode: Some("auto".into()),
++            },
++        )
++        .unwrap();
++        let id = session.id.clone();
++        let state = Arc::new(Mutex::new(app_state));
++        let tx = mpsc::unbounded_channel().0;
++
++        let updated = handle_request(
++            state.clone(),
++            "session.setModel",
++            json!({ "id": id, "providerId": "new-provider", "modelId": "new-model" }),
++            tx.clone(),
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(updated["session"]["id"], id);
++        assert_eq!(updated["session"]["providerId"], "new-provider");
++        assert_eq!(updated["session"]["modelId"], "new-model");
++        assert_eq!(updated["session"]["mode"], "plan");
++        assert_eq!(updated["session"]["thinkingLevel"], "high");
++        assert_eq!(updated["session"]["permissionMode"], "auto");
++        {
++            let st = state.lock().await;
++            let stored = sessions::session_summary(&st.db, &id).unwrap().unwrap();
++            assert_eq!(stored.provider_id.as_deref(), Some("new-provider"));
++            assert_eq!(stored.model_id.as_deref(), Some("new-model"));
++            assert_eq!(stored.mode, "plan");
++            assert_eq!(stored.thinking_level, "high");
++            assert_eq!(stored.permission_mode, "auto");
++        }
++
++        // session.configure keeps its existing contract and must not clear the
++        // binding that setModel wrote.
++        let configured = handle_request(
++            state,
++            "session.configure",
++            json!({ "id": id, "mode": "agent" }),
++            tx,
++        )
++        .await
++        .unwrap();
++        assert_eq!(configured["session"]["mode"], "agent");
++        assert_eq!(configured["session"]["providerId"], "new-provider");
++        assert_eq!(configured["session"]["modelId"], "new-model");
++        assert_eq!(configured["session"]["thinkingLevel"], "high");
++        assert_eq!(configured["session"]["permissionMode"], "auto");
++    }
++
++    #[tokio::test]
++    async fn session_set_model_rejects_invalid_and_unsupported_parameters() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let mut app_state = AppState::open(data_dir.path()).unwrap();
++        app_state.handshook = true;
++        let session = sessions::create_session_with_options(
++            &app_state.db,
++            sessions::SessionCreateOptions {
++                title: Some("Model".into()),
++                mode: Some("agent".into()),
++                provider_id: Some("old-provider".into()),
++                model_id: Some("old-model".into()),
++                project_path: None,
++                thinking_level: Some("medium".into()),
++                permission_mode: Some("ask".into()),
++            },
++        )
++        .unwrap();
++        let id = session.id.clone();
++        let state = Arc::new(Mutex::new(app_state));
++        let tx = mpsc::unbounded_channel().0;
++        let long_id = "a".repeat(257);
++        let long_provider = "p".repeat(129);
++        let long_model = "m".repeat(257);
++
++        let cases = vec![
++            (json!({ "providerId": "p", "modelId": "m" }), "id"),
++            (json!({ "id": "", "providerId": "p", "modelId": "m" }), "id"),
++            (
++                json!({ "id": "   ", "providerId": "p", "modelId": "m" }),
++                "id",
++            ),
++            (
++                json!({ "id": long_id, "providerId": "p", "modelId": "m" }),
++                "id",
++            ),
++            (json!({ "id": id, "modelId": "m" }), "providerId"),
++            (
++                json!({ "id": id, "providerId": "", "modelId": "m" }),
++                "providerId",
++            ),
++            (
++                json!({ "id": id, "providerId": long_provider, "modelId": "m" }),
++                "providerId",
++            ),
++            (json!({ "id": id, "providerId": "p" }), "modelId"),
++            (
++                json!({ "id": id, "providerId": "p", "modelId": " " }),
++                "modelId",
++            ),
++            (
++                json!({ "id": id, "providerId": "p", "modelId": long_model }),
++                "modelId",
++            ),
++            (
++                json!({ "id": id, "providerId": "p", "modelId": "m", "mode": "agent" }),
++                "mode",
++            ),
++            (
++                json!({
++                    "id": id,
++                    "providerId": "p",
++                    "modelId": "m",
++                    "permissionMode": "auto"
++                }),
++                "permissionMode",
++            ),
++            (
++                json!({
++                    "id": id,
++                    "providerId": "p",
++                    "modelId": "m",
++                    "thinkingLevel": "high"
++                }),
++                "thinkingLevel",
++            ),
++            (
++                json!({
++                    "id": id,
++                    "providerId": "p",
++                    "modelId": "m",
++                    "title": "renamed"
++                }),
++                "title",
++            ),
++            (
++                json!({ "id": id, "providerId": "p", "modelId": "m", "thinking": "high" }),
++                "thinking",
++            ),
++            (
++                json!({ "id": id, "providerId": 1, "modelId": "m" }),
++                "providerId",
++            ),
++        ];
++
++        for (params, field) in cases {
++            let error = handle_request(state.clone(), "session.setModel", params, tx.clone())
++                .await
++                .unwrap_err();
++            assert_eq!(error.code, 1002, "{field}");
++            let data = error.data.unwrap();
++            assert_eq!(data["errorCode"], "INVALID_PARAMS", "{field}");
++            assert!(error.message.contains(field), "{field}: {}", error.message);
++        }
++
++        let st = state.lock().await;
++        let stored = sessions::session_summary(&st.db, &id).unwrap().unwrap();
++        assert_eq!(stored.provider_id.as_deref(), Some("old-provider"));
++        assert_eq!(stored.model_id.as_deref(), Some("old-model"));
++        assert_eq!(stored.mode, "agent");
++        assert_eq!(stored.thinking_level, "medium");
++        assert_eq!(stored.permission_mode, "ask");
++    }
++
++    #[tokio::test]
++    async fn session_set_model_requires_an_existing_session() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let mut app_state = AppState::open(data_dir.path()).unwrap();
++        app_state.handshook = true;
++        let state = Arc::new(Mutex::new(app_state));
++        let tx = mpsc::unbounded_channel().0;
++
++        let error = handle_request(
++            state,
++            "session.setModel",
++            json!({ "id": "missing", "providerId": "p", "modelId": "m" }),
++            tx,
++        )
++        .await
++        .unwrap_err();
++        assert_eq!(error.code, 1007);
++        assert_eq!(error.data.unwrap()["errorCode"], "NOT_FOUND");
++    }
++
++    #[tokio::test]
++    async fn session_set_model_is_blocked_while_a_turn_is_running() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let mut app_state = AppState::open(data_dir.path()).unwrap();
++        app_state.handshook = true;
++        let session = sessions::create_session_with_options(
++            &app_state.db,
++            sessions::SessionCreateOptions {
++                title: Some("Busy".into()),
++                mode: Some("agent".into()),
++                provider_id: Some("old-provider".into()),
++                model_id: Some("old-model".into()),
++                project_path: None,
++                thinking_level: Some("medium".into()),
++                permission_mode: Some("ask".into()),
++            },
++        )
++        .unwrap();
++        let id = session.id.clone();
++        let turn_id = sessions::begin_turn(&app_state.db, &id, None, None).unwrap();
++        let state = Arc::new(Mutex::new(app_state));
++        let tx = mpsc::unbounded_channel().0;
++
++        let error = handle_request(
++            state.clone(),
++            "session.setModel",
++            json!({ "id": id, "providerId": "new-provider", "modelId": "new-model" }),
++            tx,
++        )
++        .await
++        .unwrap_err();
++        assert_eq!(
++            error.data.unwrap()["errorCode"],
++            "PLAN_CONFIGURATION_BLOCKED"
++        );
++
++        let st = state.lock().await;
++        let stored = sessions::session_summary(&st.db, &id).unwrap().unwrap();
++        assert_eq!(stored.provider_id.as_deref(), Some("old-provider"));
++        assert_eq!(stored.model_id.as_deref(), Some("old-model"));
++        assert_eq!(stored.mode, "agent");
++        assert_eq!(stored.thinking_level, "medium");
++        assert_eq!(stored.permission_mode, "ask");
++        sessions::end_turn(&st.db, &turn_id, "aborted", None, None, false).unwrap();
++    }
++
++    #[tokio::test]
++    async fn session_set_model_is_blocked_by_a_pending_plan_approval() {
++        let data_dir = tempfile::tempdir().unwrap();
++        let workspace = data_dir.path().join("workspace");
++        fs::create_dir_all(&workspace).unwrap();
++        let mut app_state = AppState::open(data_dir.path()).unwrap();
++        app_state.handshook = true;
++        let session = sessions::create_session_with_options(
++            &app_state.db,
++            sessions::SessionCreateOptions {
++                title: Some("Plan".into()),
++                mode: Some("plan".into()),
++                provider_id: Some("old-provider".into()),
++                model_id: Some("old-model".into()),
++                project_path: Some(workspace.to_string_lossy().into_owned()),
++                thinking_level: Some("medium".into()),
++                permission_mode: Some("ask".into()),
++            },
++        )
++        .unwrap();
++        let id = session.id.clone();
++        let turn_id = sessions::begin_turn(&app_state.db, &id, None, None).unwrap();
++        app_state
++            .plans
++            .submit(
++                &app_state.db,
++                PlanSubmitParams {
++                    workspace_root: &workspace,
++                    session_id: &id,
++                    turn_id: &turn_id,
++                    tool_call_id: "set-model-plan",
++                    kind: crate::plans::KIND_PLAN,
++                    title: "Plan",
++                    markdown: "# Plan",
++                    question: "Proceed?",
++                },
++            )
++            .unwrap();
++        sessions::end_turn(&app_state.db, &turn_id, "aborted", None, None, false).unwrap();
++        let state = Arc::new(Mutex::new(app_state));
++        let tx = mpsc::unbounded_channel().0;
++
++        let error = handle_request(
++            state.clone(),
++            "session.setModel",
++            json!({ "id": id, "providerId": "new-provider", "modelId": "new-model" }),
++            tx,
++        )
++        .await
++        .unwrap_err();
++        assert_eq!(
++            error.data.unwrap()["errorCode"],
++            "PLAN_CONFIGURATION_BLOCKED"
++        );
++
++        let st = state.lock().await;
++        let stored = sessions::session_summary(&st.db, &id).unwrap().unwrap();
++        assert_eq!(stored.provider_id.as_deref(), Some("old-provider"));
++        assert_eq!(stored.model_id.as_deref(), Some("old-model"));
++        assert_eq!(stored.mode, "plan");
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/docs/adr/README.md b/docs/adr/README.md
+index 728f4e5..791531e 100644
+--- a/docs/adr/README.md
++++ b/docs/adr/README.md
+@@ -377,6 +377,7 @@ Each ADR includes:
+ | 0329 | [Isolate parallel sessions of one project in git worktrees](0329-session-worktree-isolation.md) | Accepted (Windows E2E pending) |
+ | 0330 | [Open scoped HTML files in the work-panel Browser from plugins](0330-open-html-files-in-work-panel-browser-from-plugins.md) | Accepted |
+ | 0331 | [Plugin session follow and host-owned work-panel reveal](0331-plugin-session-follow-and-work-panel-reveal.md) | Accepted |
++| 0332 | [Mobile session controls over the local MCP control plane](0332-mobile-session-controls-over-local-mcp.md) | Proposed (implementation candidate; Desktop patch required; mobile E2E pending) |
+ | plugin-fetch-redirect-policy | [Host-enforced plugin fetch redirect policy](plugin-fetch-redirect-policy.md) | Accepted (implementation candidate for #1475) |
+ 
+ | local-agent-remote-workspace-tools | [Local Agent and model requests for remote workspaces](local-agent-remote-workspace-tools.md) | Accepted for implementation |
+diff --git a/docs/project/unreleased.md b/docs/project/unreleased.md
+index 367d666..952ac0b 100644
+--- a/docs/project/unreleased.md
++++ b/docs/project/unreleased.md
+@@ -1 +1,12 @@
+ # Unreleased changes
++
++## Mobile session controls
++
++- Choose a model when creating a Desktop session from a paired mobile client,
++  and switch an idle session's model without changing its mode, thinking level,
++  or permission mode.
++- Review pending tool-permission and AskTool cards for local Desktop sessions,
++  then choose Allow once or Deny, or submit plain-text answers with explicit
++  skips.
++- A Desktop build without the additive operations keeps these controls
++  unavailable instead of falling back to broad session configuration.
+diff --git a/docs/spec/03-runtime/01-ipc-protocol.md b/docs/spec/03-runtime/01-ipc-protocol.md
+index 64c0fa9..a1af3ab 100644
+--- a/docs/spec/03-runtime/01-ipc-protocol.md
++++ b/docs/spec/03-runtime/01-ipc-protocol.md
+@@ -2394,9 +2394,9 @@ The named tools cover the common Agent workflow:
+ - `pi_project_get`, `pi_project_list`, `pi_project_open`, `pi_project_clear`
+ - `pi_session_list`, `pi_session_create`, `pi_session_get`,
+   `pi_session_rename`, `pi_session_fork`, `pi_session_delete`,
+-  `pi_session_configure`
++  `pi_session_configure`, `pi_session_set_model`
+ - `pi_agent_prompt`, `pi_agent_status`, `pi_agent_stop`, `pi_agent_abort`,
+-  `pi_agent_compact`
++  `pi_agent_compact`, `pi_agent_pending_interactive`
+ - `pi_plans_pending`, `pi_plans_resolve`
+ - `pi_workspace_diff`, `pi_fs_list`, `pi_fs_read`
+ 
+@@ -2417,15 +2417,16 @@ paths, settings writes, plugin/marketplace install, window/OS control, and
+ renderer-only native picker/dialog channels (including `plugin/loadDev`) are
+ not exposed. Secret-shaped argument fields are stripped before IPC dispatch.
+ Each catalog entry is tagged `read`, `write`, or `dangerous`; dangerous
+-generic operations and the named session-delete, session-configure, and
+-plan-resolution tools require `confirm: true`. That flag is an agent
+-acknowledgement, not a desktop user prompt. All calls still pass through the
+-existing IPC handler validation, host permissions, workspace boundaries, and
+-error model. Both the text payload and `structuredContent` are size-bounded to
+-512 KiB (`MAX_RESULT_CHARS`). A larger answer is not returned verbatim: it is
+-replaced by `{truncated: true, reason: "MCP_RESULT_LIMIT", preview: "<the first
+-512 KiB of the JSON>"}`, so an external caller can never receive a silently
+-shortened payload. If an oversized answer comes from `session/get`
++generic operations and the named session-delete, session-configure,
++session-set-model, and plan-resolution tools require `confirm: true`. That flag
++is an agent acknowledgement, not a desktop user prompt. All calls still pass
++through the existing IPC handler validation, host permissions, workspace
++boundaries, and error model. Both the text payload and `structuredContent` are
++size-bounded to 512 KiB (`MAX_RESULT_CHARS`). A larger answer is not returned
++verbatim: it is replaced by
++`{truncated: true, reason: "MCP_RESULT_LIMIT", preview: "<the first 512 KiB of
++the JSON>"}`, so an external caller can never receive a silently shortened
++payload. If an oversized answer comes from `session/get`
+ (`pi_session_get`) and carries a `compaction` record or a `compactions` history,
+ Main projects each record to the compact identity (`createdAt` and
+ `details.generation`) and checks the size again before returning the truncation
+@@ -2438,6 +2439,61 @@ overflow is independent of the transcript page. Results already under the limit
+ retain their full compaction details, and the desktop's own session detail is
+ unchanged.
+ 
++### Model catalog and idle-only model selection
++
++Two reviewed reads supply the external model catalog:
++`providers/list` lists configured providers without secrets, and
++`providers/listModels` returns a provider's cached models. An external client
++may use them to offer model creation and switching, but the Desktop remains the
++authority: it accepts only enabled providers and configured or cached models.
++
++`session/setModel` is an additive **dangerous** operation with argument shape
++`["id", "config"]`. `config` contains exactly `providerId` and `modelId`;
++missing, empty, or over-long values, unknown fields, a missing session, a
++native or remote session, a disabled provider, or an uncatalogued model are
++rejected. It changes only the durable provider/model binding for subsequent
++turns: mode, thinking level, permission mode, and title are preserved, and
++`session.configure` keeps its existing contract. A session with an active turn
++or a pending Plan/Goal approval fails closed instead of changing the binding.
++The operation returns the enriched session and broadcasts the existing
++`session:modelChanged` renderer event.
++
++The named `pi_session_set_model` tool requires `confirm: true` and accepts
++`{ id, providerId, modelId }`. A client must not emulate a model switch through
++`session/configure`: that operation accepts other configuration fields,
++including `permissionMode: "auto"`, and is not a model-only contract.
++
++### Pending interactions
++
++`agent/pendingInteractive` is an additive **read** operation with argument
++shape `["input"]`, where `input` is `{ sessionId }`. It returns
++`{ asks, permissions }` for that session only. Native Pi sessions answer
++empty on their own input path. Before reading a desktop id, Electron Main
++verifies that it names a local desktop session; remote sessions and unknown ids
++are refused rather than exposing another session's queue. The returned arrays
++are filtered by the requested session even when the underlying bridge holds
++requests for several sessions.
++
++The named `pi_agent_pending_interactive` tool accepts `{ sessionId }`.
++Resolution continues through the existing reviewed operations:
++`tool/resolvePermission` (dangerous, `{ requestId, decision }`) and
++`agent/askTool/resolve` (dangerous, `{ sessionId, requestId, answers }`). Both
++require `confirm: true`. `decision` is `allow-once`, `allow-session`, or `deny`
++at the local contract; a constrained remote client should offer only
++`allow-once` and `deny`. `answers` is `Array<string[] | null>` with one entry
++per question; `null` means the question was explicitly skipped, a non-empty
++array carries plain-text answer values, and a single-select answer has at most
++one value. Pending requests are Desktop state, so reading is intentionally
++separate from resolving and the first valid resolution wins.
++
++Compatibility is capability-based. A Desktop build that does not expose these
++operation ids cannot be driven through them; clients must keep the model
++selection and approval surfaces unavailable instead of falling back to
++`session/configure` or generic IPC. The installed 0.20.1 build does not expose
++`agent/pendingInteractive` or `session/setModel` through this control plane;
++remote interaction and safe model switching require the additive Desktop patch
++described by ADR 0332.
++
+ The six `session/collaboration/*` operations are first-party-plugin-only: they
+ require an authenticated plugin tool invocation context, so they appear in
+ `pi.desktop.listOperations` and are callable through `pi.desktop.invoke`, but
+diff --git a/docs/spec/03-runtime/03-tools-and-permissions.md b/docs/spec/03-runtime/03-tools-and-permissions.md
+index 175d260..ec5094d 100644
+--- a/docs/spec/03-runtime/03-tools-and-permissions.md
++++ b/docs/spec/03-runtime/03-tools-and-permissions.md
+@@ -592,6 +592,14 @@ Permission confirmation:
+ - The local approval remains pending until Allow once, Allow for session, Deny,
+   cancellation, or host/process shutdown. Tool-specific execution timeouts
+   still apply after approval.
++- A constrained external client may read the session's pending cards through
++  the local MCP control plane and resolve them through the same host-owned
++  paths. It can offer `allow-once` and `deny` for a tool permission; it cannot
++  grant `allow-session`, change `permissionMode`, or answer Plan/Goal or
++  extension prompts. AskTool responses carry plain-text values with an
++  explicit `null` for a skipped question. The first valid resolution wins, and
++  an unconfirmed response is never replayed automatically
++  (`01-ipc-protocol.md` §13d, ADR 0332).
+ 
+ ## 8. Tool Result Visibility to the Model
+ 
+diff --git a/docs/spec/03-runtime/13-model-catalog-and-selection.md b/docs/spec/03-runtime/13-model-catalog-and-selection.md
+index 5bc62ea..bdee172 100644
+--- a/docs/spec/03-runtime/13-model-catalog-and-selection.md
++++ b/docs/spec/03-runtime/13-model-catalog-and-selection.md
+@@ -244,6 +244,14 @@ execution time, except `omit`, which is preserved on a reasoning model and
+ sends no thinking override. An empty binding or a binding containing only
+ `off` resolves to `off`.
+ 
++The local MCP control plane exposes an additive model-only switch for idle
++sessions (`session/setModel`). Unlike a Composer model switch, it does not
++rewrite `thinkingLevel`: it changes only `providerId` and `modelId`, leaves
++mode, thinking level, permission mode, and title untouched, and is rejected
++while a turn is running or a Plan/Goal approval is pending. New-session model
++selection uses the same provider/model identity and is verified by reading the
++created session back. See `01-ipc-protocol.md` §13d and ADR 0332.
++
+ For a newly created session or explicit model switch, the renderer resolves the
+ selected (or app-default) model's `ModelBinding`. A catalog-matched reasoning
+ model starts at that binding's `defaultThinkingLevel` (`omit` is preserved;
+diff --git a/docs/spec/06-delivery/04-e2e-test-plan.md b/docs/spec/06-delivery/04-e2e-test-plan.md
+index fc3b8c2..6fa4e05 100644
+--- a/docs/spec/06-delivery/04-e2e-test-plan.md
++++ b/docs/spec/06-delivery/04-e2e-test-plan.md
+@@ -18217,3 +18217,52 @@ host-created files. The full app's file-preview viewer is covered separately.
+   `ui.view` gating, panel-bridge channel) and the wiring contract in
+   `apps/desktop/test/main-wiring-contract.test.mjs`; the interactive Electron
+   scenario remains a manual validation run.
++
++### E2E-268: A mobile client selects models and resolves pending interactions
++
++- **Preconditions**: A patched PI-Desktop candidate based on
++  `589e5803a7a9f4ebf7ec1e8849c43e44b4a198f7` starts with
++  `PI_DESKTOP_MCP_CONTROL=1`. A local project and an idle local desktop session
++  exist. A second session can produce one tool-permission request and one
++  AskTool question; a native Pi or remote session is also present for a scope
++  check.
++- **Steps**:
++  1. Read `mcp-control.json`, complete the MCP handshake, and call
++     `tools/list` and `pi_control_describe`.
++  2. Create a session with a configured `providerId` and `modelId`, then read
++     it back.
++  3. Call `pi_session_set_model` for the idle session without `confirm`, then
++     with `confirm: true` and one extra configuration field. Read the session
++     again after a valid switch.
++  4. Trigger a tool permission request and an AskTool question. Call
++     `pi_agent_pending_interactive` for the local session, then for the native
++     or remote session id.
++  5. Resolve the permission with `allow-once`; repeat a separate request with
++     `deny`. Submit AskTool answers containing one option value, one free-text
++     value, and one explicit `null`.
++  6. Start a turn, then call `pi_session_set_model` while it runs. Repeat with
++     a pending Plan approval.
++- **Expected**: `pi_control_describe` lists `agent/pendingInteractive` as
++  `read` and `session/setModel` as `dangerous`; `tools/list` includes
++  `pi_agent_pending_interactive` and `pi_session_set_model`. Creation returns
++  the requested provider/model. `pi_session_set_model` requires `confirm`,
++  accepts exactly `providerId` and `modelId`, preserves mode, thinking level,
++  permission mode, and title, and rejects an extra configuration field. A
++  running turn or pending Plan approval leaves the old binding unchanged. The
++  pending read returns only the requested session's asks and permissions;
++  native Pi sessions return empty, while remote and unknown ids return
++  `NOT_FOUND` instead of data. Allow
++  once executes only that call, deny prevents execution, and the AskTool result
++  preserves plain-text values and skipped questions. The first valid resolution
++  wins; a lost acknowledgement is reconciled by re-reading and is not replayed.
++- **Specs linked**: `03-runtime/01-ipc-protocol.md` §13d,
++  `03-runtime/03-tools-and-permissions.md` §6–7,
++  `03-runtime/13-model-catalog-and-selection.md` §4, ADR 0203, ADR 0332.
++- **Acceptance**: A (app control), C (sessions), Security, Quality.
++- **Status**: Automated source-contract coverage is added in
++  `apps/desktop/test/mcp-control.test.mjs`,
++  `apps/desktop/test/pending-interactive-scope.test.mjs`,
++  `apps/desktop/test/session-model-only.test.mjs`, and the host-core
++  `session.setModel` tests. The documentation change that added this scenario
++  did not run them. The full Electron-to-mobile journey remains **NOT RUN** and
++  requires the patched Desktop build.
+diff --git a/packages/shared/src/protocol.ts b/packages/shared/src/protocol.ts
+index 7635845..aacabac 100644
+--- a/packages/shared/src/protocol.ts
++++ b/packages/shared/src/protocol.ts
+@@ -162,6 +162,8 @@ export const IPC = {
+     /** Deterministic first-prompt title for a session that is still untitled. */
+     sessionDeriveTitle: "pi-desktop/session/deriveTitle",
+     sessionConfigure: "pi-desktop/session/configure",
++    /** Change only the provider/model binding, preserving mode, permission, and thinking. */
++    sessionSetModel: "pi-desktop/session/setModel",
+     sessionImportScan: "pi-desktop/session/importScan",
+     sessionImportRun: "pi-desktop/session/importRun",
+     modelConfigImportScan: "pi-desktop/modelConfig/importScan",
+diff --git a/apps/desktop/test/pending-interactive-scope.test.mjs b/apps/desktop/test/pending-interactive-scope.test.mjs
+new file mode 100644
+index 0000000..0572566
+--- /dev/null
++++ b/apps/desktop/test/pending-interactive-scope.test.mjs
+@@ -0,0 +1,167 @@
++/**
++ * `pendingInteractive` is now reachable through the external MCP control
++ * plane. The handler must keep reading only this desktop's own session queue:
++ * a remote or unknown id must fail closed instead of returning an empty (or
++ * another session's) set of cards, while native Pi sessions keep the empty
++ * renderer contract.
++ *
++ * The test drives the real `registerAgentIpc` callback with fake host and
++ * bridge. When a workspace dependency is unavailable in a partial checkout,
++ * the resolver below falls back to its source or a minimal stub; a complete
++ * checkout keeps using the installed packages.
++ */
++import assert from "node:assert/strict";
++import { register } from "node:module";
++import { dirname, join } from "node:path";
++import test from "node:test";
++import { fileURLToPath, pathToFileURL } from "node:url";
++
++const here = dirname(fileURLToPath(import.meta.url));
++const repoRoot = join(here, "../../..");
++register(pathToFileURL(join(here, "helpers/ts-import-hooks.mjs")));
++
++const dataModule = (source) => `data:text/javascript,${encodeURIComponent(source)}`;
++const fallbacks = {
++  "@pi-desktop/shared": pathToFileURL(join(repoRoot, "packages/shared/src/index.ts")).href,
++  "@pi-desktop/agent-runtime": dataModule(`
++export function expandSlashInvocation() { throw new Error("agent-runtime is unavailable"); }
++export function visionFromModelConfig() { throw new Error("agent-runtime is unavailable"); }
++`),
++  "@pi-desktop/host-runtime": dataModule(`
++export function executionFromResponse() { throw new Error("host-runtime is unavailable"); }
++export function resolveSessionMessageInput() { throw new Error("host-runtime is unavailable"); }
++`),
++  typebox: dataModule(`
++const inert = new Proxy(function () {}, {
++  get: () => inert,
++  apply: () => inert,
++  construct: () => inert,
++});
++export default new Proxy({}, { get: () => inert });
++`),
++};
++register(dataModule(`
++const fallbacks = ${JSON.stringify(fallbacks)};
++export async function resolve(specifier, context, next) {
++  try {
++    return await next(specifier, context);
++  } catch (error) {
++    if (error?.code === "ERR_MODULE_NOT_FOUND" && Object.prototype.hasOwnProperty.call(fallbacks, specifier)) {
++      return { url: fallbacks[specifier], shortCircuit: true };
++    }
++    throw error;
++  }
++}
++`));
++
++const { registerAgentIpc } = await import(
++  pathToFileURL(join(here, "../electron/main/ipc/agent-ipc.ts")).href
++);
++const { IPC, ErrorCodes } = await import("@pi-desktop/shared");
++
++const askFor = (sessionId, requestId) => ({
++  sessionId,
++  requestId,
++  toolCallId: `tool-${requestId}`,
++  questions: [{ question: "Which branch should I use?", options: [] }],
++});
++
++const permissionFor = (sessionId, requestId) => ({
++  sessionId,
++  requestId,
++  toolCallId: `tool-${requestId}`,
++  toolName: "shell",
++});
++
++function createPendingHandler({ sessions = [], pending = { asks: [], permissions: [] } } = {}) {
++  const handlers = new Map();
++  const hostCalls = [];
++  const bridgeCalls = [];
++  registerAgentIpc({
++    registrar: { handle: (channel, fn) => handlers.set(channel, fn) },
++    getHost: () => ({
++      call: async (method) => {
++        hostCalls.push(method);
++        if (method === "session.list") return { sessions };
++        throw new Error(`unexpected host call: ${method}`);
++      },
++    }),
++    getSidecar: () => null,
++    getAgentHostBridge: () => ({
++      pendingInteractiveRequests: async (sessionId) => {
++        bridgeCalls.push(sessionId);
++        return pending;
++      },
++    }),
++    logger: { app() {} },
++  });
++  const handle = handlers.get(IPC.invoke.pendingInteractive);
++  assert.ok(handle, "pendingInteractive handler must be registered");
++  return { handle, hostCalls, bridgeCalls };
++}
++
++test("pending interactive keeps only the requested local session's cards", async () => {
++  const pending = {
++    asks: [askFor("session-a", "ask-a"), askFor("session-b", "ask-b")],
++    permissions: [
++      permissionFor("session-a", "perm-a"),
++      permissionFor("session-b", "perm-b"),
++    ],
++  };
++  const { handle, hostCalls, bridgeCalls } = createPendingHandler({
++    sessions: [
++      { id: "session-a", source: "desktop" },
++      { id: "session-b", source: "desktop" },
++    ],
++    pending,
++  });
++
++  const restored = await handle({ sessionId: " session-a " });
++
++  assert.deepEqual(restored, {
++    asks: [askFor("session-a", "ask-a")],
++    permissions: [permissionFor("session-a", "perm-a")],
++  });
++  assert.deepEqual(hostCalls, ["session.list"]);
++  assert.deepEqual(bridgeCalls, ["session-a"]);
++});
++
++test("unknown, remote, and non-desktop sessions fail closed", async () => {
++  const { handle, hostCalls, bridgeCalls } = createPendingHandler({
++    sessions: [
++      { id: "local-a", source: "desktop" },
++      { id: "remote-a", source: "remote", remoteHostKey: "host-1" },
++      { id: "remote-b", remoteHostKey: "host-2" },
++      { id: "native-row", source: "pi-native" },
++    ],
++    pending: { asks: [askFor("local-a", "ask-a")], permissions: [] },
++  });
++
++  for (const sessionId of ["missing", "remote-a", "remote-b", "native-row"]) {
++    await assert.rejects(
++      () => handle({ sessionId }),
++      (error) => error.errorCode === ErrorCodes.NOT_FOUND,
++      `${sessionId} must not read a pending queue`,
++    );
++  }
++  assert.equal(bridgeCalls.length, 0);
++  assert.equal(hostCalls.length, 4);
++});
++
++test("native sessions keep the empty contract and oversized ids are rejected", async () => {
++  const { handle, hostCalls, bridgeCalls } = createPendingHandler({
++    sessions: [{ id: "local-a", source: "desktop" }],
++  });
++
++  assert.deepEqual(await handle({ sessionId: "native-pi:abc" }), { asks: [], permissions: [] });
++  await assert.rejects(
++    () => handle({ sessionId: "x".repeat(257) }),
++    (error) => error.errorCode === ErrorCodes.INVALID_ARGUMENT,
++  );
++  await assert.rejects(
++    () => handle({ sessionId: "   " }),
++    (error) => error.errorCode === ErrorCodes.INVALID_ARGUMENT,
++  );
++  assert.equal(hostCalls.length, 0);
++  assert.equal(bridgeCalls.length, 0);
++});
+diff --git a/apps/desktop/test/session-model-only.test.mjs b/apps/desktop/test/session-model-only.test.mjs
+new file mode 100644
+index 0000000..5a44a8c
+--- /dev/null
++++ b/apps/desktop/test/session-model-only.test.mjs
+@@ -0,0 +1,293 @@
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import test from "node:test";
++import ts from "typescript";
++import { ErrorCodes } from "../../../packages/shared/src/errors.ts";
++import { IPC, IPC_WHITELIST } from "../../../packages/shared/src/protocol.ts";
++
++function load(relative, imports) {
++  const file = new URL(relative, import.meta.url);
++  const { outputText } = ts.transpileModule(fs.readFileSync(file, "utf8"), {
++    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
++    fileName: file.pathname,
++  });
++  const module = { exports: {} };
++  new Function("require", "exports", "module", outputText)((id) => {
++    assert.ok(Object.hasOwn(imports, id), `unexpected IPC dependency: ${id}`);
++    return imports[id];
++  }, module.exports, module);
++  return module.exports;
++}
++
++const shared = {
++  ErrorCodes,
++  IPC,
++  IPC_WHITELIST,
++  modelConfigImportKey: () => null,
++  publicModelConfigCandidate: (candidate) => candidate,
++  draftMatchesExisting: () => false,
++  providerCreateInputFromDraft: (draft) => draft,
++  isModelConfigImportSource: () => false,
++};
++
++const remoteState = { boot: null };
++const { registerSessionIpc } = load("../electron/main/ipc/session-ipc.ts", {
++  electron: { shell: {} },
++  "node:fs": fs,
++  "node:path": path,
++  "@pi-desktop/shared": shared,
++  "../importers": {},
++  "../services/session-collaboration": {},
++  "../services/session-search": {},
++  "../bootstrap/remote-hosts.js": {
++    getActiveRemoteHostsBoot: () => remoteState.boot,
++  },
++});
++
++const providers = [
++  {
++    id: "provider-a",
++    name: "Provider A",
++    enabled: true,
++    models: [{ id: "model-a" }, { id: "model-b" }],
++    defaultModelId: "model-a",
++  },
++  {
++    id: "provider-disabled",
++    name: "Disabled",
++    enabled: false,
++    models: [{ id: "model-d" }],
++  },
++];
++
++function harness({
++  sessions = [
++    {
++      id: "session-1",
++      source: "desktop",
++      mode: "plan",
++      permissionMode: "ask",
++      thinkingLevel: "high",
++      providerId: "provider-a",
++      modelId: "model-a",
++    },
++  ],
++  cachedModels = [],
++  setModel = async () => ({
++    session: {
++      id: "session-1",
++      mode: "plan",
++      permissionMode: "ask",
++      thinkingLevel: "high",
++      providerId: "provider-a",
++      modelId: "model-b",
++    },
++  }),
++} = {}) {
++  remoteState.boot = null;
++  const handlers = new Map();
++  const calls = [];
++  const events = [];
++  registerSessionIpc({
++    registrar: { handle: (channel, handler) => handlers.set(channel, handler) },
++    getHost: () => ({
++      call: async (method, input) => {
++        calls.push({ method, input });
++        if (method === "session.list") return { sessions };
++        if (method === "providers.listModels") return { models: cachedModels };
++        if (method === "session.setModel") return setModel(method, input);
++        throw new Error(`unexpected host call: ${method}`);
++      },
++    }),
++    getSidecar: () => null,
++    dataDir: "/tmp/pi-desktop-session-model-test",
++    activeTurns: new Map(),
++    sessionProjects: new Map(),
++    persistenceOutbox: {},
++    logger: { app: () => undefined },
++    plugins: {
++      broadcastEvent: (channel, payload) => events.push({ channel, payload }),
++    },
++    sessionCapabilityContext: async () => ({ providers, defaults: {} }),
++    enrichSession: (session) => ({ ...session, supportsReasoning: true }),
++    acquireSessionOperation: async () => () => undefined,
++    beginTranscriptRewrite: () => ({ commit() {}, rollback() {} }),
++    forgetTranscriptRewriteHistory: () => undefined,
++    stripWinLongPrefix: (value) => value,
++  });
++  const handle = handlers.get(IPC.invoke.sessionSetModel);
++  assert.equal(typeof handle, "function");
++  return { handle, calls, events };
++}
++
++test("the model-only channel is a registered shared IPC contract", () => {
++  assert.equal(IPC.invoke.sessionSetModel, "pi-desktop/session/setModel");
++  assert.equal(IPC_WHITELIST.has(IPC.invoke.sessionSetModel), true);
++});
++
++test("setModel rejects configs with unknown or missing fields before any write", async () => {
++  const cases = [
++    { providerId: "provider-a", modelId: "model-b", mode: "agent" },
++    { providerId: "provider-a", modelId: "model-b", thinkingLevel: "off" },
++    { providerId: "provider-a" },
++    {},
++  ];
++  for (const config of cases) {
++    const { handle, calls } = harness();
++    await assert.rejects(handle("session-1", config), {
++      errorCode: ErrorCodes.INVALID_ARGUMENT,
++    });
++    assert.deepEqual(calls, []);
++  }
++});
++
++test("setModel bounds the id and the two config strings", async () => {
++  const cases = [
++    "",
++    "   ",
++    "a".repeat(257),
++  ];
++  for (const id of cases) {
++    const { handle, calls } = harness();
++    await assert.rejects(handle(id, { providerId: "provider-a", modelId: "model-b" }), {
++      errorCode: ErrorCodes.INVALID_ARGUMENT,
++    });
++    assert.deepEqual(calls, []);
++  }
++  for (const config of [
++    { providerId: "", modelId: "model-b" },
++    { providerId: "provider-a", modelId: " " },
++    { providerId: "p".repeat(129), modelId: "model-b" },
++    { providerId: "provider-a", modelId: "m".repeat(257) },
++  ]) {
++    const { handle, calls } = harness();
++    await assert.rejects(handle("session-1", config), {
++      errorCode: ErrorCodes.INVALID_ARGUMENT,
++    });
++    assert.deepEqual(calls, []);
++  }
++});
++
++test("setModel rejects native and remote sessions without touching the host", async () => {
++  const native = harness();
++  await assert.rejects(
++    native.handle("native-pi:fixture", { providerId: "provider-a", modelId: "model-b" }),
++    { errorCode: ErrorCodes.INVALID_ARGUMENT },
++  );
++  assert.deepEqual(native.calls, []);
++
++  const remote = harness();
++  remoteState.boot = {
++    sessionSummaries: () => [
++      { id: "remote:host-a:session-1", source: "remote", remoteHostKey: "host-a" },
++    ],
++  };
++  try {
++    await assert.rejects(
++      remote.handle("remote:host-a:session-1", {
++        providerId: "provider-a",
++        modelId: "model-b",
++      }),
++      { errorCode: ErrorCodes.INVALID_ARGUMENT },
++    );
++  } finally {
++    remoteState.boot = null;
++  }
++  assert.deepEqual(remote.calls, []);
++});
++
++test("setModel calls the host RPC and broadcasts the model change", async () => {
++  const { handle, calls, events } = harness();
++  const result = await handle("session-1", {
++    providerId: "provider-a",
++    modelId: "model-b",
++  });
++
++  assert.deepEqual(calls, [
++    { method: "session.list", input: undefined },
++    {
++      method: "session.setModel",
++      input: { id: "session-1", providerId: "provider-a", modelId: "model-b" },
++    },
++  ]);
++  assert.equal(calls.some((call) => call.method === "session.configure"), false);
++  assert.equal(result.session.id, "session-1");
++  assert.equal(result.session.providerId, "provider-a");
++  assert.equal(result.session.modelId, "model-b");
++  assert.equal(result.session.mode, "plan");
++  assert.equal(result.session.permissionMode, "ask");
++  assert.equal(result.session.thinkingLevel, "high");
++  assert.equal(result.session.supportsReasoning, true);
++  assert.deepEqual(events, [
++    {
++      channel: "session:modelChanged",
++      payload: [
++        {
++          sessionId: "session-1",
++          modelKey: "provider-a/model-b",
++          thinkingLevel: "high",
++        },
++      ],
++    },
++  ]);
++});
++
++test("setModel accepts a cached catalog model without a binding", async () => {
++  const { handle, calls, events } = harness({
++    cachedModels: [{ modelId: "model-cached", displayName: "Cached model" }],
++    setModel: async () => ({
++      session: {
++        id: "session-1",
++        mode: "plan",
++        permissionMode: "ask",
++        thinkingLevel: "high",
++        providerId: "provider-a",
++        modelId: "model-cached",
++      },
++    }),
++  });
++  const result = await handle("session-1", {
++    providerId: "provider-a",
++    modelId: "model-cached",
++  });
++
++  assert.deepEqual(calls.map((call) => call.method), [
++    "session.list",
++    "providers.listModels",
++    "session.setModel",
++  ]);
++  assert.deepEqual(calls[1].input, { providerId: "provider-a" });
++  assert.deepEqual(calls[2].input, {
++    id: "session-1",
++    providerId: "provider-a",
++    modelId: "model-cached",
++  });
++  assert.equal(result.session.modelId, "model-cached");
++  assert.equal(events.length, 1);
++});
++
++test("setModel rejects unconfigured providers and unknown models before mutating", async () => {
++  for (const config of [
++    { providerId: "missing-provider", modelId: "model-b" },
++    { providerId: "provider-disabled", modelId: "model-d" },
++    { providerId: "provider-a", modelId: "missing-model" },
++  ]) {
++    const { handle, calls, events } = harness();
++    await assert.rejects(handle("session-1", config), {
++      errorCode: ErrorCodes.INVALID_ARGUMENT,
++    });
++    assert.equal(calls.some((call) => call.method === "session.setModel"), false);
++    assert.deepEqual(events, []);
++  }
++});
++
++test("setModel reports a missing session without mutating", async () => {
++  const { handle, calls, events } = harness({ sessions: [] });
++  await assert.rejects(
++    handle("missing-session", { providerId: "provider-a", modelId: "model-b" }),
++    { errorCode: ErrorCodes.NOT_FOUND },
++  );
++  assert.equal(calls.some((call) => call.method === "session.setModel"), false);
++  assert.deepEqual(events, []);
++});
+diff --git a/docs/adr/0332-mobile-session-controls-over-local-mcp.md b/docs/adr/0332-mobile-session-controls-over-local-mcp.md
+new file mode 100644
+index 0000000..4f75951
+--- /dev/null
++++ b/docs/adr/0332-mobile-session-controls-over-local-mcp.md
+@@ -0,0 +1,111 @@
++# ADR 0332: Mobile session controls over the local MCP control plane
++
++- Status: Proposed (implementation candidate; Desktop patch required; mobile E2E pending)
++- Date: 2026-10-19
++- Deciders: PI-Desktop maintainers
++- Related: [ADR 0203](0203-local-mcp-control-plane.md) ·
++  [ADR 0310](0310-local-permission-approvals-without-deadline.md) ·
++  [03-runtime/01-ipc-protocol](../spec/03-runtime/01-ipc-protocol.md) §13d ·
++  [03-runtime/03-tools-and-permissions](../spec/03-runtime/03-tools-and-permissions.md) §6–7 ·
++  [03-runtime/13-model-catalog-and-selection](../spec/03-runtime/13-model-catalog-and-selection.md) §4
++
++## Context
++
++The local MCP control plane already exposes project, session, Agent, and
++workspace operations. A paired mobile client can list and read Desktop
++sessions, create one, send a prompt, and stop it. Two useful controls were
++still missing:
++
++1. The client could read a session but could not choose a model when creating
++   it or switch an existing idle session without using the broad
++   `session/configure` operation. That operation also accepts mode, thinking
++   level, and `permissionMode`, including `auto`, so using it as a model switch
++   would risk changing unrelated policy.
++2. The Agent's pending AskTool questions and tool-permission requests were
++   available to the renderer, but not through the reviewed MCP catalog. A
++   remote client could therefore not see or answer the request that was
++   blocking the turn.
++
++The installed 0.20.1 build exposes neither a model-only switch nor the pending
++interaction read over this control plane. The `agent/pendingInteractive` IPC
++handler also returned the bridge's pending requests without proving that the
++requested id was a local desktop session or filtering the result by session.
++
++## Decision
++
++1. Add the dangerous `session/setModel` operation and named
++   `pi_session_set_model` tool. Its config contains exactly `providerId` and
++   `modelId`. It requires an existing local desktop session, an enabled
++   provider, a configured or cached model, and an idle session with no pending
++   Plan/Goal approval. It updates only the durable model binding; mode,
++   thinking level, permission mode, and title are preserved. Validation and
++   the write happen in the existing main-process and host-core paths.
++2. Add the read `agent/pendingInteractive` operation and named
++   `pi_agent_pending_interactive` tool. Native Pi sessions keep their own empty
++   path. Before returning anything for a desktop id, Electron Main verifies
++   that it names a local desktop session, then filters both the AskTool and
++   permission arrays to that session. Remote and unknown ids fail closed.
++3. Reuse the existing dangerous resolvers. `tool/resolvePermission` accepts the
++   local vocabulary, but a constrained remote client is expected to offer only
++   `allow-once` and `deny`. It must not expose `allow-session`, change
++   `permissionMode`, or answer Plan/Goal approvals or extension prompts
++   through this surface. `agent/askTool/resolve` accepts one
++   `string[] | null` entry per question; `null` is an explicit skip and answer
++   values are plain text.
++4. Keep capability discovery authoritative. A Desktop build without these
++   operation ids keeps the corresponding client controls unavailable; clients
++   do not fall back to `session/configure`, arbitrary IPC, or a fabricated
++   acknowledgement.
++5. Do not add a new persisted schema, a new transport, or a general-purpose
++   remote API. `session/setModel` is one host RPC in the existing session
++   domain; the pending read delegates to the existing Agent IPC handler.
++
++## Consequences
++
++- A paired client can choose a model at creation, switch an idle session's
++  model without changing its execution or permission policy, and resolve
++  ordinary tool and AskTool cards. Subscription, provider credentials,
++  secrets, and global settings remain outside the surface.
++- Remote approval is intentionally narrower than the desktop card. A remote
++  user cannot create a session-wide grant or move a session to Auto.
++- Reading pending state and resolving it are separate calls. A response is
++  authoritative only when the Desktop acknowledges it; a transport failure or
++  unknown result must be reconciled by re-reading and is never replayed
++  automatically.
++- The capability exists only with the additive Desktop patch based on
++  `589e5803a7a9f4ebf7ec1e8849c43e44b4a198f7` (v0.21.0-beta.4). An installed
++  0.20.1 build, or an unpatched build of that baseline, does not support it.
++  This ADR does not claim that an upstream release already ships it.
++- Plan/Goal approval, extension UI, attachments, thinking-level changes, and
++  permission-mode changes remain desktop-only.
++
++## Alternatives considered
++
++### Use `session/configure` for model switching
++
++Rejected: its accepted fields include permission mode and other session
++configuration. A client that intends only to change the model could silently
++alter policy, and the confirmation prompt would not describe the actual risk.
++
++### Expose `agent/pendingInteractive` without session scoping
++
++Rejected: the bridge can hold requests for multiple sessions, and the API must
++not let a caller read or infer another session's prompts. Native and remote
++sessions also have their own input paths.
++
++### Implement RACP for this client
++
++Rejected for this change: the local MCP plane already carries the same
++authorities and persistence, and RACP remains a separate remote-Host contract.
++Adding a second transport would duplicate authorization and lifecycle logic
++without serving the constrained mobile use case.
++
++## Verification
++
++Source-contract coverage is added in
++`apps/desktop/test/mcp-control.test.mjs`,
++`apps/desktop/test/pending-interactive-scope.test.mjs`, and
++`apps/desktop/test/session-model-only.test.mjs`, with host-core tests beside
++`session.setModel`. E2E-268 records the end-to-end desktop/mobile scenario.
++The documentation change that introduced this ADR did not execute those
++tests; the full Electron journey remains pending.

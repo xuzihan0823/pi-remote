@@ -1,0 +1,12 @@
+# HISTORICAL PROPOSAL — corresponding source and regression tests are now updated; do not apply again.
+--- a/src/agent/desktop-agent-handler.ts
++++ b/src/agent/desktop-agent-handler.ts
+@@ -309,7 +309,7 @@
+         const metadata = await findSession(id);
+         const status = await statusFor(id);
+         const permission = await readDesktopPermission(client, metadata);
+-        const capabilities = describeCapabilities(await probeOperations());
++        const capabilities = describeCapabilities(await requiredOperations("Pi Desktop 控制目录不可用，无法确认待处理请求"));
+         const interactionsSupported = capabilities.remoteApprovals;
+         const pendingInteractions = interactionsSupported
+           ? await readDesktopInteractions(client, id, sessionId)

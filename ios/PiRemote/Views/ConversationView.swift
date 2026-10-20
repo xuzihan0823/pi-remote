@@ -19,6 +19,7 @@ public struct ConversationView: View {
     @State private var viewportHeight: CGFloat = 0
     @State private var branchOffsets: [String: CGFloat] = [:]
     @State private var pendingBranchOffset: CGFloat?
+    @State private var selectedInteraction: DesktopInteraction?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(
@@ -165,6 +166,7 @@ public struct ConversationView: View {
                     }
                 }
 
+                desktopControlsBar
                 inputBar
             }
         }
@@ -173,10 +175,21 @@ public struct ConversationView: View {
                 .presentationDetents([.height(460)])
                 .presentationDragIndicator(.hidden)
         }
+        .sheet(item: $selectedInteraction) { interaction in
+            DesktopInteractionSheet(client: client, interaction: interaction, session: session)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
         .onAppear {
             subscribeIfNeeded()
-            if let draft = client.pendingDraft {
+            if !client.isSendingPrompt, let draft = client.pendingDraft {
                 inputText = draft
+                client.pendingDraft = nil
+            }
+        }
+        .onChange(of: client.isSendingPrompt) { _, sending in
+            if !sending, let draft = client.pendingDraft {
+                if inputText.isEmpty { inputText = draft }
                 client.pendingDraft = nil
             }
         }
@@ -191,6 +204,12 @@ public struct ConversationView: View {
             hasNewMessages = false
             pendingPageAnchor = nil
             readingAnchor = nil
+            selectedInteraction = nil
+        }
+        .onChange(of: client.pendingDesktopInteractions) { _, pending in
+            guard let current = selectedInteraction,
+                  !pending.contains(where: { $0.id == current.id }) else { return }
+            selectedInteraction = nil
         }
     }
 
@@ -221,6 +240,15 @@ public struct ConversationView: View {
         }
         if let error = client.terminal.error {
             noticeLine(error, color: DesignTokens.Colors.warning)
+            if client.terminal.isReadError {
+                HStack {
+                    Spacer()
+                    Button("重新读取") { client.retryActiveSessionRead() }
+                        .font(DesignTokens.Fonts.notoBold(12))
+                        .disabled(!client.isConnected || !client.agentConnected)
+                        .accessibilityIdentifier("conversation-retry-read")
+                }
+            }
         }
 
         if client.terminal.messages.isEmpty, client.terminal.items.isEmpty, client.terminal.error == nil {
@@ -481,6 +509,72 @@ public struct ConversationView: View {
         return rest == 0 ? "\(minutes) 分钟" : "\(minutes) 分 \(rest) 秒"
     }
 
+    @ViewBuilder
+    private var desktopControlsBar: some View {
+        if client.isActiveDesktop && (client.supportsSessionControls || client.desktopControls != nil) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Text(desktopPermissionText)
+                        .font(.footnote)
+                        .foregroundStyle(DesignTokens.Colors.textSecondary)
+                        .accessibilityIdentifier("desktop-permission-state")
+
+                    Spacer(minLength: 8)
+
+                    if !client.pendingDesktopInteractions.isEmpty {
+                        Button {
+                            selectedInteraction = client.pendingDesktopInteractions.first
+                        } label: {
+                            Label(
+                                "\(client.pendingDesktopInteractions.count) 项待回应",
+                                systemImage: "exclamationmark.bubble"
+                            )
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(DesignTokens.Colors.accentGreen)
+                            .frame(minHeight: 44)
+                            .padding(.horizontal, 12)
+                            .background(DesignTokens.Colors.glassMedium)
+                            .clipShape(Capsule())
+                        }
+                        .accessibilityIdentifier("desktop-pending-interactions")
+                    }
+                }
+
+                if let error = client.desktopControlsError {
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(DesignTokens.Colors.warning)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Button("重新读取") { client.refreshDesktopControls() }
+                            .font(.caption.weight(.semibold))
+                            .frame(minHeight: 44)
+                            .disabled(!client.isConnected || !client.agentConnected)
+                    }
+                } else if !client.pendingDesktopInteractions.isEmpty,
+                          !client.canRespondDesktopInteraction,
+                          !client.isSubmittingDesktopInteraction {
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(client.isConnected && client.agentConnected
+                             ? "控制状态未确认，重新读取后可回应。"
+                             : "连接中断，暂时无法回应。")
+                            .font(.caption)
+                            .foregroundStyle(DesignTokens.Colors.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Button("重新读取") { client.refreshDesktopControls() }
+                            .font(.caption.weight(.semibold))
+                            .frame(minHeight: 44)
+                            .disabled(!client.isConnected || !client.agentConnected)
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 8)
+        }
+    }
+
     private var inputBar: some View {
         VStack(spacing: 8) {
             if let reconnectSeconds = client.reconnectSeconds {
@@ -514,6 +608,16 @@ public struct ConversationView: View {
                     .font(DesignTokens.Fonts.notoRegular(11))
                     .foregroundColor(DesignTokens.Colors.warning)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            } else if client.terminal.isReadError {
+                HStack(spacing: 8) {
+                    Text("会话内容暂时无法读取")
+                        .font(DesignTokens.Fonts.notoRegular(11))
+                        .foregroundColor(DesignTokens.Colors.warning)
+                    Spacer(minLength: 8)
+                    Button("重新读取") { client.retryActiveSessionRead() }
+                        .font(DesignTokens.Fonts.notoBold(12))
+                        .disabled(!client.isConnected || !client.agentConnected)
+                }
             }
             if client.supportsModelSelection && client.isSessionRunning {
                 Text("当前任务运行中，完成后即可切换模型")
@@ -539,7 +643,7 @@ public struct ConversationView: View {
                     .font(DesignTokens.Fonts.notoRegular(14))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .lineLimit(1...4)
-                    .disabled(client.isActiveArchive ? !client.isConnected : (!client.isConnected || terminalOffline || !client.activeCanControl))
+                    .disabled(client.isActiveArchive ? !client.isConnected : (!client.isConnected || terminalOffline || client.terminal.isReadError || !client.activeCanControl))
                     .accessibilityIdentifier("conversation-input")
                     .padding(.horizontal, 6)
                     .frame(minHeight: 32)
@@ -558,6 +662,18 @@ public struct ConversationView: View {
                         .disabled(!client.canSelectHistoryModel)
                         .accessibilityIdentifier("history-resume-model")
                     }
+                    if client.isActiveDesktop, !client.supportsModelSelection,
+                       let model = client.desktopControls?.model ?? client.activeModel {
+                        HStack(spacing: 4) {
+                            Image(systemName: "cpu")
+                                .font(.system(size: 10))
+                            Text(model.name)
+                                .font(DesignTokens.Fonts.sfProRegular(14))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(DesignTokens.Colors.textSecondary)
+                        .accessibilityIdentifier("desktop-model-readonly")
+                    }
                     if !client.isActiveArchive && client.supportsModelSelection {
                         ModelMenu(
                             models: client.activeModels,
@@ -566,7 +682,8 @@ public struct ConversationView: View {
                             defaultTitle: client.activeModelLoadError == nil ? "当前模型" : "读取失败",
                             onSelect: { model in
                                 if let model { client.setActiveModel(model) }
-                            }
+                            },
+                            allowsDefaultSelection: false
                         )
                         .disabled(!client.canSelectActiveModel)
                     }
@@ -603,7 +720,7 @@ public struct ConversationView: View {
             HStack(spacing: 4) {
                 Image(systemName: "paperclip")
                     .font(.system(size: 10))
-                Text(client.isActiveTerminal && !client.isActiveArchive ? "确认和选择请在 Mac 终端完成" : "在你的 Mac 上执行")
+                Text(footerHint)
                     .font(DesignTokens.Fonts.notoRegular(11))
             }
             .foregroundColor(DesignTokens.Colors.textSecondary)
@@ -616,10 +733,29 @@ public struct ConversationView: View {
         if client.isActiveArchive { return "继续输入…" }
         if client.usesSessionTimeline {
             if terminalOffline { return "会话离线，无法发送" }
+            if client.terminal.isReadError { return "会话内容暂时无法读取" }
             if client.terminal.isBusy { return "正在运行，请等待完成…" }
             return client.terminal.loaded ? "继续输入…" : "正在读取会话状态…"
         }
         return client.sessionSettled ? "描述你想完成的工作…" : "补充要求，或开始下一步…"
+    }
+
+    private var footerHint: String {
+        if client.isActiveDesktop {
+            return client.supportsRemoteApprovals
+                ? "附件请在 Pi Desktop 中添加"
+                : "Pi Desktop 不支持远程确认，请在电脑上回应；附件请在 Pi Desktop 中添加"
+        }
+        return client.isActiveTerminal && !client.isActiveArchive
+            ? "确认和选择请在 Mac 终端完成"
+            : "在你的 Mac 上执行"
+    }
+
+    private var desktopPermissionText: String {
+        if let controls = client.desktopControls {
+            return "权限：\(controls.permission.displayText)"
+        }
+        return client.desktopControlsError == nil ? "权限：正在读取…" : "权限：未知"
     }
     private var terminalOffline: Bool {
         !client.isActiveArchive && client.usesSessionTimeline && (!client.isConnected || !client.agentConnected || client.terminal.isOffline)

@@ -1,6 +1,8 @@
 node_modules/
 dist/
+*.tgz
 .env
 *.log
 .DS_Store
 macos/.build/
+.reference/

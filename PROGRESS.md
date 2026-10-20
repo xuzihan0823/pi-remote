@@ -1,6 +1,38 @@
 # pi-remote 开发进度
 
-更新时间：2026-10-10
+更新时间：2026-10-19
+
+## 2026-10-19：Pi Desktop 手机模型选择、控制视图与远程审批
+
+- `modelCatalog`、`modelSelectionOnCreate`、`modelSelection`、`sessionControls`、`remoteApprovals` 拆成独立能力位，分别按 Desktop 的 MCP 操作目录探测；不再用一个“完整控制”开关代替。
+- 新建会话可提交 `provider` + `modelId`，创建后重新读取会话确认绑定；未确认时保留草稿，不把“已创建”当作“模型已生效”。已有会话只在空闲时切换模型，Desktop 端新增的 `session.setModel` 只改这两个字段，保留模式、思考级别、权限模式和标题，运行中或待审批计划时拒绝。
+- 控制视图 `session.get` + `view: "controls"` 与正文时间线分离，只返回当前模型、权限模式/生效模式、可控制状态、运行状态和待处理请求；手机约每秒轻量轮询，不重复读取正文。
+- 远程审批只覆盖普通工具权限和 AskTool：工具权限仅 `allow-once`/`deny`，问题答案按题目提交 `Array<string[] | null>`，`null` 表示显式跳过；不提供 `allow-session`、不修改权限模式，也不处理 Plan/Goal 审批或扩展 UI。
+- 交互回应只有在 Desktop 明确确认后才从待处理列表移除；网络中断或回执未知时提示刷新核对，不自动重发；模型切换同样通过重新读取确认，不承诺跨进程 exactly-once。
+- 0.20.1 的 MCP 目录没有待处理交互读取和只改模型的会话操作，因此不能远程回应或安全切换已有会话模型。所需补丁基线为 `589e5803a7a9f4ebf7ec1e8849c43e44b4a198f7`（v0.21.0-beta.4），不表示上游版本已支持；补丁将由主会话导出到 `docs/patches/pi-desktop-mobile-controls.patch`，路径和应用命令见 [Desktop 接入说明](docs/pi-desktop.md)。
+- 验证：TypeScript 类型检查与相关 Node 测试 38/38 通过；5 套 Swift 行为回归通过；iOS 模拟器 build-for-testing 通过。iPhone 17 / iOS 26.5 UI 验收 2 通过、1 失败：模型切换及正文失败时授权通过，问答测试因多行输入控件定位失败；定位代码已修并重新构建复验，仍在输入焦点变化后定位失败，尚未验证提交路径。
+- 收尾发现的两项问题已修复：回应失败统一先重新读取再允许手动重试；能力目录故障返回错误并保留待回应未知状态。Swift 门禁回归与 handler 12 项回归通过，模拟器最终重建通过。Desktop 15 文件补丁已导出并通过正反向检查与逐文件比对。UI 最终复跑仍为 2 通过、1 失败：问答在输入获得焦点后无法重新定位控件，未到提交断言；附件诊断被审批拒绝，大字体未验收。详见 [验证记录](docs/mobile-controls-verification.md)。独立审查因 429 和工具拒绝未完成，不能视为完整安全验收通过。
+- Desktop 定向 Node 测试由子任务报告通过；Rust 最后参数小修的编译检查通过，用户明确授权后重新运行五项模型定向测试，5 通过、0 失败；完整 Desktop 检查缺依赖。未安装或重启真实 Desktop，未调用真实模型，未部署、提交或推送。
+
+## 2026-10-19：修复 Pi Desktop 大内容读取误判离线
+
+- 根因：时间线固定按 50 条 × 64000 字符读取，超过 Desktop MCP 512 KiB 结果上限后被当作普通工具失败，手机把 `session.get` 错误一律显示为离线并禁用发送。
+- Agent 按会话自适应降档 64000→32000→16000→8000→4000；降档时清空旧缓存，游标与 revision 绑定档位。锚点请求遇到降档返回 `refresh_required`，由手机改为完整刷新；最低档仍超限时返回 `result_too_large`，不再伪装成内部错误。
+- iOS 区分“读取失败”和“会话离线”：超限或需要重建时保留已有正文、显示原因和“重新读取”；超限后轮询退避 15 秒，成功读取后自动恢复；精简正文时显示 Desktop 的提示文案。
+- 新建 Desktop 会话默认使用会话临时目录，界面只显示“临时目录”；选择项目后仍可切回。
+- 验证：TypeScript 类型检查通过；后端全量 271 项，265 通过、6 项预设跳过、0 失败；Swift SessionParsing、SessionCreation、HistoryTimeline、TerminalCallbackGuard 通过；iOS 模拟器 Debug 构建通过。未提交、未部署，真实 Desktop 联调未执行。
+
+## 2026-10-18：收窄为 Pi Desktop 会话管理
+
+- 原有未提交多运行时工作已完整保存在 `archive/multi-runtime-20261018`（`3e4a79c`），回到 `main` 开发本轮改动。
+- 生产 Agent 改接 Desktop 本机 MCP，不再装配 Pi/OMP 进程、终端桥、历史扫描和恢复协调器；旧代码暂保留但不参与生产路由。
+- 新建、阅读、发送和停止均由 Desktop 执行；排除原生 CLI 导入和其他远端会话，不直接读写 Desktop 存储。
+- Mac 助手不再要求 CLI 可执行文件；当时手机只提供 Desktop 新建入口，并沿用 Desktop 模型和权限设置；模型选择与受限远程回应见上方 2026-10-19 条目。
+- TypeScript 类型检查通过；后端全量 260 项，254 通过、6 项显式 live/旧运行时测试按预设跳过、0 失败。覆盖真实本地 Relay 转发、MCP 认证与端口复用、123 条历史分页、来源隔离及创建/发送/停止。
+- Mac SwiftPM 64 项测试通过；本地 arm64 release 编译、打包、签名和包内 Desktop Agent 加载通过，不再打包 Bun/OMP。未替换已安装应用。
+- iOS SessionCreation、HistoryTimeline、TerminalCallbackGuard 与 SessionParsing 回归通过，包含 31 条 Desktop 列表分页、非法引用拒绝、首发草稿保留、旧 idle 快照隔离、停止后真实状态及变化锚点恢复；模拟器 Debug 构建通过。未安装真机。
+- 安全审查发现的失效连接清理凭据风险已修复并定向复核；真实 `agent/status` 的嵌套响应已按安装包契约修正。
+- 真实 Desktop 当前未启用 MCP，本轮不重启或修改用户运行中的会话，不把隔离协议验证当作真实联调完成。详细边界和启用方式见 [Desktop 接入说明](docs/pi-desktop.md)。
 
 ## 2026-10-10：统一会话记录、直接发送续接与全端替换
 
