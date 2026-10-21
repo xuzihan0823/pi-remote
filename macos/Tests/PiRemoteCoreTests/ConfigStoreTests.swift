@@ -30,7 +30,7 @@ final class ConfigStoreTests: XCTestCase {
 
     func testLegacyConfigWithoutNewFieldsStillLoads() throws {
         let store = ConfigStore(directory: directory)
-        let legacy = #"{"deviceId":"pi-mac-deadbeef","mode":"server","piBinPath":"/usr/local/bin/pi","serverURL":"wss://pi.anyyu.cyou/ws/agent","workspacePath":"/Users/tester/Desktop"}"#
+        let legacy = #"{"deviceId":"pi-mac-deadbeef","mode":"server","piBinPath":"/usr/local/bin/pi","serverURL":"wss://relay.example.com/ws/agent","workspacePath":"/Users/tester/Desktop"}"#
         try Data(legacy.utf8).write(to: store.fileURL)
         let loaded = try XCTUnwrap(store.load())
         XCTAssertEqual(loaded.deviceId, "pi-mac-deadbeef")
@@ -70,10 +70,10 @@ final class ConfigStoreTests: XCTestCase {
         var config = AppConfig.makeDefault(deviceId: "pi-mac-deadbeef")
         XCTAssertNoThrow(try config.validated())
 
-        config.serverURL = "wss://pi.anyyu.cyou/ws/ios"
+        config.serverURL = "wss://relay.example.com/ws/ios"
         XCTAssertThrowsError(try config.validated())
 
-        config.serverURL = "wss://pi.anyyu.cyou/ws/agent?token=abc"
+        config.serverURL = "wss://relay.example.com/ws/agent?token=abc"
         XCTAssertThrowsError(try config.validated())
     }
 
