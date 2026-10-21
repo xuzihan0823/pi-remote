@@ -54,7 +54,7 @@ public struct AppConfig: Codable, Equatable {
     public var serverSource: ServerSource
     public var deployTarget: RemoteDeployTarget
 
-    public static let defaultServerURL = "wss://pi.anyyu.cyou/ws/agent"
+    public static let defaultServerURL = "wss://relay.example.com/ws/agent"
     public static let defaultPiBin = AgentRuntime.pi.defaultBinaryPath
     public static let defaultRelayPort = 8789
 
