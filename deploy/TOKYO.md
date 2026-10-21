@@ -16,7 +16,7 @@
 
 ## 当前部署状态（2026-10-09 模型协议修复）
 
-- 用户授权升级 `pi.anyyu.cyou` 的 Relay 并更新手机。旧九月 Relay 不接受 `model.list`，已由本地构建并验过的 linux/amd64 镜像 `pi-remote-relay:model-protocol-20261009` 替换，同时标记 latest。
+- 用户授权升级 `relay.example.com` 的 Relay 并更新手机。旧九月 Relay 不接受 `model.list`，已由本地构建并验过的 linux/amd64 镜像 `pi-remote-relay:model-protocol-20261009` 替换，同时标记 latest。
 - `/opt/pi-remote` 源码同步新镜像；保留原 `.env`（校验摘要不变）、Compose 项目/网络和 Caddy，只重建 Relay。容器状态 healthy，其他容器 ID 不变，Mac Agent 自动重连；用户后台 OMP PID/启动身份及原会话不变。
 - 新备份 `/var/backups/pi-remote/20261009-before-model-protocol/project.tar.gz` 已验证 gzip/tar 可读，SHA-256 `0d31980d91953291cb83255dc7260b15006979045cd92c235e49a2867030b795`；验证后清理本项目上一份九月备份。旧运行镜像保留为 `pi-remote-relay:before-model-fix-20261009`，部署命令有启动失败回退。
 - 真实公网握手返回 supportedMethods，`model.list` 返回 29 个可用模型，`session.get_model` 与列表当前模型一致，原会话空闲可控。验收只读，未给用户会话发提示词或更改模型。
@@ -27,12 +27,12 @@
 
 ## 当前部署状态（2026-09-18）
 
-- 东京服务器：`43.130.228.225`。已更新 `/opt/pi-remote` 和 Relay 容器，镜像 `pi-remote-relay:terminal-bridge-20260918`（同时标记为 `latest`），平台 `linux/amd64`；镜像在 Mac 本地构建后传入服务器，支持终端快照接口 `session.get`。
+- 东京服务器：`<SERVER_IP>`。已更新 `/opt/pi-remote` 和 Relay 容器，镜像 `pi-remote-relay:terminal-bridge-20260918`（同时标记为 `latest`），平台 `linux/amd64`；镜像在 Mac 本地构建后传入服务器，支持终端快照接口 `session.get`。
 - 本次更新前的项目备份：`/var/backups/pi-remote/20260918-before-terminal-bridge/project.tar.gz`，已通过 gzip 和 tar 可读性检查。SHA-256：`500d4b83901a4e0f4ce73f64a63f5d4e6bc9e4f7c057bde0b427347cede3402f`。旧的 `20260917-before-stability` 备份在验证新备份后已删除。旧镜像保留为 `pi-remote-relay:before-terminal-bridge`。
 - Relay 容器已按本仓库 `deploy/docker-compose.tokyo.yml` 的稳定性配置重建，重建后健康状态为 `healthy`，`restart: unless-stopped` 生效；本次重建没有重启服务器上的其他容器，容器 ID 均未变化。
 - Mac App 已更新到 `/Users/mac/Applications/Pi Remote.app` 并重新连接，当前线上 Agent ID 为 `pi-mac-d5c770bc`；旧 launchd Agent 当前未运行。App 配置和钥匙串凭据保持不变。
 - 终端桥接扩展已安装到 `~/.pi/agent/extensions/pi-remote-bridge/index.ts`。已有终端需待当前任务结束后执行 `/reload`；未加载扩展的终端不会自动出现在列表中。详见 `docs/terminal-bridge.md`。
-- 手机地址：`wss://pi.anyyu.cyou/ws/ios`。本地连接二维码：`/Users/mac/.config/pi-remote/tokyo-connection.png`；配套 JSON 同目录。二维码含连接凭据，仅供自己的手机扫码，不应公开分享。
+- 手机地址：`wss://relay.example.com/ws/ios`。本地连接二维码：`/Users/mac/.config/pi-remote/tokyo-connection.png`；配套 JSON 同目录。二维码含连接凭据，仅供自己的手机扫码，不应公开分享。
 - 实测通过：公网 TLS、HTTP/WS 无凭据访问返回 401、模拟 iOS 握手、真实 Mac 的 `session.list`，以及 Relay 重启后 Mac 自动重连。
 - 本次更新后通过公网 TLS、鉴权、iOS 握手与 `session.list` 检查；`session.get` 对未知会话返回 `unknown_session`，确认新接口已贯通。尚未 reload 的用户终端未注册，线上列表为 0。
 - iOS 新版已完成签名真机构建，但手机显示 unavailable，尚未安装本次新版、未完成真机操作验证。协议检查未创建用户会话或调用模型。
@@ -42,15 +42,15 @@
 ## 架构
 
 - 服务器用 ssh 别名 `tokyo-server` 登录，项目目录 `/opt/pi-remote`，容器名 `pi-remote-relay`。容器只在宿主机监听 `127.0.0.1:8789`，不直接暴露到公网。
-- 公网入口由服务器上已有的反向代理容器 `new-api-caddy` 提供：域名 `https://pi.anyyu.cyou`，内部转发到 `pi-remote-relay:8789`。
+- 公网入口由服务器上已有的反向代理容器 `new-api-caddy` 提供：域名 `https://relay.example.com`，内部转发到 `pi-remote-relay:8789`。
 - 因为反代按容器名转发，relay 必须加入外部 Docker 网络 `new-api_new-api-net`。此前是靠手工 `docker network connect` 临时挂上的，`deploy/docker-compose.tokyo.yml` 把它写进配置，重建容器后依然生效。
 - 该 override 只做三件事：声明镜像来源、把 relay 加入 `default` 与 `new-api_new-api-net`，以及附加本地可靠性配置（healthcheck、`init`、`stop_grace_period`、json-file 日志轮转）。它不部署 Caddy，也不新增任何公网端口。
-- 对外的地址：iOS 用 `wss://pi.anyyu.cyou/ws/ios`，Mac Agent 用 `wss://pi.anyyu.cyou/ws/agent`，健康检查 `https://pi.anyyu.cyou/api/health`。
+- 对外的地址：iOS 用 `wss://relay.example.com/ws/ios`，Mac Agent 用 `wss://relay.example.com/ws/agent`，健康检查 `https://relay.example.com/api/health`。
 
 服务器上现有的 Caddy 站点（由 `new-api-caddy` 管理）应包含以下已有配置，**不要覆盖或重写它**：
 
 ```caddy
-pi.anyyu.cyou {
+relay.example.com {
     encode zstd gzip
     reverse_proxy pi-remote-relay:8789
 }
@@ -122,7 +122,7 @@ docker inspect pi-remote-relay --format '{{json .HostConfig.LogConfig}}'
 - Mac 本地 `.env` 关键项（值自行填写）：
 
 ```
-RELAY_URL=wss://pi.anyyu.cyou/ws/agent
+RELAY_URL=wss://relay.example.com/ws/agent
 RELAY_TOKEN=<与服务器一致的 token>
 AGENT_TOKEN=<与服务器一致的 token>
 AGENT_DEVICE_ID=pi-mac-agent
@@ -140,7 +140,7 @@ npm install
 npm run agent
 ```
 
-Agent 会连接 `wss://pi.anyyu.cyou/ws/agent`，断线后自动指数退避重连，自身不会启动会话。
+Agent 会连接 `wss://relay.example.com/ws/agent`，断线后自动指数退避重连，自身不会启动会话。
 
 ### 常驻运行（launchd 模板）
 
@@ -179,7 +179,7 @@ node --env-file=.env scripts/check-relay.ts
 手工补充确认（可选）：
 
 ```bash
-curl -sS https://pi.anyyu.cyou/api/health
+curl -sS https://relay.example.com/api/health
 ```
 
 ### 为什么没有 `--probe-session`
