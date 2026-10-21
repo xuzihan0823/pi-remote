@@ -28,7 +28,7 @@ PI_REMOTE_SKIP_BUILD=1 ./macos/verify.sh   # 只跑测试
 
 ### 服务器模式（默认）
 
-- 服务器地址默认 `wss://pi.anyyu.cyou/ws/agent`，可改成自建 Relay。
+- 服务器地址默认 `wss://relay.example.com/ws/agent`，可改成自建 Relay。
 - 连接 Token 至少 32 个字符，与手机扫码使用的是同一个 Token；保存在系统钥匙串（`com.piremote.mac`）。
 - 工作区与 `PI_BIN` 传给 Agent；`PI_BIN` 可以写裸命令名（例如 `pi`），连接前会按 PATH 解析成绝对可执行路径。
 - 配置保存到 `~/Library/Application Support/Pi Remote/config.json`（0600）。有效配置存在时，下次启动会自动连接。
