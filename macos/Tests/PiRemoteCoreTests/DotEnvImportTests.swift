@@ -7,7 +7,7 @@ final class DotEnvImportTests: XCTestCase {
         # comment
         export RELAY_TOKEN=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         AGENT_TOKEN="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        RELAY_URL=wss://pi.anyyu.cyou/ws/agent
+        RELAY_URL=wss://relay.example.com/ws/agent
         PI_BIN=/usr/local/bin/pi
         PI_WORKSPACE_ROOT=/Users/tester/Desktop
         SECRET_EXTRA=should-be-ignored
@@ -17,7 +17,7 @@ final class DotEnvImportTests: XCTestCase {
         let values = DotEnv.extract(text)
         XCTAssertEqual(values.relayToken, String(repeating: "a", count: 32))
         XCTAssertEqual(values.agentToken, String(repeating: "b", count: 32))
-        XCTAssertEqual(values.relayURL, "wss://pi.anyyu.cyou/ws/agent")
+        XCTAssertEqual(values.relayURL, "wss://relay.example.com/ws/agent")
         XCTAssertEqual(values.piBin, "/usr/local/bin/pi")
         XCTAssertEqual(values.workspaceRoot, "/Users/tester/Desktop")
         XCTAssertEqual(values.effectiveToken, String(repeating: "b", count: 32))
