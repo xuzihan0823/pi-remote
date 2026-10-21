@@ -9,7 +9,7 @@ final class SupervisorJobTests: XCTestCase {
         let job = JobBuilder.agentJob(
             nodePath: "/App/Contents/Resources/runtime/node",
             runtimeDirectory: "/App/Contents/Resources/runtime",
-            agentURL: "wss://pi.anyyu.cyou/ws/agent",
+            agentURL: "wss://relay.example.com/ws/agent",
             token: token,
             deviceId: "pi-mac-1234abcd",
             workspacePath: "/Users/tester/Desktop",
@@ -19,7 +19,7 @@ final class SupervisorJobTests: XCTestCase {
         XCTAssertEqual(job.command, "/App/Contents/Resources/runtime/node")
         XCTAssertEqual(job.args, ["src/agent/run.ts"])
         XCTAssertEqual(job.cwd, "/App/Contents/Resources/runtime")
-        XCTAssertEqual(job.env["RELAY_URL"], "wss://pi.anyyu.cyou/ws/agent")
+        XCTAssertEqual(job.env["RELAY_URL"], "wss://relay.example.com/ws/agent")
         XCTAssertEqual(job.env["RELAY_TOKEN"], token)
         XCTAssertEqual(job.env["AGENT_TOKEN"], token)
         XCTAssertEqual(job.env["AGENT_DEVICE_ID"], "pi-mac-1234abcd")
@@ -33,7 +33,7 @@ final class SupervisorJobTests: XCTestCase {
         let job = JobBuilder.agentJob(
             nodePath: "/runtime/node",
             runtimeDirectory: "/runtime",
-            agentURL: "wss://pi.anyyu.cyou/ws/agent",
+            agentURL: "wss://relay.example.com/ws/agent",
             token: token,
             deviceId: "pi-mac-1234abcd",
             workspacePath: "/Users/tester/Desktop",
