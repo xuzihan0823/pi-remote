@@ -2,14 +2,14 @@ import XCTest
 @testable import PiRemoteCore
 
 final class ConnectionQRCodeTests: XCTestCase {
-    private let agentURL = URL(string: "wss://pi.anyyu.cyou/ws/agent")!
+    private let agentURL = URL(string: "wss://relay.example.com/ws/agent")!
     private let token = String(repeating: "k", count: 32)
 
     func testPayloadMatchesIOSContract() throws {
         let text = try ConnectionQRCode.text(agentURL: agentURL, token: token)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
         XCTAssertEqual(object["version"] as? Int, 1)
-        XCTAssertEqual(object["serverUrl"] as? String, "wss://pi.anyyu.cyou/ws/ios")
+        XCTAssertEqual(object["serverUrl"] as? String, "wss://relay.example.com/ws/ios")
         XCTAssertEqual(object["token"] as? String, token)
         XCTAssertEqual(object.count, 3)
         XCTAssertLessThanOrEqual(text.utf8.count, 4096)
@@ -28,8 +28,8 @@ final class ConnectionQRCodeTests: XCTestCase {
     }
 
     func testRejectsAgentURLThatIsNotAnAgentEndpoint() {
-        XCTAssertThrowsError(try ConnectionQRCode.text(agentURL: URL(string: "wss://pi.anyyu.cyou/ws/ios")!, token: token))
-        XCTAssertThrowsError(try ConnectionQRCode.text(agentURL: URL(string: "https://pi.anyyu.cyou/ws/agent")!, token: token))
+        XCTAssertThrowsError(try ConnectionQRCode.text(agentURL: URL(string: "wss://relay.example.com/ws/ios")!, token: token))
+        XCTAssertThrowsError(try ConnectionQRCode.text(agentURL: URL(string: "https://relay.example.com/ws/agent")!, token: token))
     }
 
     func testGeneratesScannableImage() throws {
