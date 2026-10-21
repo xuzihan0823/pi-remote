@@ -27,7 +27,7 @@ ios
 
 - 做什么：Mac 助手是本机常驻的菜单栏 App。它在 Mac 上托管 Agent 进程，并把它们交给 iOS 客户端访问。依据：`macos/README.md`。
 - **产品范围（事实）**：Mac 助手同时管理两类本地服务，二者共用同一个 App、同一个窗口：
-  1. **Pi Remote Relay 连接**：Mac 上的 Agent 通过「服务器模式」连接已部署的 Relay（默认 `wss://pi.anyyu.cyou/ws/agent`，可自建），或通过「Cloudflare 模式」在本机启动 Relay 并用 Quick Tunnel 暴露临时公网地址。含方案 §14 的一键部署 Relay 与 pi / omp 运行时选择。依据：`macos/README.md`、`FRONTEND-REWRITE-PLAN.md` §14。
+  1. **Pi Remote Relay 连接**：Mac 上的 Agent 通过「服务器模式」连接已部署的 Relay（默认 `wss://relay.example.com/ws/agent`，可自建），或通过「Cloudflare 模式」在本机启动 Relay 并用 Quick Tunnel 暴露临时公网地址。含方案 §14 的一键部署 Relay 与 pi / omp 运行时选择。依据：`macos/README.md`、`FRONTEND-REWRITE-PLAN.md` §14。
   2. **Claude 本地服务**：管理本机的 Claude daemon（默认 `127.0.0.1:8788`），有两种模式：**本机**（仅回环地址）和 **Cloudflare 临时隧道**（额外拉起独立的 Quick Tunnel，拿到并验证 `https://*.trycloudflare.com` 地址）。依据：`macos/Sources/PiRemoteCore/ClaudeService.swift`（`ClaudeServiceMode.local / .cloudflare`）、`Services/ClaudeServiceController.swift`。撰写本文时，`Views/` 下尚无 Claude 相关界面，界面由并行任务实现中；本文只记录已存在的服务事实。
 - 成功的样子：用户打开窗口，一眼知道「现在能不能用手机连」「还差哪一步」「出错了去哪处理」。状态必须是真实的：二维码只在健康检查确认当前设备后才出现，失效立即撤下。依据：`FRONTEND-REWRITE-PLAN.md` §1、§5.5、§6。
 - 假设：对 Claude 服务，同样的「状态必须真实」原则适用——只有 daemon 健康检查通过（隧道模式还要公网健康检查通过）才显示可用。依据来自控制器里的 `checkHealth` / `checkPublicHealth` 流程，但界面呈现仍待确定。
