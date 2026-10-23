@@ -40,7 +40,6 @@ before(async () => {
     cooldownMs: 120_000,
     interactionsDbPath: ":memory:",
     permissionTimeoutMs: 300_000,
-    publicBases: [],
     instanceId: INSTANCE_ID,
   };
   watcher = new SessionWatcher({ projectsDir: config.projectsDir });

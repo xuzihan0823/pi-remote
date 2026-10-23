@@ -133,7 +133,6 @@ async function startHarness(): Promise<Harness> {
     cooldownMs: 120_000,
     interactionsDbPath: ":memory:",
     permissionTimeoutMs: 300_000,
-    publicBases: ["https://tunnel.example.com"],
   };
 
   const store = new InteractionStore(":memory:");
@@ -240,11 +239,8 @@ test("loadConfig: 缺/短 token 拒绝；默认值正确", () => {
   assert.equal(config.cooldownMs, 120_000);
   assert.equal(config.permissionTimeoutMs, 300_000);
   assert.ok(config.instanceId);
-  assert.deepEqual(config.publicBases, []);
-  assert.deepEqual(
-    loadConfig({ BRIDGE_TOKEN: TOKEN32, BRIDGE_PUBLIC_BASES: " https://a.example.com/ ,http://b:1 ,bad,http://u:p@c:9 " }).publicBases,
-    ["https://a.example.com", "http://b:1"],
-  );
+  // BRIDGE_PUBLIC_BASES 已移除（同 claude-remote d63e50b）：设置了也不再出现在配置里
+  assert.equal("publicBases" in loadConfig({ BRIDGE_TOKEN: TOKEN32, BRIDGE_PUBLIC_BASES: "https://a.example.com" }), false);
   const root = stateRoot({});
   assert.equal(config.interactionsDbPath, join(root, "interactions.sqlite"));
   assert.equal(config.uploadsDir, join(root, "uploads"));
@@ -295,7 +291,7 @@ test("配对端点：本机直连放行；带代理特征头（隧道/反代）�
   assert.equal(direct.status, 200);
   const info = (await direct.json()) as { token: string; bases: string[] };
   assert.equal(info.token, TOKEN);
-  assert.equal(info.bases[0], "https://tunnel.example.com"); // 配置的公网地址排首位
+  assert.ok(Array.isArray(info.bases));
 
   for (const header of ["x-forwarded-for", "cf-connecting-ip", "cf-ray", "x-real-ip", "forwarded"]) {
     const viaProxy = await fetch(`${harness.base}/api/pair-info`, { headers: { [header]: "1.2.3.4" } });

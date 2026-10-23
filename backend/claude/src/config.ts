@@ -23,8 +23,6 @@ export interface DaemonConfig {
   cooldownMs: number;
   interactionsDbPath: string;
   permissionTimeoutMs: number;
-  /** 配对二维码额外候选地址（如 Cloudflare 隧道），排在自动枚举的局域网地址之前。 */
-  publicBases: string[];
   /**
    * 进程实例标识（health 端点用）。BRIDGE_INSTANCE_ID 或随机 UUID。
    * 可选仅为兼容既有测试 fixture；loadConfig 永远返回具体值。
@@ -102,29 +100,6 @@ function readPath(env: NodeJS.ProcessEnv, key: string, baseDir: string): string 
   return resolve(isAbsolute(raw) ? raw : join(baseDir, raw));
 }
 
-/**
- * BRIDGE_PUBLIC_BASES：逗号分隔的候选地址。仅保留 http/https 且无 userinfo 的 URL
- * （userinfo 会把凭据写进二维码/日志），去掉末尾斜杠。
- */
-function readPublicBases(env: NodeJS.ProcessEnv): string[] {
-  const raw = readString(env, "BRIDGE_PUBLIC_BASES") ?? "";
-  const bases: string[] = [];
-  for (const part of raw.split(",")) {
-    const trimmed = part.trim();
-    if (trimmed === "") continue;
-    let parsed: URL;
-    try {
-      parsed = new URL(trimmed);
-    } catch {
-      continue;
-    }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
-    if (parsed.username !== "" || parsed.password !== "") continue;
-    bases.push(trimmed.replace(/\/+$/, ""));
-  }
-  return [...new Set(bases)];
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): DaemonConfig {
   const token = readToken(env);
   const port = readInt(env, "BRIDGE_PORT", 8788);
@@ -144,7 +119,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): DaemonConfig {
     cooldownMs: readInt(env, "ACTIVITY_COOLDOWN_MS", 120_000),
     interactionsDbPath: dbPath,
     permissionTimeoutMs: readInt(env, "PERMISSION_TIMEOUT_MS", 300_000),
-    publicBases: readPublicBases(env),
     instanceId: readInstanceId(env),
     ...(barkUrl === undefined ? {} : { barkUrl }),
     ...(ntfyUrl === undefined ? {} : { ntfyUrl }),

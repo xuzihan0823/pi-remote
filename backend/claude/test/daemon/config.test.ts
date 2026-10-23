@@ -70,10 +70,7 @@ test("instanceId：默认随机 UUID；显式值必须严格 UUID", () => {
   assert.throws(() => loadConfig({ BRIDGE_TOKEN: TOKEN, BRIDGE_INSTANCE_ID: "not-a-uuid" }), ConfigError);
 });
 
-test("BRIDGE_PUBLIC_BASES：保留协议、去掉 userinfo/非法项、去重", () => {
-  const bases = loadConfig({
-    BRIDGE_TOKEN: TOKEN,
-    BRIDGE_PUBLIC_BASES: " https://a.example.com/ ,http://b:1 ,bad,ftp://c,http://u:p@d:9,https://a.example.com ",
-  }).publicBases;
-  assert.deepEqual(bases, ["https://a.example.com", "http://b:1"]);
+test("BRIDGE_PUBLIC_BASES 已移除：配置中不再出现 publicBases", () => {
+  const config = loadConfig({ BRIDGE_TOKEN: TOKEN, BRIDGE_PUBLIC_BASES: "https://a.example.com" });
+  assert.equal("publicBases" in config, false);
 });

@@ -134,8 +134,8 @@ export class DaemonServer {
 
   /** 配对信息（候选地址每次现查——Tailscale 可能在 daemon 启动后才拉起）；listen() 后用实际端口。 */
   get pairInfo(): PairInfo {
-    const { publicBases, token } = this.#options.config;
-    return { bases: [...new Set([...publicBases, ...enumeratePairBases(this.#pairPort)])], token };
+    const { token } = this.#options.config;
+    return { bases: enumeratePairBases(this.#pairPort), token };
   }
 
   /** 实际监听地址（测试用 port 0）。 */
