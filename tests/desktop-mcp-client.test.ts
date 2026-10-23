@@ -1,13 +1,37 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createInterface } from "node:readline";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
+import { join, resolve, sep } from "node:path";
+import nodeTest from "node:test";
 import { DesktopConnectionError, DesktopMcpClient } from "../src/desktop/mcp-client.ts";
+
+/**
+ * The client refuses connection files whose ancestor directories are group/world writable (the
+ * same rule ssh applies). Linux containers and CI often have a 1777 home, so pick a base that
+ * passes the rule, or skip the suite instead of failing and leaving servers open.
+ */
+async function safeBase(): Promise<string | undefined> {
+  for (const candidate of [process.env.PI_REMOTE_TEST_SAFE_DIR, homedir(), process.cwd()]) {
+    if (!candidate) continue;
+    let current: string = sep;
+    let ok = true;
+    for (const part of ["", ...resolve(candidate).split(sep).filter(Boolean)]) {
+      current = part ? resolve(current, part) : current;
+      const info = await lstat(current).catch(() => undefined);
+      if (!info || !info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o022) !== 0) { ok = false; break; }
+    }
+    if (ok) return resolve(candidate);
+  }
+  return undefined;
+}
+const SAFE_BASE = await safeBase();
+const test = SAFE_BASE
+  ? nodeTest
+  : ((name: string, ..._rest: unknown[]) => nodeTest(name, { skip: "no directory with a non-writable ancestor chain; set PI_REMOTE_TEST_SAFE_DIR" })) as typeof nodeTest;
 
 const TOKEN = "local-secret-token";
 const SESSION = "session-test-1";
@@ -28,7 +52,10 @@ async function listen(handler: Handler, port = 0): Promise<{ server: Server; por
 }
 
 async function stop(server: Server): Promise<void> {
-  if (server.listening) await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  if (!server.listening) return;
+  const closed = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+  server.closeAllConnections();
+  await closed;
 }
 
 async function spawnMcpHost(): Promise<{ child: ReturnType<typeof spawn>; port: number }> {
@@ -89,7 +116,7 @@ async function fixture(): Promise<{
   set: (port: number, overrides?: Record<string, unknown>) => Promise<void>;
   cleanup: () => Promise<void>;
 }> {
-  const directory = await mkdtemp(join(homedir(), ".pi-desktop-mcp-"));
+  const directory = await mkdtemp(join(SAFE_BASE ?? homedir(), ".pi-desktop-mcp-"));
   await chmod(directory, 0o700);
   const file = join(directory, "mcp-control.json");
   const set = async (port: number, overrides: Record<string, unknown> = {}): Promise<void> => {

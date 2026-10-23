@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { access, mkdir, stat } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -65,7 +65,10 @@ export async function start(configuration: CliConfig): Promise<void> {
     if (pi) {
       const localBase = `http://127.0.0.1:${config.pi.port}`;
       const agentURL = config.pi.mode === "relay" ? config.pi.relayUrl : `ws://127.0.0.1:${config.pi.port}/ws/agent`;
-      const env = { ...environment, RELAY_HOST: "127.0.0.1", RELAY_PORT: String(config.pi.port), RELAY_TOKEN: config.pi.token, AGENT_TOKEN: config.pi.token, RELAY_URL: agentURL, AGENT_DEVICE_ID: config.pi.deviceId, PI_WORKSPACE_ROOT: config.pi.workspace };
+      // A local relay gets a per-run agent credential that never leaves this process group, so the
+      // phone token in the pairing QR cannot register as the agent. A remote relay keeps its own.
+      const agentToken = config.pi.mode === "cloudflare" ? randomBytes(32).toString("hex") : config.pi.token;
+      const env = { ...environment, RELAY_HOST: "127.0.0.1", RELAY_PORT: String(config.pi.port), RELAY_TOKEN: config.pi.token, AGENT_TOKEN: agentToken, RELAY_URL: agentURL, AGENT_DEVICE_ID: config.pi.deviceId, PI_WORKSPACE_ROOT: config.pi.workspace };
       if (config.pi.mode === "cloudflare") {
         group.start({ command: process.execPath, args: [runtime("relay")], cwd: config.pi.workspace, env, tag: "pi-relay" }, log("pi-relay"));
         await waitFor("等待本机 Relay", async () => (await health(localBase, config.pi.token, group.signal))?.status === "ok" ? true : undefined, group.signal);

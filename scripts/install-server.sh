@@ -125,6 +125,7 @@ fi
 
 IS_UPGRADE=false
 EXISTING_TOKEN=""
+EXISTING_AGENT_TOKEN=""
 BACKUP_TAR=""
 
 if [[ -d "$INSTALL_DIR" ]]; then
@@ -146,6 +147,8 @@ if [[ -d "$INSTALL_DIR" ]]; then
   if [[ -f "$INSTALL_DIR/.env" ]]; then
     # 提取现有 RELAY_TOKEN
     EXISTING_TOKEN="$(grep -E '^RELAY_TOKEN=' "$INSTALL_DIR/.env" | cut -d'=' -f2- | tr -d '\r"' || true)"
+    # 保留用户另行配置的 AGENT_TOKEN（Mac Agent 专用凭据）
+    EXISTING_AGENT_TOKEN="$(grep -E '^AGENT_TOKEN=' "$INSTALL_DIR/.env" | cut -d'=' -f2- | tr -d '\r"' || true)"
   fi
 fi
 
@@ -260,6 +263,9 @@ RELAY_HOST=0.0.0.0
 RELAY_PORT=8789
 RELAY_TOKEN=${FINAL_TOKEN}
 EOF
+if [[ ${#EXISTING_AGENT_TOKEN} -ge 32 && "$EXISTING_AGENT_TOKEN" != *$'\n'* ]]; then
+  printf 'AGENT_TOKEN=%s\n' "$EXISTING_AGENT_TOKEN" >> "$STAGE_DIR/.env"
+fi
 chmod 600 "$STAGE_DIR/.env"
 
 # 写入受管标记

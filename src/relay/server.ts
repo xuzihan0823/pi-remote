@@ -129,11 +129,12 @@ export class RelayServer {
     const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
     if (req.method === "GET" && url.pathname === "/api/health") {
-      sendJson(res, 200, this.#health());
+      // Public liveness probe only: agent presence, device ids and client counts stay behind auth.
+      sendJson(res, 200, { status: "ok", protocolVersion: RELAY_PROTOCOL_VERSION });
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/status") {
-      if (!this.#authorize(req, url)) {
+      if (!this.#authorize(req, "ios") && !this.#authorize(req, "agent")) {
         sendJson(res, 401, { error: "unauthorized" });
         return;
       }
@@ -151,12 +152,12 @@ export class RelayServer {
       socket.destroy();
       return;
     }
-    if (!this.#authorize(req, url)) {
+    const role: RelayRole = url.pathname === "/ws/agent" ? "agent" : "ios";
+    if (!this.#authorize(req, role)) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return;
     }
-    const role: RelayRole = url.pathname === "/ws/agent" ? "agent" : "ios";
     wss.handleUpgrade(req, socket, head, (ws) => this.#onConnection(ws, role));
   }
 
@@ -269,14 +270,19 @@ export class RelayServer {
     }
   }
 
-  #authorize(req: IncomingMessage, url: URL): boolean {
+  /**
+   * Bearer-header auth only. Query-string tokens are rejected because they end up in reverse
+   * proxy access logs. The agent endpoint takes AGENT_TOKEN and the iOS endpoint RELAY_TOKEN, so
+   * a leaked phone credential cannot register as (or squat the slot of) the Mac agent.
+   */
+  #authorize(req: IncomingMessage, role: RelayRole): boolean {
     const header = req.headers.authorization;
     let provided: string | undefined;
     if (typeof header === "string" && header.startsWith("Bearer ")) {
       provided = header.slice("Bearer ".length).trim();
     }
-    if (!provided) provided = url.searchParams.get("token") ?? undefined;
-    return tokenEquals(provided, this.#config.relayToken);
+    const expected = role === "agent" ? this.#config.agentToken : this.#config.relayToken;
+    return tokenEquals(provided, expected);
   }
 
   #health(): Record<string, unknown> {

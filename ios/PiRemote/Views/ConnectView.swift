@@ -302,6 +302,10 @@ struct ConnectionConfigSheet: View {
             errorText = "服务器地址需要以 ws:// 或 wss:// 开头"
             return
         }
+        guard ConnectionConfig.allowsTransport(scheme: scheme, host: url.host ?? "") else {
+            errorText = "公网地址必须使用 wss://，明文 ws:// 仅限本机或局域网"
+            return
+        }
         client.connect(
             config: ConnectionConfig(
                 serverUrl: trimmedUrl,

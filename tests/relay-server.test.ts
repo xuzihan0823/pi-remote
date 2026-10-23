@@ -13,13 +13,26 @@ import {
   waitForClose,
 } from "./helpers/relay-harness.ts";
 
-test("GET /api/health is public and reports relay state", async () => {
+test("GET /api/health is public and reveals only liveness", async () => {
   const { server, port } = await startTestServer();
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/health`);
     assert.equal(res.status, 200);
     const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.status, "ok");
+    assert.equal("agentConnected" in body, false);
+    assert.equal("agentDeviceId" in body, false);
+    assert.equal("iosClients" in body, false);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("HTTP /api/status reports relay state to authorized callers", async () => {
+  const { server, port } = await startTestServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/status`, { headers: { authorization: `Bearer ${TEST_TOKEN}` } });
+    const body = (await res.json()) as Record<string, unknown>;
     assert.equal(body.agentConnected, false);
     assert.equal(body.iosClients, 0);
   } finally {
@@ -48,6 +61,40 @@ test("WebSocket upgrades require the relay token", async () => {
     await assert.rejects(openSocket(port, "/ws/ios", "wrong-token"));
     await assert.rejects(openSocket(port, "/ws/ios", null));
     await assert.rejects(openSocket(port, "/ws/agent", "wrong-token"));
+  } finally {
+    await server.stop();
+  }
+});
+
+test("query-string tokens are rejected", async () => {
+  const { server, port } = await startTestServer();
+  try {
+    for (const path of ["/ws/ios", "/ws/agent"]) {
+      await assert.rejects(new Promise((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}${path}?token=${encodeURIComponent(TEST_TOKEN)}`);
+        ws.on("open", () => { ws.close(); resolve(undefined); });
+        ws.on("error", reject);
+      }));
+    }
+    const status = await fetch(`http://127.0.0.1:${port}/api/status?token=${encodeURIComponent(TEST_TOKEN)}`);
+    assert.equal(status.status, 401);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("a separate AGENT_TOKEN keeps the phone token off the agent endpoint", async () => {
+  const agentToken = "agent-token-0123456789abcdef0123456789abcdef";
+  const { server, port } = await startTestServer({ agentToken });
+  try {
+    await assert.rejects(openSocket(port, "/ws/agent", TEST_TOKEN));
+    await assert.rejects(openSocket(port, "/ws/ios", agentToken));
+    const agent = await openSocket(port, "/ws/agent", agentToken);
+    const ios = await openSocket(port, "/ws/ios", TEST_TOKEN);
+    agent.close();
+    ios.close();
+    const status = await fetch(`http://127.0.0.1:${port}/api/status`, { headers: { authorization: `Bearer ${agentToken}` } });
+    assert.equal(status.status, 200);
   } finally {
     await server.stop();
   }

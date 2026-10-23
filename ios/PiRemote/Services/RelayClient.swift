@@ -382,6 +382,10 @@ public final class RelayClient {
             state = .failed("服务器地址无效")
             return
         }
+        guard ConnectionConfig.allowsTransport(scheme: scheme, host: url.host ?? "") else {
+            state = .failed("公网地址必须使用 wss://，明文 ws:// 仅限本机或局域网")
+            return
+        }
 
         var request = URLRequest(url: url)
         if !connectionConfig.token.isEmpty {
@@ -1576,11 +1580,11 @@ public final class RelayClient {
 
     private static let dialogMethods: Set<String> = ["select", "confirm", "input", "editor"]
 
-    /// hello_ack 不携带 agent 设备名，只能走 /api/health 这条公开接口取回。
+    /// hello_ack 不携带 agent 设备名，从需要鉴权的 /api/status 取回（/api/health 只报存活）。
     private func refreshAgentName() {
         guard var components = URLComponents(string: connectionConfig.serverUrl) else { return }
         components.scheme = components.scheme?.lowercased() == "wss" ? "https" : "http"
-        components.path = "/api/health"
+        components.path = "/api/status"
         components.query = nil
         guard let url = components.url else { return }
 

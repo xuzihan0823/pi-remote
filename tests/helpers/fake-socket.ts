@@ -14,14 +14,16 @@ export class FakeSocket {
 
   readyState = 0;
   readonly url: string;
+  readonly headers: Record<string, string>;
   readonly sent: string[] = [];
   pingCount = 0;
   terminated = false;
   gracefulCloseStalls = false;
   readonly #listeners = new Map<string, Set<Listener>>();
 
-  constructor(url: string) {
+  constructor(url: string, options?: { headers?: Record<string, string> }) {
     this.url = url;
+    this.headers = options?.headers ?? {};
     FakeSocket.instances.push(this);
     setImmediate(() => {
       if (FakeSocket.silentConnect) return;

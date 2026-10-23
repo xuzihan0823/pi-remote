@@ -16,12 +16,12 @@ enum HealthOutcome {
 }
 
 enum HealthChecker {
-    /// Public TLS health check. TLS validation stays enabled; the relay's device id must match this
-    /// app's own agent so an unrelated agent can never be mistaken for a successful connection.
-    static func check(agentURL: URL, expectedDeviceId: String, timeout: TimeInterval) async -> HealthOutcome {
+    /// Authenticated TLS status check. TLS validation stays enabled; the relay's device id must match
+    /// this app's own agent so an unrelated agent can never be mistaken for a successful connection.
+    static func check(agentURL: URL, token: String, expectedDeviceId: String, timeout: TimeInterval) async -> HealthOutcome {
         let url: URL
         do {
-            url = try EndpointValidator.healthURL(forAgentURL: agentURL)
+            url = try EndpointValidator.statusURL(forAgentURL: agentURL)
         } catch {
             return .failed(error.localizedDescription)
         }
@@ -29,12 +29,14 @@ enum HealthChecker {
         var request = URLRequest(url: url)
         request.timeoutInterval = timeout
         request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let session = makeSession(timeout: timeout)
         defer { session.invalidateAndCancel() }
 
         do {
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse else { return .failed("健康检查没有有效响应") }
+            if http.statusCode == 401 { return .failed("健康检查认证失败，请检查连接密钥") }
             guard http.statusCode == 200 else { return .failed("健康检查返回状态码 \(http.statusCode)") }
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return .failed("健康检查响应格式无效")

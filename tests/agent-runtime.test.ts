@@ -131,7 +131,8 @@ test("AgentRuntime sends an agent hello and reconnects after the socket drops", 
 
     FakeSocket.instances[0]?.serverClose();
     await waitFor(() => FakeSocket.instances.length >= 2 && client.state === "connected");
-    assert.equal(FakeSocket.instances[1]?.url.includes("token="), true);
+    assert.equal(FakeSocket.instances[1]?.url.includes("token="), false);
+    assert.match(FakeSocket.instances[1]?.headers.authorization ?? "", /^Bearer /);
   } finally {
     await runtime.stop();
     await manager.closeAll();

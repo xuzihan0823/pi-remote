@@ -52,8 +52,8 @@ export class FrameQueue {
 
 export function openSocket(port: number, path: string, token: string | null = TEST_TOKEN): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
-    const query = token === null ? "" : `?token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(`ws://127.0.0.1:${port}${path}${query}`);
+    const headers = token === null ? undefined : { authorization: `Bearer ${token}` };
+    const ws = new WebSocket(`ws://127.0.0.1:${port}${path}`, { headers });
     ws.on("open", () => resolve(ws));
     ws.on("error", (error) => reject(error));
   });

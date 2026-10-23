@@ -102,11 +102,12 @@ export class AgentClient {
 
     const Impl = this.#options.WebSocketImpl ?? WebSocket;
     const url = new URL(this.#options.url);
-    url.searchParams.set("token", this.#options.token);
 
     this.#setState("connecting");
     const proxyAgent = proxyAgentFor(url);
-    const socket = proxyAgent ? new Impl(url.toString(), { agent: proxyAgent }) : new Impl(url.toString());
+    // Token travels in the Authorization header, never the URL, so proxies cannot log it.
+    const headers = { authorization: `Bearer ${this.#options.token}` };
+    const socket = new Impl(url.toString(), proxyAgent ? { agent: proxyAgent, headers } : { headers });
     this.#socket = socket;
 
     socket.on("message", (data) => {

@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 public struct ConnectionConfig: Codable, Equatable {
     public var serverUrl: String
@@ -21,15 +22,23 @@ public struct ConnectionConfig: Codable, Equatable {
 
     public static func load() -> ConnectionConfig {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let config = try? JSONDecoder().decode(ConnectionConfig.self, from: data) else {
+              let stored = try? JSONDecoder().decode(ConnectionConfig.self, from: data) else {
             return .default
         }
+        // 旧版本把 Token 明文写在 UserDefaults 里：读到时迁入 Keychain 并改写为不含 Token 的记录。
+        if !stored.token.isEmpty {
+            ConnectionTokenStore.setToken(stored.token, for: stored.serverUrl)
+            persist(stored, forKey: storageKey)
+            return stored
+        }
+        var config = stored
+        config.token = ConnectionTokenStore.token(for: stored.serverUrl) ?? ""
         return config
     }
 
     public func save() {
-        guard let data = try? JSONEncoder().encode(self) else { return }
-        UserDefaults.standard.set(data, forKey: Self.storageKey)
+        ConnectionTokenStore.setToken(token, for: serverUrl)
+        Self.persist(self, forKey: Self.storageKey)
         var devices = Self.savedDevices().filter { $0.serverUrl != serverUrl }
         devices.insert(self, at: 0)
         Self.storeSavedDevices(devices)
@@ -38,9 +47,22 @@ public struct ConnectionConfig: Codable, Equatable {
     private static let savedDevicesKey = "piRemote.savedDevices"
 
     /// 连接过的设备，最近使用的在前。旧版本只存了单个配置，首次读取时把它补进来。
+    /// UserDefaults 只保存地址和设备名，Token 按服务器地址存放在 Keychain。
     public static func savedDevices() -> [ConnectionConfig] {
         if let data = UserDefaults.standard.data(forKey: savedDevicesKey),
-           let devices = try? JSONDecoder().decode([ConnectionConfig].self, from: data) {
+           let stored = try? JSONDecoder().decode([ConnectionConfig].self, from: data) {
+            var migrated = false
+            let devices = stored.map { device -> ConnectionConfig in
+                var device = device
+                if device.token.isEmpty {
+                    device.token = ConnectionTokenStore.token(for: device.serverUrl) ?? ""
+                } else {
+                    ConnectionTokenStore.setToken(device.token, for: device.serverUrl)
+                    migrated = true
+                }
+                return device
+            }
+            if migrated { storeSavedDevices(devices) }
             return devices
         }
         let current = load()
@@ -49,11 +71,95 @@ public struct ConnectionConfig: Codable, Equatable {
 
     public static func forgetDevice(serverUrl: String) {
         storeSavedDevices(savedDevices().filter { $0.serverUrl != serverUrl })
+        if load().serverUrl != serverUrl { ConnectionTokenStore.removeToken(for: serverUrl) }
     }
 
     private static func storeSavedDevices(_ devices: [ConnectionConfig]) {
-        guard let data = try? JSONEncoder().encode(devices) else { return }
+        let redacted = devices.map { device -> ConnectionConfig in
+            var device = device
+            device.token = ""
+            return device
+        }
+        guard let data = try? JSONEncoder().encode(redacted) else { return }
         UserDefaults.standard.set(data, forKey: savedDevicesKey)
+    }
+
+    private static func persist(_ config: ConnectionConfig, forKey key: String) {
+        var redacted = config
+        redacted.token = ""
+        guard let data = try? JSONEncoder().encode(redacted) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+
+    /// 明文 ws:// 只允许本机、局域网和 Tailscale 地址；公网地址必须走 wss://，
+    /// 否则 Token 与会话内容会以明文经过公网。
+    public static func allowsTransport(scheme: String, host: String) -> Bool {
+        switch scheme.lowercased() {
+        case "wss": return true
+        case "ws": return isPrivateHost(host)
+        default: return false
+        }
+    }
+
+    public static func isPrivateHost(_ rawHost: String) -> Bool {
+        let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        if host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".ts.net") { return true }
+        if host.contains(":") {
+            // IPv6：回环、链路本地 fe80::/10、唯一本地 fc00::/7
+            return host == "::1" || host.hasPrefix("fe8") || host.hasPrefix("fe9") || host.hasPrefix("fea") ||
+                host.hasPrefix("feb") || host.hasPrefix("fc") || host.hasPrefix("fd")
+        }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false).compactMap { UInt8($0) }
+        guard parts.count == 4 else { return false }
+        switch (parts[0], parts[1]) {
+        case (127, _), (10, _), (192, 168), (169, 254): return true
+        case (172, 16...31): return true
+        case (100, 64...127): return true // CGNAT / Tailscale
+        default: return false
+        }
+    }
+}
+
+/// iOS 端连接 Token 的 Keychain 存储，按服务器地址区分；仅本机解锁后可读，不随备份迁移到其他设备。
+enum ConnectionTokenStore {
+    private static let service = "com.piremote.app.relay-token"
+
+    static func token(for serverUrl: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: serverUrl,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let value = String(data: data, encoding: .utf8),
+              !value.isEmpty else { return nil }
+        return value
+    }
+
+    static func setToken(_ token: String, for serverUrl: String) {
+        removeToken(for: serverUrl)
+        guard !token.isEmpty else { return }
+        let attributes: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: serverUrl,
+            kSecValueData as String: Data(token.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    static func removeToken(for serverUrl: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: serverUrl,
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 }
 

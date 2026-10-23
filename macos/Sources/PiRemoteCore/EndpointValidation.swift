@@ -81,6 +81,17 @@ public enum EndpointValidator {
         return url
     }
 
+    /// Authenticated status endpoint. `/api/health` is liveness only and no longer reports which
+    /// agent is connected, so readiness checks must call this with the bearer token.
+    public static func statusURL(forAgentURL agentURL: URL) throws -> URL {
+        guard var components = URLComponents(url: try healthURL(forAgentURL: agentURL), resolvingAgainstBaseURL: false) else {
+            throw ValidationError("地址格式无效")
+        }
+        components.path = "/api/status"
+        guard let url = components.url else { throw ValidationError("无法构造状态检查地址") }
+        return url
+    }
+
     /// iOS WebSocket endpoint on the same host as the agent endpoint.
     public static func iosURL(forAgentURL agentURL: URL) throws -> URL {
         guard var components = URLComponents(url: agentURL, resolvingAgainstBaseURL: false) else {

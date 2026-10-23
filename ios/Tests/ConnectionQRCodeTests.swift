@@ -18,7 +18,7 @@ struct ConnectionQRCodeTests {
             return String(decoding: data, as: UTF8.self)
         }
 
-        for url in ["wss://relay.example.com/ws/ios", "ws://192.168.1.10:8789/ws/ios", "ws://[::1]:8789/ws/ios"] {
+        for url in ["wss://relay.example.com/ws/ios", "ws://192.168.1.10:8789/ws/ios", "ws://[::1]:8789/ws/ios", "ws://100.101.102.103:8789/ws/ios", "ws://mac.local:8789/ws/ios"] {
             let config = try ConnectionQRCode.parse(payload(url: url), deviceName: "我的 iPhone")
             try expect(config.serverUrl == url, "Preserves the server address")
             try expect(config.token == token, "Preserves the token")
@@ -34,6 +34,7 @@ struct ConnectionQRCodeTests {
 
         for url in [
             "https://relay.example.com/ws/ios", "file:///ws/ios", "ws:///ws/ios",
+            "ws://relay.example.com/ws/ios", "ws://8.8.8.8:8789/ws/ios", "ws://172.32.0.1:8789/ws/ios",
             "wss://relay.example.com/ws/agent", "wss://relay.example.com",
             "wss://relay.example.com/ws/%69os", "wss://bad%20host/ws/ios",
             "wss://user:password@relay.example.com/ws/ios",
@@ -43,7 +44,7 @@ struct ConnectionQRCodeTests {
         ] {
             try expectError(payload(url: url), .invalidServer)
         }
-        print("PASS: invalid schemes, hosts, ports, endpoints and embedded credentials are rejected")
+        print("PASS: invalid schemes, public plaintext ws://, hosts, ports, endpoints and embedded credentials are rejected")
 
         for invalidToken in ["", String(token.dropLast()), token + "\r\nInjected: header", token + " ", token + "\u{0000}"] {
             try expectError(payload(token: invalidToken), .invalidToken)

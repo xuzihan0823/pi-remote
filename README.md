@@ -165,13 +165,17 @@ This was run successfully against pi 0.85.1. It does not read or modify user ses
 | --- | --- | --- |
 | `RELAY_HOST` | `127.0.0.1` | bare host or IP, no scheme/port/path |
 | `RELAY_PORT` | `8789` | integer 1-65535 |
-| `RELAY_TOKEN` | required | shared secret, >= 32 chars |
+| `RELAY_TOKEN` | required | iOS client token (`/ws/ios`), >= 32 chars |
 | `RELAY_URL` | `ws://$RELAY_HOST:$RELAY_PORT/ws/agent` | `ws://`/`wss://` URL; must not embed a token |
-| `AGENT_TOKEN` | `RELAY_TOKEN` | Mac agent token, >= 32 chars |
+| `AGENT_TOKEN` | `RELAY_TOKEN` | agent token (`/ws/agent`), >= 32 chars; set a different value on both relay and Mac so a leaked phone token cannot impersonate the agent |
 | `AGENT_DEVICE_ID` | `pi-mac-agent` | 1-128 chars from `[A-Za-z0-9._:-]`, first char alphanumeric |
 | `PI_RUNTIME` / `PI_BIN` | legacy | ignored by the Desktop production agent; retained for old components |
 | `PI_WORKSPACE_ROOT` | `~/Desktop` | absolute, non-root default project selection location |
 | `MAX_SESSIONS` | `16` | legacy component limit; Desktop owns its own execution limits |
+
+Tokens are accepted only as `Authorization: Bearer …`; `?token=` query strings are rejected so they
+never land in proxy access logs. `GET /api/health` is a public liveness probe (`status` and protocol
+version only); agent presence and device id are on the authenticated `GET /api/status`.
 
 Tokens are never logged. `describeConfig()` prints only the relay URL, device id, runtime, binary,
 workspace root, and session cap; `RELAY_URL` rejects embedded tokens for the same reason.

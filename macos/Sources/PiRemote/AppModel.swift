@@ -738,7 +738,7 @@ final class AppModel: ObservableObject {
             while Date() < deadline {
                 if Task.isCancelled { return }
                 guard let self, self.generation == currentGeneration else { return }
-                let outcome = await HealthChecker.check(agentURL: agentURL, expectedDeviceId: deviceId, timeout: 8)
+                let outcome = await HealthChecker.check(agentURL: agentURL, token: token, expectedDeviceId: deviceId, timeout: 8)
                 if Task.isCancelled { return }
                 guard self.generation == currentGeneration else { return }
                 switch outcome {
@@ -785,7 +785,7 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 if Task.isCancelled { return }
                 guard let self, self.generation == currentGeneration, !self.isShuttingDown else { return }
-                let outcome = await HealthChecker.check(agentURL: agentURL, expectedDeviceId: deviceId, timeout: 8)
+                let outcome = await HealthChecker.check(agentURL: agentURL, token: token, expectedDeviceId: deviceId, timeout: 8)
                 if Task.isCancelled { return }
                 guard self.generation == currentGeneration, !self.isShuttingDown else { return }
 

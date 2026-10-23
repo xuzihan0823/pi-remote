@@ -53,6 +53,7 @@ final class EndpointValidationTests: XCTestCase {
 
         let localURL = URL(string: "ws://127.0.0.1:8789/ws/agent")!
         XCTAssertEqual(try EndpointValidator.healthURL(forAgentURL: localURL).absoluteString, "http://127.0.0.1:8789/api/health")
+        XCTAssertEqual(try EndpointValidator.statusURL(forAgentURL: agentURL).absoluteString, "https://relay.example.com/api/status")
     }
 
     func testIOSURLMappingKeepsHostAndPort() throws {

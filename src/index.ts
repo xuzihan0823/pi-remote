@@ -5,11 +5,14 @@ async function main(): Promise<void> {
   const config = loadConfig();
   const server = new RelayServer({ config });
   const address = await server.start();
+  if (config.agentToken === config.relayToken) {
+    console.warn("warning: AGENT_TOKEN is unset or equals RELAY_TOKEN; anyone holding the phone token can register as the Mac agent. Set a separate AGENT_TOKEN on the relay and the Mac agent.");
+  }
 
   console.log(`pi-remote relay is listening on http://${address.host}:${address.port}`);
   console.log(`  health   GET  http://${address.host}:${address.port}/api/health`);
-  console.log(`  ios      WS   ws://${address.host}:${address.port}/ws/ios?token=***`);
-  console.log(`  agent    WS   ws://${address.host}:${address.port}/ws/agent?token=***`);
+  console.log(`  ios      WS   ws://${address.host}:${address.port}/ws/ios (Authorization: Bearer RELAY_TOKEN)`);
+  console.log(`  agent    WS   ws://${address.host}:${address.port}/ws/agent (Authorization: Bearer AGENT_TOKEN)`);
   console.log(`  workspace root: ${config.piWorkspaceRoot} (pi: ${config.piBin}, max sessions: ${config.maxSessions})`);
 
   let shuttingDown = false;
