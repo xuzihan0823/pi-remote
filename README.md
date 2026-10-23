@@ -4,6 +4,8 @@ Remote gateway for the [pi](https://github.com/earendil-works/pi) coding agent.
 
 Mac Agent 通过本机 pi / OMP CLI 管理会话（托管 RPC 会话、终端共享会话、OMP 历史恢复），经 Relay 转发给 iOS 客户端。仓库另带独立的 Claude 后端（`backend/claude`），iOS App 可作为第二种后端直接连接它（扫描 `claude-remote://setup` 配对码，详见 [ios/CONNECTING.md](ios/CONNECTING.md#claude-后端第二种后端)）。No prompt is invoked automatically; a pi subprocess starts only when a client sends `session.start`.
 
+另有 **PI-Desktop 插件** [`plugins/pi-desktop-bridge`](plugins/pi-desktop-bridge)：在 [PI-Desktop](https://github.com/vastsa/PI-Desktop) 里以“加载开发插件”方式安装后，插件直接作为 Mac Agent 连到 Relay（只需 Relay 地址 + `AGENT_TOKEN`），手机即可阅读、新建、发送、停止 Pi Desktop 会话；审批需在 Mac 上完成，建议会话使用 auto 权限模式。详见 [docs/pi-desktop-plugin.md](docs/pi-desktop-plugin.md)。
+
 ## Requirements
 
 - Node.js >= 22.18 (uses built-in TypeScript type stripping and `node:test`; developed on Node 24)
@@ -76,6 +78,8 @@ src/agent/pi-agent-handler.ts  relay requests -> PiProcessManager, events -> ses
 src/agent/run.ts            Mac agent entry point with reconnect and graceful shutdown
 src/index.ts                relay entry point
 tests/                      node:test suites + fake child-process/socket helpers
+plugins/pi-desktop-bridge/   PI-Desktop plugin that acts as the Mac agent (see docs/pi-desktop-plugin.md)
+tests/pi-desktop-bridge/    plugin tests with a fake PI-Desktop host (`npm run test:plugin`)
 ```
 
 ## Verified RPC protocol

@@ -1,0 +1,6 @@
+{
+  "name": "pi-remote-bridge-plugin",
+  "private": true,
+  "description": "PI-Desktop 插件包内的模块类型声明：本插件是 CommonJS，避免被上层 pi-remote 的 \"type\": \"module\" 当成 ESM 加载。PI-Desktop 不会安装依赖，本插件也没有依赖。",
+  "type": "commonjs"
+}

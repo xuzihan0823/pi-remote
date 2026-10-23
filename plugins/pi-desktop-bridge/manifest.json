@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.xuzihan0823.pi-remote-bridge",
+  "name": "pi-remote Bridge",
+  "version": "0.1.0",
+  "description": "把 PI-Desktop 接到 pi-remote Relay，让 pi-remote iOS App 阅读、新建、发送和停止 Pi Desktop 会话。",
+  "author": "徐子涵",
+  "homepage": "https://github.com/xuzihan0823/pi-remote/tree/main/plugins/pi-desktop-bridge",
+  "repository": "https://github.com/xuzihan0823/pi-remote",
+  "main": "main.js",
+  "engines": {
+    "piDesktop": ">=0.21.0"
+  },
+  "activationEvents": ["onStartup"],
+  "contributes": {
+    "commands": [
+      {
+        "id": "pi-remote-bridge.status",
+        "title": "pi-remote：连接状态",
+        "keywords": ["pi-remote", "relay", "iphone", "手机", "远程"],
+        "category": "pi-remote"
+      },
+      {
+        "id": "pi-remote-bridge.reconnect",
+        "title": "pi-remote：重新连接",
+        "keywords": ["pi-remote", "relay", "reconnect", "重连"],
+        "category": "pi-remote"
+      }
+    ],
+    "services": [
+      {
+        "id": "relay",
+        "label": "pi-remote Relay 连接"
+      }
+    ],
+    "settings": [
+      {
+        "key": "relayUrl",
+        "title": "Relay 地址",
+        "description": "pi-remote Relay 的地址，例如 wss://relay.example.com（会自动补上 /ws/agent）。公网地址必须用 wss://；ws:// 只允许本机、局域网或 Tailscale 地址。",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "key": "agentToken",
+        "title": "AGENT_TOKEN",
+        "description": "Relay 的 Agent 凭据（与手机用的 RELAY_TOKEN 不同）。只通过 Authorization 头发送。注意：PI-Desktop 目前不支持加密的插件设置，此值以明文保存在本插件的私有设置文件里。",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "key": "deviceName",
+        "title": "设备名称（可选）",
+        "description": "在手机上显示的 Mac 名称，留空时使用本机主机名。",
+        "type": "string",
+        "default": ""
+      },
+      {
+        "key": "enabled",
+        "title": "启用连接",
+        "description": "关闭后插件保持加载，但不连接 Relay。",
+        "type": "boolean",
+        "default": true
+      }
+    ]
+  },
+  "permissions": [
+    "background.service",
+    "net.websocket",
+    "net.anyHost",
+    "desktop.control"
+  ]
+}
