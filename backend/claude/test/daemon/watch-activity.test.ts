@@ -97,10 +97,11 @@ test("terminal-driving 中 beginRun：清掉 cooldown 直接接管", async () =>
   );
 });
 
-test("endRun 后的写入是外部信号：重新进入 terminal-driving", async () => {
+test("endRun 后（收尾宽限期过后）的写入是外部信号：重新进入 terminal-driving", async () => {
   const { tracker, scheduler } = makeTracker(1000);
   tracker.beginRun("s1");
   tracker.endRun("s1");
+  await scheduler.advance(3_001); // 默认 postRunGraceMs = 3000
   tracker.noteWrite("s1");
   assert.equal(tracker.getStatus("s1"), "terminal-driving");
   await scheduler.advance(1000);
@@ -137,4 +138,45 @@ test("dispose 清空全部 timer，进程可退出", () => {
   assert.equal(scheduler.pending, 0);
   assert.equal(tracker.getStatus("s1"), "idle");
   tracker.dispose(); // 幂等
+});
+
+test("run 收尾宽限：endRun 后宽限期内的写入不判 terminal-driving，期满后的写入照常判定", async () => {
+  const scheduler = new FakeScheduler();
+  const tracker = new ActivityTracker({ cooldownMs: 1000, postRunGraceMs: 300, scheduler, now: scheduler.now });
+  const changes: StatusChangeEvent[] = [];
+  tracker.on("change", (event) => changes.push(event));
+
+  tracker.beginRun("s1");
+  tracker.endRun("s1");
+  // CLI 报错行 / last-prompt 在 result 之后才落盘，watcher 晚一拍才 poll 到
+  tracker.noteWrite("s1", scheduler.now() + 10);
+  await scheduler.advance(200);
+  tracker.noteWrite("s1");
+  assert.equal(tracker.getStatus("s1"), "idle");
+
+  await scheduler.advance(200);
+  tracker.noteWrite("s1"); // 真正的终端活动
+  assert.equal(tracker.getStatus("s1"), "terminal-driving");
+  assert.deepEqual(changes, [
+    { sessionId: "s1", status: "daemon-driving" },
+    { sessionId: "s1", status: "idle" },
+    { sessionId: "s1", status: "terminal-driving" },
+  ]);
+  tracker.dispose();
+});
+
+test("release：terminal-driving 可手动解除回 idle；daemon run 期间与 idle 时无效", async () => {
+  const { tracker, scheduler, changes } = makeTracker(1000);
+  assert.equal(tracker.release("s1"), false);
+
+  tracker.noteWrite("s1");
+  assert.equal(tracker.release("s1"), true);
+  assert.equal(tracker.getStatus("s1"), "idle");
+  assert.equal(scheduler.pending, 0);
+
+  tracker.beginRun("s1");
+  assert.equal(tracker.release("s1"), false);
+  assert.equal(tracker.getStatus("s1"), "daemon-driving");
+  tracker.endRun("s1");
+  assert.deepEqual(changes.map((c) => c.status), ["terminal-driving", "idle", "daemon-driving", "idle"]);
 });

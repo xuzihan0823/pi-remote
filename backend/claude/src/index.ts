@@ -28,8 +28,7 @@ const pkg = require("../package.json") as { name: string; version: string };
 
 /** 启动时异步探测 claude CLI 版本；失败保持 "unknown"（health 端点用）。 */
 function probeClaudeCliVersion(onResult: (version: string) => void): void {
-  const bin = process.env.CLAUDE_BIN ?? "claude";
-  execFile(bin, ["--version"], { timeout: 10_000 }, (error, stdout) => {
+  execFile(process.env.CLAUDE_BIN?.trim() || "claude", ["--version"], { timeout: 10_000 }, (error, stdout) => {
     if (error !== null) return;
     const version = stdout.trim();
     if (version !== "") onResult(version);

@@ -64,6 +64,8 @@ export class ApprovalBridge implements PermissionBroker {
   readonly #manager: InteractionManager;
   readonly #onEvent: ((event: ApprovalEvent) => void) | undefined;
   readonly #resolvedEmitted = new Set<string>();
+  /** 已发出卡片但尚未决议的交互（后连上的客户端如 CLI 用它补齐，WS 广播只覆盖在线连接）。 */
+  readonly #pending = new Map<string, ApprovalCard>();
 
   constructor(options: ApprovalBridgeOptions) {
     this.#manager = options.manager;
@@ -136,6 +138,12 @@ export class ApprovalBridge implements PermissionBroker {
     }
   }
 
+  /** 当前待决审批卡片，按创建先后。 */
+  pending(): ApprovalCard[] {
+    const now = Date.now();
+    return [...this.#pending.values()].filter((card) => card.expiresAt > now);
+  }
+
   #emitCard(record: InteractionRecord): void {
     const base = {
       interactionId: record.interactionId,
@@ -145,23 +153,21 @@ export class ApprovalBridge implements PermissionBroker {
     };
     if (record.kind === "approval") {
       const payload = record.payload as Approval;
-      this.#emit({
-        type: "approval",
-        interaction: { ...base, toolName: payload.toolName, input: payload.input, prompt: payload.prompt },
-      });
+      const card: ApprovalCard = { ...base, toolName: payload.toolName, input: payload.input, prompt: payload.prompt };
+      this.#pending.set(card.interactionId, card);
+      this.#emit({ type: "approval", interaction: card });
       return;
     }
     const payload = record.payload as Question;
-    this.#emit({
-      type: "approval",
-      interaction: {
-        ...base,
-        toolName: "AskUserQuestion",
-        input: { questions: payload.questions },
-        prompt: payload.questions[0]?.question ?? "AskUserQuestion",
-        questions: payload.questions,
-      },
-    });
+    const card: ApprovalCard = {
+      ...base,
+      toolName: "AskUserQuestion",
+      input: { questions: payload.questions },
+      prompt: payload.questions[0]?.question ?? "AskUserQuestion",
+      questions: payload.questions,
+    };
+    this.#pending.set(card.interactionId, card);
+    this.#emit({ type: "approval", interaction: card });
   }
 
   /** 按落库终态补发 approval.resolved；decide 与 awaitDecision 续体都会走到，Set 去重。 */
@@ -169,6 +175,7 @@ export class ApprovalBridge implements PermissionBroker {
     if (this.#resolvedEmitted.has(interactionId)) return;
     const record = this.#manager.get(interactionId);
     if (record === undefined || record.status === "pending") return;
+    this.#pending.delete(interactionId);
     this.#resolvedEmitted.add(interactionId);
     this.#emit({ type: "approval.resolved", interactionId, status: record.status });
   }

@@ -5,7 +5,7 @@ import { join } from "node:path";
 export interface ModelOption {
   /** Concrete model identifier resolved from Mac settings. */
   id: string;
-  /** Stable CLI alias accepted by the Agent SDK. */
+  /** CLI alias or configured model identifier accepted by the Agent SDK. */
   alias: string;
   displayName: string;
 }
@@ -44,7 +44,7 @@ function displayNameForModel(id: string): string {
 
 /**
  * Read a deliberately narrow, redacted projection of ~/.claude/settings.json.
- * Only `model` and the four documented model-alias environment keys are read.
+ * Only model identifiers, aliases, and display names are projected.
  */
 export async function readModelCatalog(
   settingsPath = join(process.env.CLAUDE_CONFIG_DIR?.trim() || join(homedir(), ".claude"), "settings.json"),
@@ -58,12 +58,41 @@ export async function readModelCatalog(
   }
 
   const env = record(settings.env) ?? {};
+  const defaultModel = modelId(settings.model);
+  const pickerOptions = record(settings.modelPicker)?.options;
+  const pickerModels: ModelOption[] = [];
+  const seen = new Set<string>();
+  if (Array.isArray(pickerOptions)) {
+    for (const value of pickerOptions) {
+      const option = record(value);
+      const id = modelId(option?.model);
+      if (id === undefined || seen.has(id)) continue;
+      seen.add(id);
+      const label = typeof option?.label === "string" ? option.label.trim() : "";
+      pickerModels.push({ id, alias: id, displayName: label || displayNameForModel(id) });
+    }
+  }
+
+  if (pickerModels.length > 0) {
+    const defaultAlias = MODEL_ALIASES.find(({ alias }) => alias === defaultModel);
+    const resolvedDefault = defaultAlias === undefined
+      ? defaultModel
+      : modelId(env[defaultAlias.envKey]) ?? defaultModel;
+    if (resolvedDefault !== undefined && !seen.has(resolvedDefault)) {
+      pickerModels.push({
+        id: resolvedDefault,
+        alias: resolvedDefault,
+        displayName: displayNameForModel(resolvedDefault),
+      });
+    }
+    return resolvedDefault === undefined ? { models: pickerModels } : { models: pickerModels, defaultModel: resolvedDefault };
+  }
+
   const models: ModelOption[] = MODEL_ALIASES.map(({ alias, displayName, envKey }) => ({
     alias,
     displayName,
     id: modelId(env[envKey]) ?? alias,
   }));
-  const defaultModel = modelId(settings.model);
 
   if (
     defaultModel !== undefined
@@ -80,5 +109,6 @@ export async function readModelCatalog(
 }
 
 export function isKnownModel(catalog: ModelCatalog, value: string): boolean {
-  return catalog.models.some((model) => model.alias === value || model.id === value);
+  return MODEL_ALIASES.some(({ alias }) => alias === value)
+    || catalog.models.some((model) => model.alias === value || model.id === value);
 }

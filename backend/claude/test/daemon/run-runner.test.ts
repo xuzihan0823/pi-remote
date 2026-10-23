@@ -277,3 +277,39 @@ test("endRun 抛错也不影响 completion settle 与终态事件", async (t) =>
   const events = await collect(handle.events);
   assert.deepEqual(events.at(-1), { type: "run", runId: handle.runId, sessionId: "s", state: "done" });
 });
+
+test("abort 后 interrupt 不生效（CLI 卡死）：宽限期满强制 close，run 仍以 aborted 收尾", async (t) => {
+  t.mock.method(console, "warn", () => undefined);
+  const { factory, state } = fakeFactory(async function* () {
+    yield assistantMessage("卡住前", "m1", "s");
+    await new Promise<void>(() => undefined); // 永不返回，interrupt 也不理
+  });
+  const { gate, ended } = stubGate();
+  const runner = new TurnRunner({ gate, permissions: denyAll, queryFactory: factory, abortGraceMs: 30 });
+  const handle = runner.startTurn({ sessionId: "s", cwd: "/tmp", text: "hi" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(runner.abort(handle.runId), true);
+  assert.equal(runner.abort(handle.runId), true); // 重复停止幂等，不重复挂计时器
+  assert.deepEqual(await handle.completion, { state: "error", error: "aborted" });
+  assert.equal(state.interrupts, 1);
+  assert.ok(state.closes >= 1);
+  assert.deepEqual(ended, ["s"]);
+  assert.equal(runner.activeRunId("s"), undefined);
+  // 会话已解锁，可以再发
+  assert.doesNotThrow(() => runner.startTurn({ sessionId: "s", cwd: "/tmp", text: "again" }));
+});
+
+test("result is_error（模型不可用/鉴权失败）：run 以 error 收尾并带上错误文本", async () => {
+  const { factory } = fakeFactory(async function* () {
+    yield assistantMessage("API Error: 404 model not found", "m1", "s");
+    yield sdkMessage({ type: "result", subtype: "success", is_error: true, result: "API Error: 404 model not found", uuid: "r1", session_id: "s" });
+  });
+  const { gate, ended } = stubGate();
+  const runner = new TurnRunner({ gate, permissions: denyAll, queryFactory: factory });
+  const handle = runner.startTurn({ sessionId: "s", cwd: "/tmp", text: "hi" });
+  assert.deepEqual(await handle.completion, { state: "error", error: "API Error: 404 model not found" });
+  const events = await collect(handle.events);
+  assert.deepEqual(events.at(-1), { type: "run", runId: handle.runId, sessionId: "s", state: "error", error: "API Error: 404 model not found" });
+  assert.deepEqual(ended, ["s"]);
+});

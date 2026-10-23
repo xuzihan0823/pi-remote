@@ -13,7 +13,7 @@ import { createReadStream } from "node:fs";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, extname, join, normalize, resolve, sep } from "node:path";
 import QRCode from "qrcode";
 import { WebSocket, WebSocketServer } from "ws";
@@ -22,9 +22,12 @@ import type { DaemonConfig } from "./config.ts";
 import { enumeratePairBases, isLoopbackAddress, looksProxied, pairPayload, type PairInfo } from "./pair.ts";
 import { isKnownModel, readModelCatalog, type ModelCatalog } from "./model-config.ts";
 import { readSessionCwd, resolveSessionFile } from "./session-files.ts";
-import { NotIdleError, type ApprovalBridge, type ApprovalEvent, type Notifier, type TurnHandle, type TurnRunner } from "./run/index.ts";
+import { StreamBuffer } from "./run/stream-buffer.ts";
+import { approvalLink, NotIdleError, sessionLink, type ApprovalBridge, type ApprovalEvent, type Notifier, type TurnHandle, type TurnRunner } from "./run/index.ts";
 import { listSessions } from "./transcript/indexer.ts";
+import { buildProjectIndex } from "./transcript/projects.ts";
 import { readBefore, readTail } from "./transcript/reader.ts";
+import { searchSessions } from "./transcript/search.ts";
 import type { ActivityTracker } from "./watch/activity.ts";
 import type { SessionWatcher } from "./watch/watcher.ts";
 
@@ -92,6 +95,7 @@ export class DaemonServer {
   readonly #newSessions = new Set<string>();
   readonly #watchActivations = new Set<string>();
   readonly #watchRetryTimers = new Map<string, NodeJS.Timeout>();
+  readonly #streams = new StreamBuffer({ emit: (frame) => this.#broadcastToSubscribers(frame.sessionId, frame) });
   #heartbeat: NodeJS.Timeout | undefined;
   #closed = false;
 
@@ -146,7 +150,12 @@ export class DaemonServer {
     this.#broadcastAll(event);
     if (event.type === "approval") {
       const card = event.interaction;
-      void this.#options.notifier("Claude 待审批", `${card.toolName}: ${card.prompt}`.slice(0, 120));
+      const what = card.kind === "approval" ? `${card.toolName}: ${card.prompt}` : `提问：${card.questions?.[0]?.question ?? ""}`;
+      void this.#options.notifier(card.kind === "approval" ? "Claude 待审批" : "Claude 有问题要问你", what.slice(0, 120), {
+        url: approvalLink(card.interactionId, card.sessionId),
+        group: "approval",
+        urgent: true,
+      });
     }
   }
 
@@ -229,12 +238,29 @@ export class DaemonServer {
         instanceId: this.#instanceId,
         version: this.#options.version,
         claudeCliVersion: this.#options.claudeCliVersion(),
+        hostname: hostname(),
       });
       return;
     }
 
     if (method === "GET" && path === "/api/sessions") {
       await this.#handleListSessions(res, url);
+      return;
+    }
+
+    if (method === "GET" && path === "/api/sessions/search") {
+      await this.#handleSearch(res, url);
+      return;
+    }
+
+    if (method === "GET" && path === "/api/interactions/pending") {
+      this.#json(res, 200, { interactions: this.#options.approvals.pending() });
+      return;
+    }
+
+    if (method === "GET" && path === "/api/projects") {
+      const all = await listSessions(this.#options.config.projectsDir);
+      this.#json(res, 200, { ...(await buildProjectIndex(all)).catalog, homeCwd: homedir() });
       return;
     }
 
@@ -352,11 +378,40 @@ export class DaemonServer {
     const limit = clampInt(url.searchParams.get("limit"), 50, 1, 500);
     const offset = clampInt(url.searchParams.get("offset"), 0, 0, Number.MAX_SAFE_INTEGER);
     const all = await listSessions(this.#options.config.projectsDir);
-    const sessions = all.slice(offset, offset + limit).map((summary) => ({
+    const projectId = url.searchParams.get("projectId");
+    const cwd = url.searchParams.get("cwd");
+    let filtered = cwd === null ? all : all.filter((summary) => summary.cwd === cwd);
+    if (projectId === "") {
+      filtered = filtered.filter((summary) => summary.cwd === "");
+    } else if (projectId !== null) {
+      const { projectIdByCwd } = await buildProjectIndex(all);
+      filtered = filtered.filter((summary) => projectIdByCwd.get(summary.cwd) === projectId);
+    }
+    const sessions = filtered.slice(offset, offset + limit).map((summary) => ({
       ...summary,
       status: this.#options.tracker.getStatus(summary.sessionId),
     }));
-    this.#json(res, 200, { sessions, total: all.length });
+    this.#json(res, 200, { sessions, total: filtered.length });
+  }
+
+  async #handleSearch(res: ServerResponse, url: URL): Promise<void> {
+    const q = url.searchParams.get("q") ?? "";
+    if (q.trim() === "") {
+      this.#json(res, 400, { error: "invalid_query" });
+      return;
+    }
+    const full = url.searchParams.get("full") === "1" || url.searchParams.get("full") === "true";
+    const limit = clampInt(url.searchParams.get("limit"), 50, 1, 200);
+    const all = await listSessions(this.#options.config.projectsDir);
+    const { hits, truncated } = await searchSessions(this.#options.config.projectsDir, all, q, { full, limit });
+    this.#json(res, 200, {
+      results: hits.map((hit) => ({
+        ...hit.session,
+        status: this.#options.tracker.getStatus(hit.session.sessionId),
+        match: { field: hit.field, snippet: hit.snippet, ...(hit.seq === undefined ? {} : { seq: hit.seq }) },
+      })),
+      truncated,
+    });
   }
 
   async #readModelCatalog(): Promise<ModelCatalog> {
@@ -365,7 +420,7 @@ export class DaemonServer {
 
   async #knownCwds(): Promise<Set<string>> {
     const sessions = await listSessions(this.#options.config.projectsDir);
-    return new Set(sessions.map((session) => session.cwd).filter((cwd) => cwd !== ""));
+    return new Set([...sessions.map((session) => session.cwd).filter((cwd) => cwd !== ""), homedir()]);
   }
 
   async #validateModel(
@@ -452,7 +507,9 @@ export class DaemonServer {
     }
     const runId = this.#options.runner.activeRunId(sessionId);
     if (runId === undefined) {
-      this.#json(res, 200, { runId: null, status: "idle" });
+      // 无 daemon run：若被判为 terminal-driving（如上一轮报错后 CLI 收尾写入误判），手动解除占用
+      const released = this.#options.tracker.release(sessionId);
+      this.#json(res, 200, { runId: null, status: released ? "released" : "idle" });
       return;
     }
     this.#options.runner.abort(runId);
@@ -542,11 +599,19 @@ export class DaemonServer {
     try {
       for await (const event of handle.events) {
         if (event.type === "worker") {
-          if (this.#newSessions.has(sessionId) && event.event.type === "session") {
+          const worker = event.event;
+          if (this.#newSessions.has(sessionId) && worker.type === "session") {
             void this.#activateNewSessionWatch(sessionId);
+          } else if (worker.type === "assistant_stream_start") {
+            this.#streams.start(sessionId, worker.apiMessageId);
+          } else if (worker.type === "assistant_delta") {
+            this.#streams.delta(sessionId, worker.index ?? 0, worker.text);
+          } else if (worker.type === "assistant_block_stop") {
+            this.#streams.stop(sessionId, worker.index);
           }
           continue;
         }
+        if (event.state !== "started") this.#streams.end(sessionId);
         const frame: Record<string, unknown> = {
           type: "run",
           sessionId,
@@ -557,15 +622,19 @@ export class DaemonServer {
         if (event.permissionMode !== undefined) frame.permissionMode = event.permissionMode;
         this.#broadcastToSubscribers(sessionId, frame);
         if (event.state === "done") {
-          void this.#options.notifier("Claude 已完成", snippet(text));
+          void this.#options.notifier("Claude 已完成", snippet(text), { url: sessionLink(sessionId), group: "run" });
         } else if (event.state === "error") {
-          void this.#options.notifier("Claude 运行出错", `${event.error ?? "unknown"} · ${snippet(text)}`);
+          void this.#options.notifier("Claude 运行出错", `${event.error ?? "unknown"} · ${snippet(text)}`, {
+            url: sessionLink(sessionId),
+            group: "run",
+          });
         }
       }
     } catch (error) {
       console.error(`run event pump failed (session ${sessionId}):`, error);
     } finally {
       this.#activeRuns.delete(handle.runId);
+      this.#streams.end(sessionId);
       if (this.#newSessions.has(sessionId)) void this.#activateNewSessionWatch(sessionId);
     }
   }
@@ -716,7 +785,7 @@ export class DaemonServer {
       state.alive = true;
     });
     ws.on("message", (data) => {
-      void this.#onClientFrame(state, data.toString());
+      void this.#onClientFrame(ws, state, data.toString());
     });
     ws.on("close", () => {
       this.#clients.delete(ws);
@@ -725,7 +794,7 @@ export class DaemonServer {
     ws.on("error", () => ws.terminate());
   }
 
-  async #onClientFrame(state: ClientState, raw: string): Promise<void> {
+  async #onClientFrame(ws: WebSocket, state: ClientState, raw: string): Promise<void> {
     let frame: unknown;
     try {
       frame = JSON.parse(raw);
@@ -754,6 +823,8 @@ export class DaemonServer {
         }
       }
       state.subs.add(sessionId);
+      // 中途打开 / 断线重连：补发正在流式输出的草稿
+      for (const f of this.#streams.snapshot(sessionId)) if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(f));
       return;
     }
     if (type === "unsubscribe") {

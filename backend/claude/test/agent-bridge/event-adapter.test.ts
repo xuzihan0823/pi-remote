@@ -19,3 +19,14 @@ test("adapts tool_result and result", () => {
   const result = adaptSdkMessage(sdk({ type: "result", subtype: "success", is_error: false, result: "yes", uuid: "r1", session_id: "s" }));
   assert.deepEqual(result[1], { type: "result", subtype: "success", isError: false, result: "yes", messageId: "r1" });
 });
+
+test("stream events: message_start / block index / block_stop; subagent streams skipped", () => {
+  const start = adaptSdkMessage(sdk({ type: "stream_event", event: { type: "message_start", message: { id: "msg_1" } }, uuid: "e1", session_id: "s", parent_tool_use_id: null }));
+  assert.deepEqual(start[1], { type: "assistant_stream_start", apiMessageId: "msg_1" });
+  const delta = adaptSdkMessage(sdk({ type: "stream_event", event: { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "x" } }, uuid: "e2", session_id: "s", parent_tool_use_id: null }));
+  assert.deepEqual(delta[1], { type: "assistant_delta", text: "x", messageId: "e2", index: 2 });
+  const stop = adaptSdkMessage(sdk({ type: "stream_event", event: { type: "content_block_stop", index: 2 }, uuid: "e3", session_id: "s", parent_tool_use_id: null }));
+  assert.deepEqual(stop[1], { type: "assistant_block_stop", index: 2 });
+  const sub = adaptSdkMessage(sdk({ type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "y" } }, uuid: "e4", session_id: "s", parent_tool_use_id: "tu1" }));
+  assert.equal(sub.length, 1);
+});

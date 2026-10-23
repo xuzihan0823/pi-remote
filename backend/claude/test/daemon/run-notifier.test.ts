@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createNotifier, createNotifierFromEnv } from "../../src/run/notifier.ts";
+import { approvalLink, createNotifier, createNotifierFromEnv, sessionLink } from "../../src/run/notifier.ts";
 
 interface FetchCall {
   url: string;
@@ -82,4 +82,24 @@ test("createNotifierFromEnv：读 BARK_URL / NTFY_URL，缺省 no-op", async () 
   const noop = createNotifierFromEnv({}, fetchFn);
   await noop("t", "b");
   assert.equal(calls.length, 1, "空 env 不得发请求");
+});
+
+test("Bark：url/group/urgent 走查询参数（点通知深链进 App，审批 timeSensitive）", async () => {
+  const { fetchFn, calls } = mockFetch(() => new Response("", { status: 200 }));
+  const notify = createNotifier({ barkUrl: "https://api.day.app/key", fetchFn });
+  await notify("待审批", "Bash: ls", { url: approvalLink("i 1", "s1"), group: "approval", urgent: true });
+  const u = new URL(calls[0]!.url);
+  assert.equal(u.searchParams.get("url"), "claude-remote://approval/i%201?session=s1");
+  assert.equal(u.searchParams.get("group"), "approval");
+  assert.equal(u.searchParams.get("level"), "timeSensitive");
+  // 不带选项时保持原格式，无查询串
+  await notify("t", "b");
+  assert.equal(calls[1]!.url.includes("?"), false);
+});
+
+test("ntfy：url → Click 头，urgent → Priority: high", async () => {
+  const { fetchFn, calls } = mockFetch(() => new Response("", { status: 200 }));
+  const notify = createNotifier({ ntfyUrl: "https://ntfy.sh/t", fetchFn });
+  await notify("完成", "ok", { url: sessionLink("s1"), urgent: true });
+  assert.deepEqual(calls[0]!.init?.headers, { Click: "claude-remote://session/s1", Priority: "high" });
 });

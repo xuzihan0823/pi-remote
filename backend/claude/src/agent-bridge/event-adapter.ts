@@ -26,12 +26,20 @@ export function adaptSdkMessage(message: SDKMessage): WorkerEvent[] {
   const events: WorkerEvent[] = sessionId === undefined ? [] : [{ type: "session", sessionId }];
 
   if (message.type === "stream_event") {
+    // 子代理（Task）的流不在主链上，手机端只流式显示主会话
+    if (source.parent_tool_use_id) return events;
     const event = message.event as unknown as Record<string, unknown>;
-    if (event.type === "content_block_delta") {
+    const index = typeof event.index === "number" ? event.index : undefined;
+    if (event.type === "message_start") {
+      const id = record(event.message)?.id;
+      if (typeof id === "string") events.push({ type: "assistant_stream_start", apiMessageId: id });
+    } else if (event.type === "content_block_delta") {
       const delta = record(event.delta);
       if (delta?.type === "text_delta" && typeof delta.text === "string") {
-        events.push({ type: "assistant_delta", text: delta.text, messageId: message.uuid });
+        events.push({ type: "assistant_delta", text: delta.text, messageId: message.uuid, ...(index === undefined ? {} : { index }) });
       }
+    } else if (event.type === "content_block_stop" && index !== undefined) {
+      events.push({ type: "assistant_block_stop", index });
     }
     return events;
   }

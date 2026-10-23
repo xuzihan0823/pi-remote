@@ -75,12 +75,16 @@ function rawGet(path: string, headers: Record<string, string> = {}): Promise<Raw
 test("health 返回强身份 service + instanceId", async () => {
   const res = await rawGet("/api/health", { Authorization: `Bearer ${TOKEN}` });
   assert.equal(res.status, 200);
-  assert.deepEqual(JSON.parse(res.body), {
+  const health = JSON.parse(res.body) as Record<string, unknown>;
+  // hostname 供多设备管理显示机器名（同 claude-remote 7971110）；仅在 Bearer 鉴权后可见
+  assert.equal(typeof health.hostname, "string");
+  assert.deepEqual({ ...health, hostname: undefined }, {
     ok: true,
     service: "pi-remote-claude",
     instanceId: INSTANCE_ID,
     version: "0.1.0-test",
     claudeCliVersion: "unknown",
+    hostname: undefined,
   });
 });
 

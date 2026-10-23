@@ -64,6 +64,11 @@ export interface TurnRunnerOptions {
   permissions: PermissionBroker;
   /** interactions 侧的固定用户标识（本项目单用户），默认 "web"。 */
   userId?: string;
+  /**
+   * abort 后等待 SDK interrupt 生效的上限，默认 5_000。超时仍未收尾（CLI 卡在 API 重试、
+   * 子进程无响应等）则强制 sdk.close() 并结束本轮，保证「停止」一定能让会话回到 idle。
+   */
+  abortGraceMs?: number;
   /** 透传 createPermissionAdapter 的审批超时（PERMISSION_TIMEOUT_MS）。 */
   permissionTimeoutMs?: number;
   /** 测试注入 fake；缺省用真实 Agent SDK。 */
@@ -104,13 +109,20 @@ interface ActiveRun {
   sessionId: string;
   controller: AbortController;
   aborted: boolean;
+  /** abort 宽限期满后调用：强制结束 #consume 的消息循环。 */
+  forceStop: () => void;
+  forceTimer: ReturnType<typeof setTimeout> | undefined;
 }
+
+const DEFAULT_ABORT_GRACE_MS = 5_000;
+const FORCE_STOPPED = Symbol("force-stopped");
 
 export class TurnRunner {
   readonly #gate: ActivityGate;
   readonly #permissions: PermissionBroker;
   readonly #userId: string;
   readonly #permissionTimeoutMs: number | undefined;
+  readonly #abortGraceMs: number;
   readonly #queryFactory: QueryFactory | undefined;
   readonly #runs = new Map<string, ActiveRun>();
   readonly #sessionRuns = new Map<string, string>();
@@ -120,6 +132,7 @@ export class TurnRunner {
     this.#permissions = options.permissions;
     this.#userId = options.userId ?? "web";
     this.#permissionTimeoutMs = options.permissionTimeoutMs;
+    this.#abortGraceMs = options.abortGraceMs ?? DEFAULT_ABORT_GRACE_MS;
     this.#queryFactory = options.queryFactory;
   }
 
@@ -165,13 +178,17 @@ export class TurnRunner {
     }
 
     const runId = randomUUID();
-    const run: ActiveRun = { sessionId, controller, aborted: false };
+    let forceStop!: () => void;
+    const forceStopped = new Promise<typeof FORCE_STOPPED>((resolve) => {
+      forceStop = () => resolve(FORCE_STOPPED);
+    });
+    const run: ActiveRun = { sessionId, controller, aborted: false, forceStop, forceTimer: undefined };
     this.#runs.set(runId, run);
     this.#sessionRuns.set(sessionId, runId);
 
     const queue = new EventQueue<RunEvent>();
     queue.push({ type: "run", runId, sessionId, state: "started", ...(permissionMode === undefined ? {} : { permissionMode }) });
-    const completion = this.#consume(runId, run, sdk, queue);
+    const completion = this.#consume(runId, run, sdk, queue, forceStopped);
     return { runId, events: queue, completion };
   }
 
@@ -179,8 +196,13 @@ export class TurnRunner {
   abort(runId: string): boolean {
     const run = this.#runs.get(runId);
     if (run === undefined) return false;
+    if (run.aborted) return true; // 重复点停止：已在收尾中
     run.aborted = true;
     run.controller.abort(new Error("aborted"));
+    run.forceTimer = setTimeout(() => {
+      console.warn(`run ${runId} did not settle ${this.#abortGraceMs}ms after abort; force-closing SDK`);
+      run.forceStop();
+    }, this.#abortGraceMs);
     return true;
   }
 
@@ -194,26 +216,41 @@ export class TurnRunner {
     run: ActiveRun,
     sdk: SdkQueryHandle,
     queue: EventQueue<RunEvent>,
+    forceStopped: Promise<typeof FORCE_STOPPED>,
   ): Promise<RunOutcome> {
     const { sessionId } = run;
     let outcome: RunOutcome;
+    const iterator = sdk.messages[Symbol.asyncIterator]();
     try {
       // 流式输入 + persistSession 下，CLI 在 result 后保持存活等待下一条输入，
       // iterator 不会自然耗尽（真机实测，06 集成期修复）——一轮以 result 事件为终点。
+      // 每次 next() 与 forceStopped 赛跑：interrupt 不生效时 abort 宽限期满直接跳出。
       let sawResult = false;
-      for await (const message of sdk.messages) {
-        for (const event of adaptSdkMessage(message)) {
+      let resultError: string | undefined;
+      for (;;) {
+        const next = await Promise.race([iterator.next(), forceStopped]);
+        if (next === FORCE_STOPPED || next.done === true) break;
+        for (const event of adaptSdkMessage(next.value)) {
           queue.push({ type: "worker", runId, sessionId, event });
-          if (event.type === "result") sawResult = true;
+          if (event.type === "result") {
+            sawResult = true;
+            // 模型不可用、鉴权失败等：CLI 照样给 result，但 is_error=true——按出错收尾，手机端才会提示
+            if (event.isError) resultError = resultErrorText(event) ?? "Claude 返回错误";
+          }
         }
         if (sawResult) break;
       }
-      outcome = run.aborted ? { state: "error", error: "aborted" } : { state: "done" };
+      outcome = run.aborted
+        ? { state: "error", error: "aborted" }
+        : resultError !== undefined ? { state: "error", error: resultError } : { state: "done" };
     } catch (error) {
       outcome = run.aborted
         ? { state: "error", error: "aborted" }
         : { state: "error", error: error instanceof Error ? error.message : String(error) };
     } finally {
+      if (run.forceTimer !== undefined) clearTimeout(run.forceTimer);
+      // 等价于 for-await 的 break 语义；不 await（被强制停止时生成器可能仍挂起）
+      void Promise.resolve().then(() => iterator.return?.()).catch(() => undefined);
       try {
         sdk.close();
       } catch {
@@ -239,6 +276,17 @@ export class TurnRunner {
       console.warn(`activityGate.endRun(${sessionId}) failed:`, error instanceof Error ? error.message : error);
     }
   }
+}
+
+function resultErrorText(event: WorkerEvent): string | undefined {
+  if (event.type !== "result") return undefined;
+  const record = event as unknown as { result?: unknown; errors?: unknown };
+  if (typeof record.result === "string" && record.result.trim() !== "") return record.result.trim().slice(0, 300);
+  if (Array.isArray(record.errors)) {
+    const text = record.errors.filter((e): e is string => typeof e === "string").join("; ").trim();
+    if (text !== "") return text.slice(0, 300);
+  }
+  return undefined;
 }
 
 function isUuid(value: string): boolean {
