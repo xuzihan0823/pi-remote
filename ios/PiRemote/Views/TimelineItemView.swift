@@ -22,8 +22,7 @@ struct TimelineItemView: View {
                     MarkdownMessageView(text: messageText, messageID: item.id)
                 }
                 if item.truncated {
-                    Button(expanded ? (client.isActiveDesktop ? "收起正文" : "收起完整正文")
-                                    : (client.isActiveDesktop ? "展开正文" : "展开完整正文")) {
+                    Button(expanded ? "收起完整正文" : "展开完整正文") {
                         expanded.toggle()
                         if expanded { loadDetails() }
                     }

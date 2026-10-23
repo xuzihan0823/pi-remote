@@ -273,38 +273,6 @@ export interface UiDialogResponse {
   cancelled?: boolean;
 }
 
-export type DesktopUiResponse =
-  | { kind: "permission"; decision: "allow-once" | "deny" }
-  | { kind: "question"; answers: Array<string[] | null> };
-
-export type DesktopPendingInteraction =
-  | {
-      kind: "permission";
-      requestId: string;
-      /** Public session ID in the form managed:desktop:... */
-      sessionId: string;
-      toolName: string;
-      reason: string;
-      argsPreview?: string;
-      agentName?: string;
-    }
-  | {
-      kind: "question";
-      requestId: string;
-      /** Public session ID in the form managed:desktop:... */
-      sessionId: string;
-      questions: Array<{
-        question: string;
-        options: Array<{ label: string; description?: string }>;
-        multiSelect: boolean;
-      }>;
-    };
-
-export interface DesktopPermissionState {
-  mode: "inherit" | "ask" | "accept-edits" | "auto" | null;
-  effectiveMode: "ask" | "accept-edits" | "auto" | null;
-}
-
 export interface RpcSessionState {
   sessionId: string;
   sessionFile: string | undefined;

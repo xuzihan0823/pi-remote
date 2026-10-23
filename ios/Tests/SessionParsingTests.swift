@@ -13,7 +13,6 @@ struct SessionParsingTests {
         try terminalSnapshotReplacesInsteadOfAppending()
         try resetIsolatesSwitchedSessions()
         try failedTerminalSnapshotIsOffline()
-        try readLimitFailureKeepsSessionOnline()
         try groupsSessionsByProject()
         try historyIncludesRunningAndResumedSessions()
         print("PASS: session.list 字段解析、运行判定与终端快照行为全部通过")
@@ -140,23 +139,6 @@ struct SessionParsingTests {
 
         state.apply(["activity": "idle", "messages": []])
         try expect(state.error == nil && !state.isOffline, "重连恢复后自动清除离线状态")
-    }
-
-    static func readLimitFailureKeepsSessionOnline() throws {
-        var state = TerminalSessionState()
-        state.apply(["activity": "idle", "messages": [["role": "assistant", "text": "保留历史"]]])
-        state.fail("内容超过上限", code: "result_too_large")
-        try expect(state.isReadError && !state.isOffline, "内容超限只是读取失败，不把会话标成离线")
-        try expect(state.errorCode == "result_too_large" && state.messages.first?.text == "保留历史", "保留错误码和已有正文")
-
-        state.fail("需要重建", code: "refresh_required")
-        try expect(state.isReadError && !state.isOffline, "需要重建同样不标离线")
-
-        state.fail("连接中断")
-        try expect(!state.isReadError && state.isOffline, "普通失败仍是离线")
-
-        state.apply(["activity": "idle", "messages": []])
-        try expect(state.errorCode == nil && !state.isOffline, "成功读取后清除错误码")
     }
 
     static func groupsSessionsByProject() throws {

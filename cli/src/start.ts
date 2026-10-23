@@ -4,7 +4,6 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { delimiter, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DesktopMcpClient } from "../../src/desktop/mcp-client.ts";
 import { type CliConfig, validateConfig } from "./config.ts";
 import { ProcessGroup, redact } from "./processes.ts";
 import { claudePayload, health, piPayload, showPairing, verifyClaude, verifyPi } from "./pairing.ts";
@@ -53,8 +52,8 @@ export async function start(configuration: CliConfig): Promise<void> {
     if (claude) await availablePort(config.claude.port);
     if (pi) {
       if (!(await stat(config.pi.workspace)).isDirectory()) throw new Error("Pi 工作区不是目录");
-      const desktop = new DesktopMcpClient({ timeoutMs: 5000 });
-      try { await desktop.call("pi_project_list"); } finally { await desktop.close(); }
+      // The agent spawns the Pi CLI (PI_BIN defaults to "pi"); fail early with a clear message.
+      await executable("pi");
       group.signal.throwIfAborted();
     }
     if (claude) {

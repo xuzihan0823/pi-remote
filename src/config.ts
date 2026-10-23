@@ -41,10 +41,6 @@ export function defaultWorkspaceRoot(): string {
   return join(homedir(), "Desktop");
 }
 
-export function loadDesktopAgentConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  return loadConfig({ ...env, PI_RUNTIME: "pi", PI_BIN: "pi-desktop", OMP_HISTORY_ROOTS: "[]" });
-}
-
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const relayHost = (env.RELAY_HOST ?? DEFAULT_RELAY_HOST).trim();
   if (relayHost.length === 0) {

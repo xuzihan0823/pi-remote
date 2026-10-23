@@ -93,9 +93,9 @@ test("a relay link that stalls without closing is terminated and reconnected", a
   }
 });
 
-test("Desktop runtime shutdown only disconnects its own client and runs local cleanup", async () => {
+test("runtime shutdown only disconnects its own client and runs local cleanup", async () => {
   resetFakeSockets();
-  const client = new AgentClient({ url: "ws://relay.test/ws/agent", token: "t".repeat(32), deviceId: "desktop-agent", WebSocketImpl: fakeWebSocketImpl });
+  const client = new AgentClient({ url: "ws://relay.test/ws/agent", token: "t".repeat(32), deviceId: "cleanup-agent", WebSocketImpl: fakeWebSocketImpl });
   let cleanups = 0;
   const runtime = new AgentRuntime({ client, cleanup: () => { cleanups++; } });
   await runtime.start();

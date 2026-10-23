@@ -10,7 +10,6 @@ public struct NewSessionView: View {
     @State private var mode: SessionStartMode = .terminal
     @State private var showProjectPicker = false
     @State private var selectedModel: RemoteModel?
-    @State private var needsModelReselection = false
     @FocusState private var promptFocused: Bool
 
     public init(
@@ -43,25 +42,17 @@ public struct NewSessionView: View {
         }
         .onDisappear { client.cancelSessionCreation() }
         .task(id: catalogKey) {
-            guard client.supportsModelSelectionOnCreate else { return }
-            client.loadModelCatalog(cwd: cwd, mode: effectiveMode)
+            client.loadModelCatalog(cwd: cwd, mode: mode)
         }
         .onChange(of: client.catalogModels) { _, models in
-            guard client.isConnected, client.agentConnected, !models.isEmpty,
-                  let selectedModel, !models.contains(selectedModel) else { return }
-            self.selectedModel = nil
-            needsModelReselection = true
+            if let selectedModel, !models.contains(selectedModel) { self.selectedModel = nil }
         }
         .sheet(isPresented: $showProjectPicker) {
-            MacProjectPicker(client: client, onSelect: { project in
+            MacProjectPicker(client: client) { project in
                 cwd = project.path
                 promptFocused = false
                 showProjectPicker = false
-            }, onSelectTemporary: {
-                cwd = ""
-                promptFocused = false
-                showProjectPicker = false
-            })
+            }
         }
     }
 
@@ -104,11 +95,11 @@ public struct NewSessionView: View {
 
     private var greeting: some View {
         VStack(spacing: 8) {
-            Text(client.agentConnected ? "想从哪里开始？" : "Mac 助手尚未连接")
+            Text(client.agentConnected ? "想从哪里开始？" : "Mac 上的 pi 尚未连接")
                 .font(DesignTokens.Fonts.notoBold(26))
                 .foregroundColor(DesignTokens.Colors.textPrimary)
             Text(client.agentConnected
-                 ? (client.isDesktopScope ? "手机与 Pi Desktop 共用同一会话，模型和权限沿用桌面设置。" : (mode == .terminal ? "手机与 Mac 终端共用同一会话。" : "会话在 Mac 后台运行。"))
+                 ? (mode == .terminal ? "手机与 Mac 终端共用同一会话。" : "会话在 Mac 后台运行。")
                  : "先在 Mac 上启动 agent，再开始任务。")
                 .font(DesignTokens.Fonts.notoRegular(14))
                 .foregroundColor(DesignTokens.Colors.textSecondary)
@@ -118,9 +109,9 @@ public struct NewSessionView: View {
                 showProjectPicker = true
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: cwd.isEmpty && !client.isDesktopScope ? "folder.badge.plus" : "folder.fill")
+                    Image(systemName: cwd.isEmpty ? "folder.badge.plus" : "folder.fill")
                         .font(.system(size: 15))
-                    Text(cwd.isEmpty ? (client.isDesktopScope ? "临时目录" : "选择项目") : (cwd as NSString).lastPathComponent)
+                    Text(cwd.isEmpty ? "选择项目" : (cwd as NSString).lastPathComponent)
                         .font(DesignTokens.Fonts.notoBold(15))
                         .lineLimit(1)
                     Image(systemName: "chevron.down")
@@ -142,29 +133,8 @@ public struct NewSessionView: View {
 
     private var composer: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if client.supportsModelSelectionOnCreate, let error = client.catalogModelLoadError {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(error)
-                        .font(DesignTokens.Fonts.notoRegular(12))
-                        .foregroundColor(DesignTokens.Colors.warning)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
-                    Button("重试", action: reloadCatalog)
-                        .font(DesignTokens.Fonts.notoBold(12))
-                        .foregroundColor(DesignTokens.Colors.accentGreen)
-                        .frame(minWidth: 44, minHeight: 44)
-                        .contentShape(Rectangle())
-                        .disabled(client.isLoadingModels || !client.isConnected || !client.agentConnected)
-                        .accessibilityIdentifier("retry-model-catalog")
-                }
-            } else if let error = client.lastError {
+            if let error = client.lastError {
                 Text(error)
-                    .font(DesignTokens.Fonts.notoRegular(12))
-                    .foregroundColor(DesignTokens.Colors.warning)
-            }
-
-            if needsModelReselection {
-                Text("原所选模型已不在当前目录中，请重新选择模型。")
                     .font(DesignTokens.Fonts.notoRegular(12))
                     .foregroundColor(DesignTokens.Colors.warning)
             }
@@ -179,44 +149,35 @@ public struct NewSessionView: View {
                 .padding(.horizontal, 4)
 
             HStack(spacing: 10) {
-                if !client.isDesktopScope {
-                    Menu {
-                        Picker("会话类型", selection: $mode) {
-                            Label("Mac 共享会话", systemImage: "terminal").tag(SessionStartMode.terminal)
-                            Label("后台会话", systemImage: "gearshape.2").tag(SessionStartMode.rpc)
-                        }
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundColor(DesignTokens.Colors.textPrimary)
-                            .frame(width: 40, height: 40)
-                            .contentShape(Circle())
+                Menu {
+                    Picker("会话类型", selection: $mode) {
+                        Label("Mac 共享会话", systemImage: "terminal").tag(SessionStartMode.terminal)
+                        Label("后台会话", systemImage: "gearshape.2").tag(SessionStartMode.rpc)
                     }
-                    .disabled(client.isCreatingSession)
-                    .accessibilityLabel("更多选项")
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(DesignTokens.Colors.textPrimary)
+                        .frame(width: 40, height: 40)
+                        .contentShape(Circle())
                 }
+                .disabled(client.isCreatingSession)
+                .accessibilityLabel("更多选项")
 
-                Text(client.isDesktopScope ? "Pi Desktop" : (mode == .terminal ? "共享" : "后台"))
+                Text(mode == .terminal ? "共享" : "后台")
                     .font(DesignTokens.Fonts.notoRegular(12))
                     .foregroundColor(DesignTokens.Colors.textSecondary)
 
                 Spacer(minLength: 0)
 
-                if client.supportsModelSelectionOnCreate {
-                    ModelMenu(
-                        models: client.catalogModels,
-                        selected: selectedModel,
-                        isLoading: client.isLoadingModels,
-                        defaultTitle: client.isDesktopScope ? "沿用 Desktop 默认模型" : "默认模型",
-                        onSelect: { model in
-                            selectedModel = model
-                            needsModelReselection = false
-                        },
-                        loadError: client.catalogModelLoadError,
-                        onRetry: reloadCatalog
-                    )
-                    .disabled(client.isCreatingSession || !client.supportsModelCatalog)
-                }
+                ModelMenu(
+                    models: client.catalogModels,
+                    selected: selectedModel,
+                    isLoading: client.isLoadingModels,
+                    defaultTitle: "默认模型",
+                    onSelect: { selectedModel = $0 }
+                )
+                .disabled(client.isCreatingSession || !client.supportsModelCatalog)
 
                 Button(action: send) {
                     Group {
@@ -244,29 +205,19 @@ public struct NewSessionView: View {
         .padding(.bottom, 8)
     }
 
-    private var effectiveMode: SessionStartMode {
-        client.isDesktopScope ? .desktop : mode
-    }
-
     private var catalogKey: String {
-        "\(client.isConnected)|\(client.agentConnected)|\(client.supportsModelSelectionOnCreate)|\(client.supportsModelCatalog)|\(effectiveMode.rawValue)|\(cwd)"
+        "\(client.isConnected)|\(client.agentConnected)|\(client.supportsModelCatalog)|\(mode.rawValue)|\(cwd)"
     }
 
     private var canSend: Bool {
         !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-            (!cwd.isEmpty || client.isDesktopScope) && client.isConnected && client.agentConnected &&
-            client.hasLoadedSessionCapabilities && client.supportsSessionCreation && !client.isCreatingSession &&
-            !needsModelReselection
-    }
-
-    private func reloadCatalog() {
-        client.loadModelCatalog(cwd: cwd, mode: effectiveMode)
+            !cwd.isEmpty && client.isConnected && client.agentConnected && !client.isCreatingSession
     }
 
     private func send() {
         let text = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSend else { return }
-        client.startNewSession(prompt: text, cwd: cwd, mode: effectiveMode, model: selectedModel) { sessionId in
+        client.startNewSession(prompt: text, cwd: cwd, mode: mode, model: selectedModel) { sessionId in
             onStarted(sessionId)
         }
     }
@@ -279,9 +230,6 @@ struct ModelMenu: View {
     var isLoading = false
     let defaultTitle: String
     let onSelect: (RemoteModel?) -> Void
-    var allowsDefaultSelection = true
-    var loadError: String?
-    var onRetry: (() -> Void)?
     @State private var isPresented = false
     @State private var search = ""
 
@@ -309,13 +257,11 @@ struct ModelMenu: View {
         .sheet(isPresented: $isPresented) {
             NavigationStack {
                 List {
-                    if allowsDefaultSelection {
-                        Button {
-                            onSelect(nil)
-                            isPresented = false
-                        } label: {
-                            selectionLabel(defaultTitle, isSelected: selected == nil)
-                        }
+                    Button {
+                        onSelect(nil)
+                        isPresented = false
+                    } label: {
+                        selectionLabel(defaultTitle, isSelected: selected == nil)
                     }
                     ForEach(groupedProviders, id: \.self) { provider in
                         Section(provider) {
@@ -330,20 +276,8 @@ struct ModelMenu: View {
                         }
                     }
                     if isLoading { ProgressView("正在读取模型…") }
-                    if let loadError {
-                        Section {
-                            Text(loadError)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                            if let onRetry {
-                                Button("重新读取") { onRetry() }
-                                    .disabled(isLoading)
-                            }
-                        }
-                    }
-                    if !isLoading, loadError == nil, filteredModels.isEmpty {
-                        Text(search.isEmpty ? "没有可用的模型" : "没有匹配的模型")
-                            .foregroundStyle(.secondary)
+                    if !search.isEmpty && filteredModels.isEmpty {
+                        Text("没有匹配的模型").foregroundStyle(.secondary)
                     }
                 }
                 .accessibilityIdentifier("model-selection-list")
@@ -390,7 +324,6 @@ struct ModelMenu: View {
 private struct MacProjectPicker: View {
     let client: RelayClient
     let onSelect: (MacProject) -> Void
-    var onSelectTemporary: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @State private var projects: MacProjectList?
     @State private var error: String?
@@ -407,21 +340,10 @@ private struct MacProjectPicker: View {
     var body: some View {
         NavigationStack {
             List {
-                if client.isDesktopScope, let onSelectTemporary {
-                    Section {
-                        Button {
-                            onSelectTemporary()
-                            dismiss()
-                        } label: {
-                            Label("临时目录", systemImage: "folder")
-                        }
-                        .accessibilityIdentifier("select-temporary-directory")
-                    }
-                }
                 if let projects {
                     Section("已有项目") {
                         if filteredProjects.isEmpty {
-                            Text(search.isEmpty ? (client.isDesktopScope ? "请先在 Pi Desktop 中打开项目，再刷新此列表。" : "还没有可用的最近项目，请浏览 Mac 目录。") : "没有匹配的项目。")
+                            Text(search.isEmpty ? "还没有可用的最近项目，请浏览 Mac 目录。" : "没有匹配的项目。")
                                 .foregroundStyle(.secondary)
                         }
                         ForEach(filteredProjects) { project in
@@ -430,17 +352,15 @@ private struct MacProjectPicker: View {
                                 .disabled(!client.isConnected || !client.agentConnected)
                         }
                     }
-                    if client.canBrowseProjectDirectories {
-                        Section("浏览 Mac") {
-                            NavigationLink(value: MacProject(name: "用户目录", path: projects.home)) {
-                                Label("用户目录", systemImage: "house")
-                            }
-                            NavigationLink(value: MacProject(name: "默认项目目录", path: projects.defaultDirectory)) {
-                                Label("默认项目目录", systemImage: "folder")
-                            }
-                            NavigationLink(value: MacProject(name: "本机全部目录", path: "/")) {
-                                Label("本机全部目录", systemImage: "laptopcomputer")
-                            }
+                    Section("浏览 Mac") {
+                        NavigationLink(value: MacProject(name: "用户目录", path: projects.home)) {
+                            Label("用户目录", systemImage: "house")
+                        }
+                        NavigationLink(value: MacProject(name: "默认项目目录", path: projects.defaultDirectory)) {
+                            Label("默认项目目录", systemImage: "folder")
+                        }
+                        NavigationLink(value: MacProject(name: "本机全部目录", path: "/")) {
+                            Label("本机全部目录", systemImage: "laptopcomputer")
                         }
                     }
                 }

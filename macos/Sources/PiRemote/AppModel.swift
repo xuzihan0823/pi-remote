@@ -323,6 +323,10 @@ final class AppModel: ObservableObject {
               FileManager.default.fileExists(atPath: workspace, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw FieldError(field: .workspace, message: "找不到这个文件夹，请重新选择")
         }
+        guard let resolved = ExecutableResolver.resolve(piBinPath.trimmingCharacters(in: .whitespacesAndNewlines), searchPath: effectiveSearchPath()),
+              FileManager.default.isExecutableFile(atPath: resolved) else {
+            throw FieldError(field: .piBin, message: "找不到 \(runtime.rawValue)，请检查可执行文件路径")
+        }
     }
 
     private static func deployField(for message: String) -> ConfigField {
@@ -969,13 +973,18 @@ final class AppModel: ObservableObject {
             mode: mode,
             serverURL: serverURL,
             workspacePath: workspacePath,
-            piBinPath: "pi-desktop",
+            piBinPath: piBinPath,
             deviceId: config.deviceId,
             runtime: runtime,
             serverSource: serverSource,
             deployTarget: deployTarget
         )
         candidate = try candidate.validated()
+        guard let resolvedPiBin = ExecutableResolver.resolve(candidate.piBinPath, searchPath: effectiveSearchPath()) else {
+            throw FieldError(field: .piBin, message: "找不到可执行的 PI_BIN：\(candidate.piBinPath)（可在 PATH 中查找，或填写绝对路径）")
+        }
+        candidate.piBinPath = resolvedPiBin
+        piBinPath = resolvedPiBin
         return candidate
     }
 
@@ -1032,6 +1041,9 @@ final class AppModel: ObservableObject {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: config.workspacePath, isDirectory: &isDirectory), isDirectory.boolValue else {
             throw ValidationError("工作区目录不存在：\(config.workspacePath)")
+        }
+        guard FileManager.default.isExecutableFile(atPath: config.piBinPath) else {
+            throw ValidationError("PI_BIN 不可执行：\(config.piBinPath)")
         }
     }
 

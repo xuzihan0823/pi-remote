@@ -15,7 +15,7 @@ const help = `Pi Remote CLI 0.1.0
 
 首次启动会交互配置；后续复用配置。服务在前台运行，Ctrl+C 统一退出。
 公网访问使用 Cloudflare Quick Tunnel（需安装 cloudflared）。
-Pi 仍需运行启用了本机 MCP 的 Pi Desktop；Claude 需安装并登录 Claude CLI。
+Pi 需在 PATH 中安装 pi 命令；Claude 需安装并登录 Claude CLI。
 Quick Tunnel 每次重启地址会改变，需要重新扫码。
 `;
 

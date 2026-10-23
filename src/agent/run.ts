@@ -1,9 +1,15 @@
+import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { describeConfig, loadDesktopAgentConfig } from "../config.ts";
-import type { PiProcessManager } from "../pi/process-manager.ts";
+import { describeConfig, loadConfig } from "../config.ts";
+import { PiProcessManager } from "../pi/process-manager.ts";
+import { TerminalSessionBridge } from "../terminal/bridge-client.ts";
+import { resolveTerminalExecutable, TerminalSessionLauncher } from "../terminal/launcher.ts";
 import { AgentClient } from "./agent-client.ts";
-import { createDesktopAgentHandler } from "./desktop-agent-handler.ts";
-import { DesktopMcpClient } from "../desktop/mcp-client.ts";
+import { createPiAgentHandler } from "./pi-agent-handler.ts";
+import { defaultOmpHistoryRoots, OmpHistoryIndex } from "../history/history-index.ts";
+import { HistoryRecoveryCoordinator } from "../terminal/history-recovery.ts";
+import { createModelCatalog } from "../pi/model-catalog.ts";
+import { BackgroundHost, CONTROLLED_RUNTIME, isBackgroundSessionId } from "../background/host.ts";
 
 export interface AgentRuntimeOptions {
   client: AgentClient;
@@ -101,30 +107,96 @@ export class AgentRuntime {
 }
 
 export async function main(): Promise<void> {
-  const config = loadDesktopAgentConfig();
+  const config = loadConfig();
   const logger = (message: string): void => console.log(`[pi-agent] ${message}`);
   logger(describeConfig(config));
-  const desktop = new DesktopMcpClient();
-  const client = new AgentClient({
+  const controlledBin = config.piRuntime === "omp" ? await resolveTerminalExecutable("bun") : undefined;
+
+  const manager = new PiProcessManager({
+    piBin: controlledBin ?? config.piBin,
+    ...(controlledBin ? {
+      spawnFn: (bin, args, options) => spawn(bin, [CONTROLLED_RUNTIME, ...args], options),
+      waitForReady: true, mode: "rpc-ui" as const,
+    } : {}),
+    maxSessions: config.maxSessions,
+  });
+
+  const terminalBridge = new TerminalSessionBridge({
+    workspaceRoot: config.piWorkspaceRoot,
+    logger,
+  });
+  logger(`terminal bridge directories: ${terminalBridge.bridgeDirs.join(", ")}`);
+  const terminalLauncher = new TerminalSessionLauncher({
+    piBin: controlledBin ?? config.piBin,
+    ...(controlledBin ? { args: [CONTROLLED_RUNTIME] } : {}),
+    workspaceRoot: config.piWorkspaceRoot,
+    bridge: terminalBridge,
+    maxSessions: config.maxSessions,
+    managedSessionCount: () => manager.list().filter((session) => session.state === "running").length,
+  });
+
+  let client: AgentClient | undefined;
+  const history = new OmpHistoryIndex({ workspaceRoot: config.piWorkspaceRoot, roots: config.ompHistoryRoots ?? defaultOmpHistoryRoots() });
+  const backgroundHost = config.piRuntime === "omp" ? new BackgroundHost({
+    workspaceRoot: config.piWorkspaceRoot, terminalBridge, maxSessions: config.maxSessions,
+    managedSessionCount: () => manager.list().filter(session => session.state === "running").length,
+    emit: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
+  }) : undefined;
+  const recoveryBridge = backgroundHost ? {
+    instances: async () => [...await terminalBridge.instances(), ...await backgroundHost.instances()],
+    get: (id: string) => isBackgroundSessionId(id) ? backgroundHost.get(id) : terminalBridge.get(id),
+    setModel: (id: string, model: Parameters<TerminalSessionBridge["setModel"]>[1]) => isBackgroundSessionId(id) ? backgroundHost.setModel(id, model) : terminalBridge.setModel(id, model),
+  } : terminalBridge;
+  const recovery = config.piRuntime === "omp" ? new HistoryRecoveryCoordinator({
+    history, bridge: recoveryBridge, launcher: backgroundHost ?? terminalLauncher,
+    workspaceRoot: config.piWorkspaceRoot, offlineSource: backgroundHost ? "managed" : "terminal",
+  }) : undefined;
+  if (recovery) {
+    terminalBridge.setControlGuard(meta => recovery.canControl(meta));
+    backgroundHost?.setControlGuard(meta => recovery.canControl(meta));
+  }
+  const handler = createPiAgentHandler({
+    manager,
+    workspaceRoot: config.piWorkspaceRoot,
+    runtime: config.piRuntime,
+    modelCatalog: createModelCatalog({ piBin: config.piBin, runtime: config.piRuntime }),
+    terminalBridge,
+    terminalLauncher,
+    history,
+    recovery,
+    backgroundHost,
+    emitSessionEvent: (sessionId, event) => client?.sendSessionEvent(sessionId, event),
+    logger,
+  });
+  client = new AgentClient({
     url: config.relayUrl,
     token: config.agentToken,
     deviceId: config.agentDeviceId,
-    handler: createDesktopAgentHandler({ client: desktop, workspaceRoot: config.piWorkspaceRoot }),
+    handler,
     logger,
   });
-  const runtime = new AgentRuntime({ client, cleanup: () => desktop.close(), logger });
-  logger("session scope: Pi Desktop only; CLI and OMP discovery disabled");
+
+  const runtime = new AgentRuntime({ client, manager, logger });
 
   let shuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
     logger(`received ${signal}, shutting down`);
+    terminalLauncher.close();
+    try { await backgroundHost?.shutdownAll(); }
+    catch (error) { logger(`background shutdown unconfirmed: ${error instanceof Error ? error.message : String(error)}`); }
+    backgroundHost?.close();
+    recovery?.close();
     try {
       await runtime.stop();
     } catch (error) {
       logger(`error during shutdown: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
+    } finally {
+      // Drops bridge client sockets only; the user's terminal processes keep running.
+      terminalBridge.close();
+      history.close();
     }
   };
 

@@ -4,7 +4,7 @@
 
 ## 安装
 
-需要 Node.js 24+。安装 `cloudflared` 并确保其在 PATH 中；Pi 也支持连接已有 Relay，此模式无需 cloudflared。Claude 模式需要已安装并登录的 Claude CLI。第一版支持 macOS 和 Linux，Windows 使用 WSL；Pi Desktop 本身仍需在受支持的桌面环境运行。
+需要 Node.js 24+。安装 `cloudflared` 并确保其在 PATH 中；Pi 也支持连接已有 Relay，此模式无需 cloudflared。Pi 模式需要 PATH 中可用的 `pi` 命令；Claude 模式需要已安装并登录的 Claude CLI。第一版支持 macOS 和 Linux，Windows 使用 WSL。
 
 在仓库目录安装构建依赖：
 
@@ -50,19 +50,13 @@ pi-remote start --config /绝对路径/config.json
 pi-remote --help
 ```
 
-CLI 在前台运行，Ctrl+C 停止本次启动的后端和隧道。关闭终端也会触发清理。不会停止 Pi Desktop 或占用端口的其他服务。运行前请先退出仍在使用同一端口的旧 Pi Remote 控制面板。
+CLI 在前台运行，Ctrl+C 停止本次启动的后端和隧道。关闭终端也会触发清理。不会停止占用端口的其他服务。运行前请先退出仍在使用同一端口的旧 Pi Remote 控制面板。
 
 Quick Tunnel 每次重启地址都会改变，需要重新扫码；连接凭据在配置中保持不变。只在交互终端显示二维码，重定向日志时不会输出二维码或带凭据的链接。若已有固定 Relay，可以在 `configure` 中选择 `relay` 并输入 `wss://服务器/ws/agent` 和服务器凭据。
 
-### Pi Desktop
+### Pi
 
-CLI 替代的是本项目的控制面板，Pi Desktop 仍然是会话执行方。请先退出原 Pi Desktop 实例，再启用本机控制接口启动：
-
-```bash
-PI_DESKTOP_MCP_CONTROL=1 /Applications/PI-Desktop.app/Contents/MacOS/PI-Desktop
-```
-
-CLI 启动时只读检查 Desktop 的项目接口，不发送模型任务。支持范围与原 Desktop Agent 相同，不恢复旧 Pi CLI/OMP 会话管理。
+Pi Agent 通过本机 `pi` 命令管理会话（RPC 托管会话、终端共享会话与历史恢复）。CLI 启动前会检查 `pi` 是否在 PATH 中。
 
 ### 配置与数据
 

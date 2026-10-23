@@ -2,18 +2,16 @@
 
 Remote gateway for the [pi](https://github.com/earendil-works/pi) coding agent.
 
-当前主分支只管理 **Pi Desktop** 的本机会话：查看列表与历史、新建、继续发送文字和停止任务，并可在受控范围内读取模型目录、在新建或空闲时选择模型、回应普通的工具权限与 AskTool 问题。OMP、Pi CLI 及 Desktop 中导入的原生 CLI 会话不再进入管理范围；旧适配代码暂时保留，但生产 Agent 不会装配或回退到这些实现。
-
-原有多运行时开发内容保存在 `archive/multi-runtime-20261018`（`3e4a79c`）。Desktop 的模型执行、权限裁决和会话存储仍由 Pi Desktop 掌握；手机不直接读写其数据库，也不通过 CLI 接管会话。模型切换只改 `provider`/`modelId`，权限模式对手机只读。
+Mac Agent 通过本机 pi / OMP CLI 管理会话（托管 RPC 会话、终端共享会话、OMP 历史恢复），经 Relay 转发给 iOS 客户端。仓库另带独立的 Claude 后端（`backend/claude`），iOS App 可作为第二种后端直接连接它。No prompt is invoked automatically; a pi subprocess starts only when a client sends `session.start`.
 
 ## Requirements
 
 - Node.js >= 22.18 (uses built-in TypeScript type stripping and `node:test`; developed on Node 24)
-- Pi Desktop（已核对安装版 0.20.1），启动时启用本机 MCP 控制接口，详见 [Desktop 接入说明](docs/pi-desktop.md)。0.20.1 可列表、阅读、新建、发送和停止；远程回应交互与已有会话的安全模型切换需要基于 `589e5803a7a9f4ebf7ec1e8849c43e44b4a198f7`（v0.21.0-beta.4）的源码补丁，补丁路径、基线及应用命令见接入说明，不表示上游版本已支持。
+- pi CLI on `PATH` (verified against pi **0.85.1**); set `PI_RUNTIME=omp` to use omp instead
 
 ## 独立 CLI 启动（推荐）
 
-新增的 [CLI 启动器](cli/README.md) 可替代 macOS 控制面板：安装后从任意目录运行 `pi-remote start`，首次选择 Pi、Claude 或两者并保存配置，自动启动后端、建立 Cloudflare 隧道并显示手机配对二维码，Ctrl+C 统一退出。需要 Node.js 24+ 和 cloudflared；Pi 使用已有 Relay 时不需要 cloudflared。Pi Desktop 仍需启用本机 MCP，Claude 需要已安装并登录的 Claude CLI。
+新增的 [CLI 启动器](cli/README.md) 可替代 macOS 控制面板：安装后从任意目录运行 `pi-remote start`，首次选择 Pi、Claude 或两者并保存配置，自动启动后端、建立 Cloudflare 隧道并显示手机配对二维码，Ctrl+C 统一退出。需要 Node.js 24+ 和 cloudflared；Pi 使用已有 Relay 时不需要 cloudflared。Pi 需要 PATH 中的 `pi` 命令，Claude 需要已安装并登录的 Claude CLI。
 
 ```bash
 npm --prefix cli install
@@ -74,18 +72,13 @@ src/relay/session-router.ts request/event routing between iOS and the agent
 src/pi/rpc-client.ts        JSONL stdin/stdout client for one `pi --mode rpc` process
 src/pi/process-manager.ts   one controlled child process per session
 src/agent/agent-client.ts   outbound relay client (connection + framing)
-src/agent/pi-agent-handler.ts  legacy CLI handler (not used by production)
-src/agent/desktop-agent-handler.ts  Desktop-only relay request handler
-src/desktop/mcp-client.ts   authenticated local Desktop MCP connection
-src/desktop/models.ts       Desktop model catalog and permission-mode reads
-src/desktop/interactions.ts pending interaction validation and resolution
-src/desktop/timeline.ts     Desktop history projection and pagination
-src/agent/run.ts            Desktop agent entry point with reconnect and graceful shutdown
+src/agent/pi-agent-handler.ts  relay requests -> PiProcessManager, events -> session_event
+src/agent/run.ts            Mac agent entry point with reconnect and graceful shutdown
 src/index.ts                relay entry point
 tests/                      node:test suites + fake child-process/socket helpers
 ```
 
-## Legacy CLI RPC protocol（保留组件）
+## Verified RPC protocol
 
 Everything below was confirmed by reading pi 0.85.1 sources
 (`dist/modes/rpc/rpc-client.js`, `rpc-types.d.ts`, `jsonl.js`, `rpc-mode.js`) and by a live
@@ -142,7 +135,8 @@ the normalized `GatewayEvent` union in `src/protocol/types.ts`.
 
 ## Isolated verification
 
-Desktop 测试使用隔离 MCP HTTP 服务、宿主数据夹具和本地 Relay，覆盖认证、来源过滤、控制路由及历史分页，不调用真实模型。CLI 保留组件另使用假子进程（内存 `PassThrough` 流）。以下 live 检查仅针对旧 CLI，按需启用且只发送 `get_state`：
+Tests use a fake child process (in-memory `PassThrough` streams) and never call a model. The live
+check is opt-in and only sends `get_state`:
 
 ```bash
 PI_LIVE_RPC=1 npm run test:live
@@ -169,9 +163,10 @@ This was run successfully against pi 0.85.1. It does not read or modify user ses
 | `RELAY_URL` | `ws://$RELAY_HOST:$RELAY_PORT/ws/agent` | `ws://`/`wss://` URL; must not embed a token |
 | `AGENT_TOKEN` | `RELAY_TOKEN` | agent token (`/ws/agent`), >= 32 chars; set a different value on both relay and Mac so a leaked phone token cannot impersonate the agent |
 | `AGENT_DEVICE_ID` | `pi-mac-agent` | 1-128 chars from `[A-Za-z0-9._:-]`, first char alphanumeric |
-| `PI_RUNTIME` / `PI_BIN` | legacy | ignored by the Desktop production agent; retained for old components |
-| `PI_WORKSPACE_ROOT` | `~/Desktop` | absolute, non-root default project selection location |
-| `MAX_SESSIONS` | `16` | legacy component limit; Desktop owns its own execution limits |
+| `PI_RUNTIME` | `pi` | exactly `pi` or `omp` (managed sessions only) |
+| `PI_BIN` | `pi` / `omp` | selected by `PI_RUNTIME` when unset; explicit non-empty override |
+| `PI_WORKSPACE_ROOT` | `~/Desktop` | absolute, non-root directory; session cwds are confined to it |
+| `MAX_SESSIONS` | `16` | integer 1-128 |
 
 Tokens are accepted only as `Authorization: Bearer …`; `?token=` query strings are rejected so they
 never land in proxy access logs. `GET /api/health` is a public liveness probe (`status` and protocol
@@ -183,11 +178,11 @@ workspace root, and session cap; `RELAY_URL` rejects embedded tokens for the sam
 ## Mac agent
 
 `npm run agent` starts the local agent. It connects to the relay as `role=agent`, forwards relay
-requests to Pi Desktop, and reconnects with exponential backoff (1s up to 30s) when the
-socket drops. The production entry point connects only to Pi Desktop's authenticated loopback
-MCP endpoint. `PI_RUNTIME`, `PI_BIN`, and CLI history roots do not enable CLI discovery or execution.
-It starts no session until a client asks for one and never invokes a model on its own. Stopping
-this agent disconnects its clients; it does not quit Desktop or stop Desktop-owned tasks.
+requests to `PiProcessManager`, and reconnects with exponential backoff (1s up to 30s) when the
+socket drops. Set `PI_RUNTIME=omp` to launch `omp --mode rpc` for managed sessions; terminal
+sessions from both pi and omp are discovered regardless of this setting. `PI_BIN` overrides the
+selected CLI, including an absolute executable path supplied by the Mac app. It starts no
+session until a client asks for one and never invokes a model on its own.
 
 ```bash
 RELAY_URL=wss://relay.example.com/ws/agent \
@@ -197,43 +192,7 @@ PI_WORKSPACE_ROOT="$HOME/Desktop" \
 npm run agent
 ```
 
-### Desktop Relay 示例
-
-新建时可省略项目或模型，或使用 `pi_project_list` 对应的已有项目绝对路径；模型用 `provider` + `modelId` 指定：
-
-```json
-{"version":1,"type":"request","requestId":"r1","payload":{"method":"session.start","params":{"mode":"desktop","cwd":"/Users/me/projects/app","model":{"provider":"provider-id","modelId":"model-id"}}}}
-```
-
-模型目录可在新建前读取；带会话引用时同时返回该会话当前模型：
-
-```json
-{"version":1,"type":"request","requestId":"r1a","payload":{"method":"model.list","params":{"mode":"desktop"}}}
-{"version":1,"type":"request","requestId":"r1b","sessionId":"managed:desktop:example-id","payload":{"method":"model.list","params":{}}}
-```
-
-取得响应中的 `sessionId` 后，用同一引用发送、读取、切换模型和停止。空闲会话的模型切换只接受 `provider`/`modelId`；运行中、待审批或模型不在目录中会明确失败：
-
-```json
-{"version":1,"type":"request","requestId":"r2","sessionId":"managed:desktop:example-id","payload":{"method":"session.prompt","params":{"message":"总结 README"}}}
-{"version":1,"type":"request","requestId":"r3","sessionId":"managed:desktop:example-id","payload":{"method":"session.get","params":{"viewVersion":2}}}
-{"version":1,"type":"request","requestId":"r3a","sessionId":"managed:desktop:example-id","payload":{"method":"session.get","params":{"view":"controls"}}}
-{"version":1,"type":"request","requestId":"r3b","sessionId":"managed:desktop:example-id","payload":{"method":"session.set_model","params":{"model":{"provider":"provider-id","modelId":"model-id"}}}}
-{"version":1,"type":"request","requestId":"r4","sessionId":"managed:desktop:example-id","payload":{"method":"session.abort"}}
-```
-
-`session.get` 的默认视图返回分页时间线与运行状态；`view: "controls"` 是独立轻量读取，返回当前模型、权限模式/生效模式、`canControl`、`activity` 和待处理交互，不携带正文。`remoteApprovals` 为真时，可用 `ui.response` 回应对应的 `requestId`：
-
-```json
-{"version":1,"type":"request","requestId":"r5","sessionId":"managed:desktop:example-id","payload":{"method":"ui.response","params":{"requestId":"permission-request-id","response":{"kind":"permission","decision":"allow-once"}}}}
-{"version":1,"type":"request","requestId":"r6","sessionId":"managed:desktop:example-id","payload":{"method":"ui.response","params":{"requestId":"question-request-id","response":{"kind":"question","answers":[["选项文本"],null]}}}}
-```
-
-权限回应只支持 `allow-once` 或 `deny`；问题答案按题目顺序提交，每项是纯文本数组或 `null`（显式跳过）。`ui.response` 返回 `acknowledged: true` 才表示 Desktop 已处理；回执不确定时不要自动重发，先重新读取控制视图核对。`session.list` 的能力位（`modelCatalog`、`modelSelectionOnCreate`、`modelSelection`、`sessionControls`、`remoteApprovals`）分别控制这些入口，不能互相替代。
-
-### Legacy CLI protocol examples（非当前生产入口）
-
-以下示例仅记录保留的 CLI 组件契约，不适用于当前 Desktop Agent。Desktop 使用 `mode: "desktop"` 新建会话、`managed:desktop:<id>` 引用已有会话，并通过 `session.get` 轮询历史、运行状态和控制视图；项目必须已在 Desktop 中打开，模型与交互能力按 Desktop 版本单独探测。完整说明见 [Desktop 接入说明](docs/pi-desktop.md)。
+### Relay protocol examples
 
 Every frame carries `version: 1` and a `type`. The agent announces itself with a hello whose role
 must match the endpoint (`/ws/agent`):
@@ -280,7 +239,7 @@ them with `ui.response`, which the agent converts to the pi RPC `extension_ui_re
 Methods without a verified mapping return `{"ok":false,"error":{"code":"not_implemented",...}}`
 rather than guessing at pi RPC semantics.
 
-## Legacy CLI limitations（保留组件）
+## Known limitations
 
 - Only `get_state` has been exercised against real pi. Other commands are implemented from the
   typed protocol but not live-tested.
@@ -292,7 +251,7 @@ rather than guessing at pi RPC semantics.
 - Extension dialog requests are surfaced as `ui_request` events and can be answered with
   `ui.response`; no policy/timeout logic beyond pi's own exists yet.
 
-## Legacy CLI roadmap（暂缓）
+## Next phase
 
 1. An opt-in integration test that drives a real prompt from an iOS client through the relay to
    the Mac agent (never enabled by default).
