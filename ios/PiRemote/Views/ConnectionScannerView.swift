@@ -6,6 +6,9 @@ struct ConnectionScannerView: View {
     let deviceName: String
     var onScanned: (ConnectionConfig) -> Void
     var onManualConnection: () -> Void
+    /// 自定义解析（Claude 配对码）；返回前抛错会在扫码页显示错误并继续扫描。设置后不再按 Relay 二维码解析。
+    var payloadHandler: ((String) throws -> Void)? = nil
+    var title = "扫码连接 Mac"
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
@@ -33,7 +36,7 @@ struct ConnectionScannerView: View {
 
             VStack(spacing: 24) {
                 HStack {
-                    Text("扫码连接 Mac")
+                    Text(title)
                         .font(DesignTokens.Fonts.notoBold(20))
                     Spacer()
                     Button {
@@ -166,6 +169,12 @@ struct ConnectionScannerView: View {
     private func readPayload(_ payload: String) -> Bool {
         guard !isFinished, scenePhase == .active else { return false }
         do {
+            if let payloadHandler {
+                try payloadHandler(payload)
+                isFinished = true
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+                return true
+            }
             let config = try ConnectionQRCode.parse(payload, deviceName: deviceName)
             isFinished = true
             UINotificationFeedbackGenerator().notificationOccurred(.success)

@@ -227,8 +227,10 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = Z25WB9W2X5;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "PiRemote-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Pi Remote";
 				INFOPLIST_KEY_NSCameraUsageDescription = "使用相机扫描 Mac 上的连接二维码，以填写连接信息。";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "连接同一局域网或 Tailscale 中 Mac 上的 Pi Relay 与 Claude 后端。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
@@ -254,8 +256,10 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = Z25WB9W2X5;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "PiRemote-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Pi Remote";
 				INFOPLIST_KEY_NSCameraUsageDescription = "使用相机扫描 Mac 上的连接二维码，以填写连接信息。";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "连接同一局域网或 Tailscale 中 Mac 上的 Pi Relay 与 Claude 后端。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;

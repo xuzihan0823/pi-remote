@@ -7,6 +7,7 @@ public struct ConnectView: View {
     @State private var activeSheet: Sheet?
     @State private var showScanner = false
     @State private var sheetAfterScanning: Sheet?
+    @AppStorage(BackendKind.storageKey) private var backend = BackendKind.relay
 
     private enum Sheet: Identifiable {
         case configuration(ConnectionConfig?)
@@ -151,10 +152,18 @@ public struct ConnectView: View {
                     .disabled(client.isConnecting)
                     .padding(.horizontal, 28)
 
-                    Button(action: { activeSheet = .configuration(nil) }) {
-                        Text("手动连接")
-                            .font(DesignTokens.Fonts.notoRegular(14))
-                            .foregroundColor(DesignTokens.Colors.accentGreen)
+                    HStack(spacing: 24) {
+                        Button(action: { activeSheet = .configuration(nil) }) {
+                            Text("手动连接")
+                                .font(DesignTokens.Fonts.notoRegular(14))
+                                .foregroundColor(DesignTokens.Colors.accentGreen)
+                        }
+                        Button(action: { backend = .claude }) {
+                            Text("连接 Claude 后端")
+                                .font(DesignTokens.Fonts.notoRegular(14))
+                                .foregroundColor(DesignTokens.Colors.accentGreen)
+                        }
+                        .accessibilityIdentifier("switch-to-claude")
                     }
 
                     HStack(spacing: 6) {

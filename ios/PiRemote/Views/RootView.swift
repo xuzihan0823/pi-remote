@@ -12,6 +12,9 @@ public struct RootView: View {
     @State private var selectedSessionId: String?
     @State private var isSidebarOpen: Bool
     @State private var sidebarDrag: CGFloat = 0
+    @State private var claudeClient = ClaudeClient.shared
+    @State private var incomingClaudeCode: ClaudePairingCode?
+    @AppStorage(BackendKind.storageKey) private var backend = BackendKind.relay
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(initialRoute: AppRoute = .connect) {
@@ -62,6 +65,42 @@ public struct RootView: View {
     #endif
 
     public var body: some View {
+        Group {
+            if backend == .claude {
+                ClaudeRootView(
+                    client: claudeClient,
+                    onSwitchBackend: { backend = .relay },
+                    incomingCode: $incomingClaudeCode
+                )
+            } else {
+                relayContent
+            }
+        }
+        .onOpenURL(perform: handleOpenURL)
+        .onChange(of: backend) { _, kind in
+            // 两种后端互斥：切走时断开另一边，避免后台连接继续重试
+            if kind == .claude {
+                relayClient.disconnect()
+                route = .connect
+            } else {
+                claudeClient.disconnect()
+            }
+        }
+    }
+
+    /// claude-remote:// 深链：配对、审批（推送点击）、会话。都会切到 Claude 后端。
+    private func handleOpenURL(_ url: URL) {
+        guard let link = ClaudeDeepLink.parse(url) else { return }
+        backend = .claude
+        switch link {
+        case .setup(let code):
+            incomingClaudeCode = code
+        case .approval, .session:
+            claudeClient.handle(link)
+        }
+    }
+
+    private var relayContent: some View {
         Group {
             switch route {
             case .connect:

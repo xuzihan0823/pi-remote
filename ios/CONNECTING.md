@@ -42,7 +42,7 @@
 ```sh
 xcrun swiftc -swift-version 5 \
   ios/PiRemote/Models/Models.swift ios/PiRemote/Models/TimelineModels.swift \
-  ios/PiRemote/Models/ConnectionQRCode.swift \
+  ios/PiRemote/Models/TransportSecurity.swift ios/PiRemote/Models/ConnectionQRCode.swift \
   ios/Tests/ConnectionQRCodeTests.swift \
   -o /tmp/pi-remote-qr-tests
 /tmp/pi-remote-qr-tests
@@ -53,9 +53,19 @@ xcrun swiftc -swift-version 5 \
 ```sh
 xcrun swiftc -swift-version 5 \
   ios/PiRemote/Models/Models.swift ios/PiRemote/Models/TimelineModels.swift \
-  ios/Tests/SessionParsingTests.swift \
+  ios/PiRemote/Models/TransportSecurity.swift ios/Tests/SessionParsingTests.swift \
   -o /tmp/pi-remote-session-tests
 /tmp/pi-remote-session-tests
+```
+
+Claude 后端客户端纯逻辑（配对码、深链、WS 帧、流式草稿、转录分页定位、搜索映射、审批答案）回归检查：
+
+```sh
+xcrun swiftc -swift-version 5 \
+  ios/PiRemote/Models/TransportSecurity.swift ios/PiRemote/Models/ClaudeModels.swift \
+  ios/Tests/ClaudeModelsTests.swift \
+  -o /tmp/pi-remote-claude-tests
+/tmp/pi-remote-claude-tests
 ```
 
 真机签名构建：
@@ -75,3 +85,13 @@ xcodebuild -project ios/PiRemote.xcodeproj -scheme PiRemote \
 Xcode 在 Mac 上编译和签名。iPhone 首次用 USB 配对并完成信任、开启开发者模式后，可在可达的同一局域网中无线安装和调试。Xcode 27 的设备管理入口为 Xcode → Open Developer Tool → Device Hub；旧版使用 Devices and Simulators。仅在手机确认开发者信任，不会自动建立无线连接；无线可用状态需在设备管理中确认。本次修复版通过 USB 安装和启动，无线安装尚未验证。
 
 外网或移动网络下分发通常使用 TestFlight，需要 Apple Developer Program 及 App Store Connect 配置。真正的远程构建可以在另一台受控 Mac 上运行 `xcodebuild`，或配置 Xcode Cloud；当前项目尚未配置这些服务。
+
+## Claude 后端（第二种后端）
+
+除 Pi Relay 外，App 可以直连 Mac 上的 Claude 后端（`backend/claude`，由 Mac 助手的 Claude 页或 `pi-remote start --service claude` 启动）。连接页点「连接 Claude 后端」，或在设置里「切换到 Claude 后端」；两种后端互斥，切换时断开另一边。
+
+- 配对：扫描或粘贴 `claude-remote://setup?v=1&token=…&bases=…`（也可手动填写 `http://<Tailscale/局域网 IP>:8788` 与 `BRIDGE_TOKEN`）。App 依次探测候选地址的 `/api/health`，第一个鉴权通过的地址生效；地址存 UserDefaults，Token 存 Keychain（`com.piremote.app.claude-token`，仅本机、解锁后可读）。断线重连时会重新探测全部候选地址。
+- 传输：明文 `http://`/`ws://` 只允许本机、局域网、`.local`、`*.ts.net` 与 Tailscale `100.64.0.0/10`；公网必须 `https://`/`wss://`。WS 端点为 `/ws?token=…`（daemon 只认查询串 token），HTTP 一律 `Authorization: Bearer`。
+- 功能：会话列表（按 `/api/projects` 的项目筛选、分页）、新建会话（显式选择已知工作目录）、会话页（尾页 + 向上翻页、订阅快照、`stream` 草稿在末尾显示并在消息落盘后替换、`resync` 重拉、重连补缺口）、搜索（先标题/路径再全文，正文命中跳转到对应 `seq` 并高亮）、审批（每次连上都拉 `/api/interactions/pending`，支持允许一次/拒绝/回答问题）、停止与「解除占用」（无 daemon run 时 `/abort` 返回 `released`）、run 以 `error`（含 CLI `is_error`）结束时显示错误卡片。
+- 深链：注册了 `claude-remote` URL scheme（`ios/PiRemote-Info.plist`），支持 `claude-remote://setup?…`、`claude-remote://approval/<id>?session=<sid>`、`claude-remote://session/<sid>`。若同一台手机还装了 claude-remote App，两者会争用该 scheme，iOS 不保证由哪个 App 打开。
+

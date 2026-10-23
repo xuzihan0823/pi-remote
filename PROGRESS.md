@@ -2,6 +2,14 @@
 
 更新时间：2026-10-23
 
+## 2026-10-23：iOS 新增 Claude 后端客户端
+
+- iOS App 新增第二种后端「Claude」：扫码/粘贴 `claude-remote://setup` 配对码或手动填写地址，Token 存 Keychain，地址与候选列表存 UserDefaults；明文 http/ws 仅限局域网、`.local`、Tailscale。
+- 会话列表 + 项目筛选（`/api/projects`）+ 分页；新建会话显式选择工作目录；会话页尾页 + 向上翻页、订阅快照、`stream` 流式草稿（落盘后替换）、`resync` 重拉、重连补缺口。
+- 会话搜索（先标题/路径再全文），正文命中跳转并高亮；审批面板（每次连上补拉 `/api/interactions/pending`，允许一次/拒绝/回答问题）；停止与「解除占用」（`/abort` 返回 `released`）；run 以 error（含 `is_error`）结束时显示错误卡片。
+- 注册 `claude-remote` URL scheme，支持 setup / approval / session 深链。
+- 纯逻辑单测 `ios/Tests/ClaudeModelsTests.swift`（配对码、深链、帧解码、草稿合并、转录分页定位、搜索映射、审批答案）。SwiftUI 界面未在 Xcode 中编译，需在 Mac 上构建验证。
+
 ## 2026-10-23：移除 Pi Desktop 集成
 
 - 删除 Agent 经本机 MCP 接入 Pi Desktop 的整条路径（`src/desktop/*`、`desktop-agent-handler.ts`、Desktop 协议类型、CLI 检查、iOS 控制视图与审批卡片、macOS 设置文案及相关测试和文档）。2026-10-18～19 的 Desktop 相关条目一并移除，历史见 git（`970ba32` 及之前）。

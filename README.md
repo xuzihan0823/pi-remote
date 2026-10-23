@@ -2,7 +2,7 @@
 
 Remote gateway for the [pi](https://github.com/earendil-works/pi) coding agent.
 
-Mac Agent 通过本机 pi / OMP CLI 管理会话（托管 RPC 会话、终端共享会话、OMP 历史恢复），经 Relay 转发给 iOS 客户端。仓库另带独立的 Claude 后端（`backend/claude`），iOS App 可作为第二种后端直接连接它。No prompt is invoked automatically; a pi subprocess starts only when a client sends `session.start`.
+Mac Agent 通过本机 pi / OMP CLI 管理会话（托管 RPC 会话、终端共享会话、OMP 历史恢复），经 Relay 转发给 iOS 客户端。仓库另带独立的 Claude 后端（`backend/claude`），iOS App 可作为第二种后端直接连接它（扫描 `claude-remote://setup` 配对码，详见 [ios/CONNECTING.md](ios/CONNECTING.md#claude-后端第二种后端)）。No prompt is invoked automatically; a pi subprocess starts only when a client sends `session.start`.
 
 ## Requirements
 

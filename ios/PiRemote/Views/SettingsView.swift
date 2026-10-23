@@ -7,6 +7,7 @@ struct SettingsView: View {
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(AppAppearance.storageKey) private var appearance = AppAppearance.system
+    @AppStorage(BackendKind.storageKey) private var backend = BackendKind.relay
     @State private var devices = ConnectionConfig.savedDevices()
     @State private var showConfiguration = false
 
@@ -35,6 +36,17 @@ struct SettingsView: View {
                     Text("切换设备")
                 } footer: {
                     Text("连接过的 Mac 会保存在这里，左滑可以移除。")
+                }
+
+                Section {
+                    Button("切换到 Claude 后端") {
+                        dismiss()
+                        backend = .claude
+                    }
+                } header: {
+                    Text("后端")
+                } footer: {
+                    Text("直连 Mac 上的 Claude 后端（配对码 claude-remote://…）。切换后会断开当前 Relay。")
                 }
 
                 Section {
